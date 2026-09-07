@@ -12,7 +12,7 @@ import requests
 
 
 # Seguridad: el token NUNCA debe vivir dentro del archivo.
-TOKEN = os.environ.get("8480223191:AAFxVP1RpTdeHEOPlW-mMm6BETr71nqTD8w", "8480223191:AAFxVP1RpTdeHEOPlW-mMm6BETr71nqTD8w").strip()
+TOKEN = os.environ.get("8480223191:AAFJkZCS3zDj0tqS8pADtfDu6k9CXRIrWS0", "8480223191:AAFJkZCS3zDj0tqS8pADtfDu6k9CXRIrWS0").strip()
 
 # Configuración del envío automático diario.
 AUTO_CHAT_ID = os.environ.get("AUTO_CHAT_ID", "").strip()

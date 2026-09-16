@@ -68,8 +68,8 @@ _ODDS_CACHE = {}
 _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
-# Triple Pick v2.9 — Tracking & Calibration Engine.
-BOT_VERSION = "2.9"
+# Triple Pick v2.9.1 — Tracking & Calibration Engine.
+BOT_VERSION = "2.9.1"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -86,7 +86,7 @@ TRACK_SETTLE_HOUR = int(os.environ.get("TRACK_SETTLE_HOUR", "4"))
 TRACK_SETTLE_MINUTE = int(os.environ.get("TRACK_SETTLE_MINUTE", "30"))
 
 
-# MLB Triple Pick v2.9 - v2.8 Market Engine + persistent tracking/calibration layer
+# MLB Triple Pick v2.9.1 - v2.8 Market Engine + persistent tracking/calibration layer
 #
 # v2.7.1 preserves the v2.7 starter sample/recency engine and the 45/25/15/10/5
 # matchup structure. It makes 100/100 Data Reliability unavailable until both
@@ -1222,12 +1222,22 @@ def _event_is_local_date(event, fecha):
     return dt.astimezone(LOCAL_TZ).strftime("%Y-%m-%d") == fecha
 
 
+def _event_is_pregame(event):
+    """Only allow pregame market snapshots; never mix live odds with pregame model output."""
+    dt = _parse_iso_utc(event.get("commence_time"))
+    if dt is None:
+        return True
+    return dt > datetime.now(timezone.utc)
+
+
 def _find_odds_event(partido, events, fecha):
     away_key = _normalize_team_name(partido.get("away"))
     home_key = _normalize_team_name(partido.get("home"))
     candidates = []
     for event in events:
         if not _event_is_local_date(event, fecha):
+            continue
+        if not _event_is_pregame(event):
             continue
         if (
             _normalize_team_name(event.get("away_team")) == away_key
@@ -1532,7 +1542,7 @@ async def _reply_long(message_obj, text, limit=3900):
 
 
 # ---------------------------------------------------------------------------
-# v2.9 TRACKING & CALIBRATION ENGINE
+# v2.9.1 TRACKING & CALIBRATION ENGINE
 # ---------------------------------------------------------------------------
 
 
@@ -1549,7 +1559,7 @@ def _tracking_connection():
 
 
 def init_tracking_db():
-    """Create the v2.9 tracking schema without modifying any existing records."""
+    """Create the v2.9.1 tracking schema without modifying any existing records."""
     with _tracking_connection() as conn:
         conn.executescript(
             """
@@ -2014,7 +2024,7 @@ async def trackstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Tracking DB error: {exc}")
         return
     await update.message.reply_text(
-        "🧾 TRACKING ENGINE — v2.9\n"
+        "🧾 TRACKING ENGINE — v2.9.1\n"
         f"DB: {info['path']}\n"
         f"Railway Volume: {info['railway_volume'] or 'NO DETECTADO'}\n"
         f"Total snapshots: {info['total']}\n"
@@ -2032,7 +2042,7 @@ async def settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ No pude liquidar el tracking: {exc}")
         return
     await update.message.reply_text(
-        "✅ TRACK SETTLEMENT — v2.9\n"
+        "✅ TRACK SETTLEMENT — v2.9.1\n"
         f"Pending al iniciar: {info['pending_before']}\n"
         f"WIN: {info['wins']} | LOSS: {info['losses']} | VOID: {info['void']}\n"
         f"Aún pendientes: {info['still_pending']}"
@@ -2049,7 +2059,7 @@ async def performance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     n = int(overall["n"] or 0)
     if n == 0:
         await update.message.reply_text(
-            "📊 PERFORMANCE — v2.9\nAún no hay picks oficiales liquidados."
+            "📊 PERFORMANCE — v2.9.1\nAún no hay picks oficiales liquidados."
         )
         return
 
@@ -2062,7 +2072,7 @@ async def performance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     brier_text = "N/D" if brier is None else f"{float(brier):.4f}"
     msg = (
-        "📊 PERFORMANCE — v2.9\n"
+        "📊 PERFORMANCE — v2.9.1\n"
         f"Official settled: {n} | Sample: {_sample_label(n)}\n"
         f"W-L: {wins}-{int(overall['losses'] or 0)} | Hit Rate: {hit*100:.1f}%\n"
         f"Brier: {brier_text}\n"
@@ -2103,12 +2113,12 @@ async def calibration(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not rows:
         await update.message.reply_text(
-            "🧪 CALIBRATION — v2.9\nAún no hay muestra oficial suficiente para formar bins."
+            "🧪 CALIBRATION — v2.9.1\nAún no hay muestra oficial suficiente para formar bins."
         )
         return
 
     msg = (
-        "🧪 CALIBRATION — v2.9\n"
+        "🧪 CALIBRATION — v2.9.1\n"
         "Pred = probabilidad proxy promedio | Actual = hit rate observado.\n\n"
     )
     for row in rows:
@@ -2130,10 +2140,10 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not rows:
-        await update.message.reply_text("📚 HISTORY — v2.9\nAún no hay picks registrados.")
+        await update.message.reply_text("📚 HISTORY — v2.9.1\nAún no hay picks registrados.")
         return
 
-    msg = "📚 HISTORY — v2.9\nÚltimos registros:\n\n"
+    msg = "📚 HISTORY — v2.9.1\nÚltimos registros:\n\n"
     for row in rows:
         official = "OFF" if row["official"] else "AUDIT"
         odds = _format_american(row["odds"])
@@ -2163,7 +2173,7 @@ async def auto_settle_tracking(context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "⚾ MLB TRIPLE PICK v2.9 — TRACKING & CALIBRATION\n\n"
+        "⚾ MLB TRIPLE PICK v2.9.1 — TRACKING & CALIBRATION\n\n"
         "Comandos disponibles:\n"
         "/mlb - Juegos de hoy\n"
         "/picks - Triple Pick final market-aware + tracking\n"
@@ -2183,7 +2193,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Triple Pick v2.9: market-aware selection plus immutable recommendation tracking."""
+    """Triple Pick v2.9.1: market-aware selection plus immutable recommendation tracking."""
     now = local_now()
     fecha = now.strftime("%Y-%m-%d")
     season = now.year
@@ -2204,7 +2214,7 @@ async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     value_count = sum(bool(p.get("value_approved")) for p in partidos)
 
     mensaje = (
-        "🔥 MLB TRIPLE PICK v2.9 — MARKET + TRACKING\n"
+        "🔥 MLB TRIPLE PICK v2.9.1 — MARKET + TRACKING\n"
         f"📅 {fecha} — {AUTO_TZ}\n\n"
         "🧠 MODEL: v2.7.1 starter sample + recency + offense + form + bullpen proxy.\n"
         "💵 MARKET: Moneyline → implied probability → no-vig → model/market agreement.\n"
@@ -2270,13 +2280,13 @@ async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             if mode == "market":
                 mensaje += (
-                    f"🧾 Tracking v2.9: {track_info['inserted']} nuevo(s), "
+                    f"🧾 Tracking v2.9.1: {track_info['inserted']} nuevo(s), "
                     f"{track_info['existing']} ya registrado(s). "
                     "SURVIVAL/HYBRID = muestra oficial.\n"
                 )
             else:
                 mensaje += (
-                    f"🧾 Tracking v2.9: {track_info['inserted']} fallback nuevo(s). "
+                    f"🧾 Tracking v2.9.1: {track_info['inserted']} fallback nuevo(s). "
                     "Se guardan para auditoría, fuera de métricas oficiales.\n"
                 )
         except Exception as exc:
@@ -2305,7 +2315,7 @@ async def pool(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     mensaje = (
-        "🔎 MLB CANDIDATE POOL — v2.9\n"
+        "🔎 MLB CANDIDATE POOL — v2.9.1\n"
         f"📅 {fecha}\n"
         f"Market: {'ON' if odds_status == 'ok' else 'OFF/FALLBACK'} | "
         f"Primary: {ODDS_PRIMARY_BOOKMAKER}\n\n"
@@ -2353,9 +2363,9 @@ async def market(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     mensaje = (
-        "💵 MLB MARKET AUDIT — v2.9\n"
+        "💵 MLB MARKET AUDIT — v2.9.1\n"
         f"📅 {fecha}\n"
-        f"Primary: {ODDS_PRIMARY_BOOKMAKER} | Books: {ODDS_BOOKMAKERS}\n\n"
+        f"Primary: {ODDS_PRIMARY_BOOKMAKER} | Books: {ODDS_BOOKMAKERS}\n""⏱️ PREMATCH ONLY: juegos iniciados/live se excluyen del Market Engine.\n\n"
     )
     for i, p in enumerate(partidos, 1):
         vg = p.get("value_gap")
@@ -2399,7 +2409,7 @@ async def value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     mensaje = (
-        "🟣 MLB VALUE BOARD — v2.9\n"
+        "🟣 MLB VALUE BOARD — v2.9.1\n"
         f"📅 {fecha}\n"
         "Regla: Model Gate aprobado + precio Hard Rock + gap ≥3.5 pp; "
         "divergencias >10 pp se mandan a REVIEW, no a VALUE automático.\n\n"
@@ -2536,7 +2546,7 @@ def main():
             "python-telegram-bot[job-queue] en requirements.txt."
         )
 
-    print("🤖 Bot MLB Triple Pick v2.9 iniciado...")
+    print("🤖 Bot MLB Triple Pick v2.9.1 iniciado...")
     app.run_polling()
 
 

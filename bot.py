@@ -68,8 +68,8 @@ _ODDS_CACHE = {}
 _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
-# Triple Pick v2.9.2 — Odds diagnostics + Tracking & Calibration Engine.
-BOT_VERSION = "2.9.2"
+# Triple Pick v2.9.3 — Primary-feed degradation notice + Odds diagnostics + Tracking & Calibration Engine.
+BOT_VERSION = "2.9.3"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -86,7 +86,7 @@ TRACK_SETTLE_HOUR = int(os.environ.get("TRACK_SETTLE_HOUR", "4"))
 TRACK_SETTLE_MINUTE = int(os.environ.get("TRACK_SETTLE_MINUTE", "30"))
 
 
-# MLB Triple Pick v2.9.2 - v2.8 Market Engine + odds diagnostics + persistent tracking/calibration layer
+# MLB Triple Pick v2.9.3 - v2.8 Market Engine + primary-feed degradation notice + odds diagnostics + persistent tracking/calibration layer
 #
 # v2.7.1 preserves the v2.7 starter sample/recency engine and the 45/25/15/10/5
 # matchup structure. It makes 100/100 Data Reliability unavailable until both
@@ -1474,6 +1474,22 @@ def build_daily_matchups_v28(fecha, season):
     return "ok", partidos, odds_status
 
 
+def _primary_feed_notice(partidos, odds_status):
+    """Transparent degradation notice when the primary book is absent from an otherwise healthy feed."""
+    if odds_status != "ok":
+        return ""
+    market_rows = [p for p in partidos if p.get("market_available")]
+    if not market_rows:
+        return ""
+    if any(p.get("hardrock_available") for p in market_rows):
+        return ""
+    return (
+        "⚠️ HARD ROCK TEMPORALMENTE NO DISPONIBLE EN EL FEED\n"
+        "🛡️ SURVIVAL: evaluado con el consenso de mercado disponible.\n"
+        "🟣 VALUE: suspendido hasta recuperar precio Hard Rock.\n\n"
+    )
+
+
 def _format_american(price):
     if price is None:
         return "N/D"
@@ -2173,7 +2189,7 @@ async def auto_settle_tracking(context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "⚾ MLB TRIPLE PICK v2.9.2 — TRACKING & CALIBRATION\n\n"
+        "⚾ MLB TRIPLE PICK v2.9.3 — TRACKING & CALIBRATION\n\n"
         "Comandos disponibles:\n"
         "/mlb - Juegos de hoy\n"
         "/picks - Triple Pick final market-aware + tracking\n"
@@ -2215,7 +2231,7 @@ async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     value_count = sum(bool(p.get("value_approved")) for p in partidos)
 
     mensaje = (
-        "🔥 MLB TRIPLE PICK v2.9.2 — MARKET + TRACKING\n"
+        "🔥 MLB TRIPLE PICK v2.9.3 — MARKET + TRACKING\n"
         f"📅 {fecha} — {AUTO_TZ}\n\n"
         "🧠 MODEL: v2.7.1 starter sample + recency + offense + form + bullpen proxy.\n"
         "💵 MARKET: Moneyline → implied probability → no-vig → model/market agreement.\n"
@@ -2239,6 +2255,7 @@ async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🏦 Primary book: {ODDS_PRIMARY_BOOKMAKER}\n"
             "🏆 Triple Pick final usa solo HYBRID/SURVIVAL; VALUE puro vive en /value.\n\n"
         )
+        mensaje += _primary_feed_notice(partidos, odds_status)
 
     if not triple_pick:
         mensaje += (
@@ -2281,13 +2298,13 @@ async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             if mode == "market":
                 mensaje += (
-                    f"🧾 Tracking v2.9.2: {track_info['inserted']} nuevo(s), "
+                    f"🧾 Tracking v2.9.3: {track_info['inserted']} nuevo(s), "
                     f"{track_info['existing']} ya registrado(s). "
                     "SURVIVAL/HYBRID = muestra oficial.\n"
                 )
             else:
                 mensaje += (
-                    f"🧾 Tracking v2.9.2: {track_info['inserted']} fallback nuevo(s). "
+                    f"🧾 Tracking v2.9.3: {track_info['inserted']} fallback nuevo(s). "
                     "Se guardan para auditoría, fuera de métricas oficiales.\n"
                 )
         except Exception as exc:
@@ -2316,13 +2333,14 @@ async def pool(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     mensaje = (
-        "🔎 MLB CANDIDATE POOL — v2.9.2\n"
+        "🔎 MLB CANDIDATE POOL — v2.9.3\n"
         f"📅 {fecha}\n"
         f"Market: {'ON' if odds_status == 'ok' else 'OFF/FALLBACK'} | "
         f"Primary: {ODDS_PRIMARY_BOOKMAKER}\n\n"
         "C=Confidence | DR=Data Reliability | MP=Model Probability Proxy | "
         "MKT=consensus no-vig | VG=value gap.\n\n"
     )
+    mensaje += _primary_feed_notice(partidos, odds_status)
     for i, p in enumerate(partidos, 1):
         icon = "✅" if p.get("eligible") else "❌"
         vg = p.get("value_gap")
@@ -2364,10 +2382,11 @@ async def market(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     mensaje = (
-        "💵 MLB MARKET AUDIT — v2.9.2\n"
+        "💵 MLB MARKET AUDIT — v2.9.3\n"
         f"📅 {fecha}\n"
         f"Primary: {ODDS_PRIMARY_BOOKMAKER} | Books: {ODDS_BOOKMAKERS}\n""⏱️ PREMATCH ONLY: juegos iniciados/live se excluyen del Market Engine.\n\n"
     )
+    mensaje += _primary_feed_notice(partidos, odds_status)
     for i, p in enumerate(partidos, 1):
         vg = p.get("value_gap")
         vg_text = "N/D" if vg is None else f"{vg * 100:+.1f} pp"
@@ -2399,6 +2418,16 @@ async def value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    primary_notice = _primary_feed_notice(partidos, odds_status)
+    if primary_notice:
+        await update.message.reply_text(
+            "🟣 MLB VALUE BOARD — v2.9.3\n"
+            f"📅 {fecha}\n\n"
+            + primary_notice
+            + "VALUE requiere un precio accionable de Hard Rock; no se sustituye por consenso."
+        )
+        return
+
     candidatos = [p for p in partidos if p.get("value_approved")]
     candidatos.sort(
         key=lambda p: (
@@ -2410,7 +2439,7 @@ async def value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     mensaje = (
-        "🟣 MLB VALUE BOARD — v2.9.2\n"
+        "🟣 MLB VALUE BOARD — v2.9.3\n"
         f"📅 {fecha}\n"
         "Regla: Model Gate aprobado + precio Hard Rock + gap ≥3.5 pp; "
         "divergencias >10 pp se mandan a REVIEW, no a VALUE automático.\n\n"
@@ -2457,13 +2486,13 @@ async def oddsdebug(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if odds_status == "not_configured":
         await update.message.reply_text(
-            "🧪 ODDS DEBUG — v2.9.2\n"
+            "🧪 ODDS DEBUG — v2.9.3\n"
             "❌ ODDS_API_KEY no configurada."
         )
         return
     if odds_status != "ok":
         await update.message.reply_text(
-            "🧪 ODDS DEBUG — v2.9.2\n"
+            "🧪 ODDS DEBUG — v2.9.3\n"
             f"❌ Odds API status: {odds_status}\n"
             f"Last error: {_ODDS_LAST_META.get('error') or 'N/D'}"
         )
@@ -2479,7 +2508,7 @@ async def oddsdebug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     primary_anywhere = ODDS_PRIMARY_BOOKMAKER in all_keys
 
     msg = (
-        "🧪 ODDS DEBUG — v2.9.2\n"
+        "🧪 ODDS DEBUG — v2.9.3\n"
         f"📅 {fecha} — {AUTO_TZ}\n"
         f"🎯 Primary esperado: {ODDS_PRIMARY_BOOKMAKER}\n"
         f"📨 Solicitados: {', '.join(requested) or 'N/D'}\n"

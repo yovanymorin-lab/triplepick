@@ -68,8 +68,8 @@ _ODDS_CACHE = {}
 _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
-# Triple Pick v2.9.1 — Tracking & Calibration Engine.
-BOT_VERSION = "2.9.1"
+# Triple Pick v2.9.2 — Odds diagnostics + Tracking & Calibration Engine.
+BOT_VERSION = "2.9.2"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -86,7 +86,7 @@ TRACK_SETTLE_HOUR = int(os.environ.get("TRACK_SETTLE_HOUR", "4"))
 TRACK_SETTLE_MINUTE = int(os.environ.get("TRACK_SETTLE_MINUTE", "30"))
 
 
-# MLB Triple Pick v2.9.1 - v2.8 Market Engine + persistent tracking/calibration layer
+# MLB Triple Pick v2.9.2 - v2.8 Market Engine + odds diagnostics + persistent tracking/calibration layer
 #
 # v2.7.1 preserves the v2.7 starter sample/recency engine and the 45/25/15/10/5
 # matchup structure. It makes 100/100 Data Reliability unavailable until both
@@ -2173,7 +2173,7 @@ async def auto_settle_tracking(context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "⚾ MLB TRIPLE PICK v2.9.1 — TRACKING & CALIBRATION\n\n"
+        "⚾ MLB TRIPLE PICK v2.9.2 — TRACKING & CALIBRATION\n\n"
         "Comandos disponibles:\n"
         "/mlb - Juegos de hoy\n"
         "/picks - Triple Pick final market-aware + tracking\n"
@@ -2181,6 +2181,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/market - Auditoría MODEL vs MARKET\n"
         "/value - Picks con señal de valor en Hard Rock\n"
         "/oddsstatus - Estado del Market Engine\n"
+        "/oddsdebug - Bookmakers recibidos por juego\n"
         "/trackstatus - Estado del Tracking Engine\n"
         "/settle - Liquidar picks finalizados\n"
         "/performance - Hit rate, ROI y Brier\n"
@@ -2214,7 +2215,7 @@ async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     value_count = sum(bool(p.get("value_approved")) for p in partidos)
 
     mensaje = (
-        "🔥 MLB TRIPLE PICK v2.9.1 — MARKET + TRACKING\n"
+        "🔥 MLB TRIPLE PICK v2.9.2 — MARKET + TRACKING\n"
         f"📅 {fecha} — {AUTO_TZ}\n\n"
         "🧠 MODEL: v2.7.1 starter sample + recency + offense + form + bullpen proxy.\n"
         "💵 MARKET: Moneyline → implied probability → no-vig → model/market agreement.\n"
@@ -2280,13 +2281,13 @@ async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             if mode == "market":
                 mensaje += (
-                    f"🧾 Tracking v2.9.1: {track_info['inserted']} nuevo(s), "
+                    f"🧾 Tracking v2.9.2: {track_info['inserted']} nuevo(s), "
                     f"{track_info['existing']} ya registrado(s). "
                     "SURVIVAL/HYBRID = muestra oficial.\n"
                 )
             else:
                 mensaje += (
-                    f"🧾 Tracking v2.9.1: {track_info['inserted']} fallback nuevo(s). "
+                    f"🧾 Tracking v2.9.2: {track_info['inserted']} fallback nuevo(s). "
                     "Se guardan para auditoría, fuera de métricas oficiales.\n"
                 )
         except Exception as exc:
@@ -2315,7 +2316,7 @@ async def pool(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     mensaje = (
-        "🔎 MLB CANDIDATE POOL — v2.9.1\n"
+        "🔎 MLB CANDIDATE POOL — v2.9.2\n"
         f"📅 {fecha}\n"
         f"Market: {'ON' if odds_status == 'ok' else 'OFF/FALLBACK'} | "
         f"Primary: {ODDS_PRIMARY_BOOKMAKER}\n\n"
@@ -2363,7 +2364,7 @@ async def market(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     mensaje = (
-        "💵 MLB MARKET AUDIT — v2.9.1\n"
+        "💵 MLB MARKET AUDIT — v2.9.2\n"
         f"📅 {fecha}\n"
         f"Primary: {ODDS_PRIMARY_BOOKMAKER} | Books: {ODDS_BOOKMAKERS}\n""⏱️ PREMATCH ONLY: juegos iniciados/live se excluyen del Market Engine.\n\n"
     )
@@ -2409,7 +2410,7 @@ async def value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     mensaje = (
-        "🟣 MLB VALUE BOARD — v2.9.1\n"
+        "🟣 MLB VALUE BOARD — v2.9.2\n"
         f"📅 {fecha}\n"
         "Regla: Model Gate aprobado + precio Hard Rock + gap ≥3.5 pp; "
         "divergencias >10 pp se mandan a REVIEW, no a VALUE automático.\n\n"
@@ -2443,6 +2444,89 @@ async def oddsstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Last request cost: {_ODDS_LAST_META.get('last') or 'N/D'}\n"
         f"Last error: {_ODDS_LAST_META.get('error') or 'ninguno'}"
     )
+
+
+async def oddsdebug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Diagnóstico seguro de bookmakers recibidos desde The Odds API.
+
+    No muestra la API key ni modifica gates/scoring. Sirve para verificar si
+    hardrockbet_fl está realmente presente en la respuesta cruda por evento.
+    """
+    fecha = local_now().strftime("%Y-%m-%d")
+    odds_status, events = await asyncio.to_thread(get_mlb_moneyline_odds, fecha)
+
+    if odds_status == "not_configured":
+        await update.message.reply_text(
+            "🧪 ODDS DEBUG — v2.9.2\n"
+            "❌ ODDS_API_KEY no configurada."
+        )
+        return
+    if odds_status != "ok":
+        await update.message.reply_text(
+            "🧪 ODDS DEBUG — v2.9.2\n"
+            f"❌ Odds API status: {odds_status}\n"
+            f"Last error: {_ODDS_LAST_META.get('error') or 'N/D'}"
+        )
+        return
+
+    requested = [b.strip() for b in ODDS_BOOKMAKERS.split(",") if b.strip()]
+    all_keys = sorted({
+        str(book.get("key"))
+        for event in events
+        for book in event.get("bookmakers", [])
+        if book.get("key")
+    })
+    primary_anywhere = ODDS_PRIMARY_BOOKMAKER in all_keys
+
+    msg = (
+        "🧪 ODDS DEBUG — v2.9.2\n"
+        f"📅 {fecha} — {AUTO_TZ}\n"
+        f"🎯 Primary esperado: {ODDS_PRIMARY_BOOKMAKER}\n"
+        f"📨 Solicitados: {', '.join(requested) or 'N/D'}\n"
+        f"📥 Recibidos globalmente: {', '.join(all_keys) or 'NINGUNO'}\n"
+        f"🏦 Primary presente en algún evento: {'SÍ' if primary_anywhere else 'NO'}\n"
+        f"📦 Eventos API: {len(events)} | Quota restante: {_ODDS_LAST_META.get('remaining') or 'N/D'}\n\n"
+    )
+
+    shown = 0
+    for event in events:
+        if not _event_is_local_date(event, fecha):
+            continue
+        # Se muestra también si ya inició para diagnosticar la respuesta cruda,
+        # pero se etiqueta LIVE/STARTED; /market sigue siendo PREMATCH ONLY.
+        pregame = _event_is_pregame(event)
+        keys = [
+            str(book.get("key"))
+            for book in event.get("bookmakers", [])
+            if book.get("key")
+        ]
+        titles = [
+            str(book.get("title") or book.get("key"))
+            for book in event.get("bookmakers", [])
+            if book.get("key")
+        ]
+        has_primary = ODDS_PRIMARY_BOOKMAKER in keys
+        away = event.get("away_team") or "Away"
+        home = event.get("home_team") or "Home"
+        state = "PREMATCH" if pregame else "STARTED/LIVE"
+        msg += (
+            f"{shown + 1}. {away} vs {home}\n"
+            f"   ⏱️ {state} | Primary: {'✅' if has_primary else '❌'}\n"
+            f"   🔑 Keys: {', '.join(keys) or 'NINGUNA'}\n"
+            f"   🏷️ Books: {', '.join(titles) or 'NINGUNO'}\n\n"
+        )
+        shown += 1
+        if shown >= 20:
+            break
+
+    if shown == 0:
+        msg += "No se encontraron eventos de la fecha local en la respuesta.\n"
+
+    msg += (
+        "ℹ️ Este comando es diagnóstico solamente: no altera picks, gates, "
+        "tracking ni calibración."
+    )
+    await _reply_long(update.message, msg)
 
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2500,6 +2584,7 @@ def main():
     app.add_handler(CommandHandler("market", market))
     app.add_handler(CommandHandler("value", value))
     app.add_handler(CommandHandler("oddsstatus", oddsstatus))
+    app.add_handler(CommandHandler("oddsdebug", oddsdebug))
     app.add_handler(CommandHandler("trackstatus", trackstatus))
     app.add_handler(CommandHandler("settle", settle))
     app.add_handler(CommandHandler("performance", performance))

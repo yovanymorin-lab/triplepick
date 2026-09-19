@@ -68,8 +68,8 @@ _ODDS_CACHE = {}
 _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
-# Triple Pick v2.9.6 — Per-game alert controls + visual menu + Market/Tracking Engine.
-BOT_VERSION = "2.9.6"
+# Triple Pick v2.9.7 — Rich Telegram pregame alerts + per-game controls + Market/Tracking Engine.
+BOT_VERSION = "2.9.7"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -85,7 +85,7 @@ TRACK_AUTO_SETTLE = os.environ.get("TRACK_AUTO_SETTLE", "1").strip().lower() not
 TRACK_SETTLE_HOUR = int(os.environ.get("TRACK_SETTLE_HOUR", "4"))
 TRACK_SETTLE_MINUTE = int(os.environ.get("TRACK_SETTLE_MINUTE", "30"))
 
-# Triple Pick v2.9.6 — Telegram pregame alerts with per-game controls.
+# Triple Pick v2.9.7 — Rich Telegram pregame alerts with pitchers, market context and short reason.
 ALERT_LEAD_MINUTES = int(os.environ.get("ALERT_LEAD_MINUTES", "45"))
 ALERTS_DEFAULT_ENABLED = os.environ.get("ALERTS_DEFAULT_ENABLED", "0").strip().lower() in {
     "1", "true", "yes", "on"
@@ -2172,7 +2172,9 @@ def _pending_alert_picks(pick_date=None):
         rows = conn.execute(
             f"""
             SELECT MAX(id) AS id, pick_date, game_pk, game_date, away, home,
-                   selection, product, odds, book
+                   selection, product, odds, book, difference, confidence,
+                   data_reliability, market_grade, model_probability,
+                   market_probability, hardrock_no_vig
             FROM tracked_picks
             {where}
               AND source IN ('TRIPLE_PICK', 'TRIPLE_PICK_FALLBACK')
@@ -2218,6 +2220,73 @@ def _alert_job_name(chat_id, row):
     return f"tp_alert_{chat_id}_{row['pick_date']}_{row['game_pk']}_{safe_selection}"
 
 
+def _get_alert_pitcher_names(game_pk):
+    """Return probable pitcher names for an alert without rebuilding the full slate."""
+    if not game_pk:
+        return "Por confirmar", "Por confirmar"
+    data = safe_get_json(
+        f"{MLB_API}/schedule",
+        params={
+            "sportId": 1,
+            "gamePk": int(game_pk),
+            "hydrate": "probablePitcher",
+        },
+        cache_ttl=60,
+    )
+    try:
+        game = data["dates"][0]["games"][0]
+        away = (
+            game.get("teams", {}).get("away", {}).get("probablePitcher", {}).get("fullName")
+            or "Por confirmar"
+        )
+        home = (
+            game.get("teams", {}).get("home", {}).get("probablePitcher", {}).get("fullName")
+            or "Por confirmar"
+        )
+        return away, home
+    except (KeyError, IndexError, TypeError):
+        return "Por confirmar", "Por confirmar"
+
+
+def _build_short_alert_reason(row):
+    """Build one compact, source-grounded reason from metrics already stored for the pick."""
+    parts = []
+    difference = row.get("difference")
+    confidence = row.get("confidence")
+    data_reliability = row.get("data_reliability")
+    market_grade = row.get("market_grade")
+
+    try:
+        difference = float(difference) if difference is not None else None
+    except (TypeError, ValueError):
+        difference = None
+    try:
+        confidence = float(confidence) if confidence is not None else None
+    except (TypeError, ValueError):
+        confidence = None
+    try:
+        data_reliability = float(data_reliability) if data_reliability is not None else None
+    except (TypeError, ValueError):
+        data_reliability = None
+
+    if difference is not None:
+        if difference >= 10:
+            parts.append(f"ventaja clara del modelo (+{difference:.1f})")
+        elif difference >= 5:
+            parts.append(f"ventaja del modelo (+{difference:.1f})")
+
+    if confidence is not None:
+        parts.append(f"confianza {confidence:.1f}/100")
+
+    if market_grade and market_grade not in {"⚪ MARKET OFF", "⚪ SIN MERCADO", "🔴 NO BET"}:
+        parts.append(str(market_grade).replace("🟢 ", "").replace("🔵 ", "").replace("🟣 ", ""))
+
+    if data_reliability is not None and data_reliability >= 85 and len(parts) < 3:
+        parts.append(f"datos {data_reliability:.0f}/100")
+
+    return " · ".join(parts[:3]) if parts else "Selección registrada por el sistema Triple Pick."
+
+
 async def _send_pick_alert_job(context: ContextTypes.DEFAULT_TYPE):
     payload = context.job.data or {}
     row = payload.get("pick") or {}
@@ -2246,14 +2315,23 @@ async def _send_pick_alert_job(context: ContextTypes.DEFAULT_TYPE):
     game_time = local_game.strftime("%I:%M %p").lstrip("0") if local_game else "N/D"
     odds_text = _format_american(row.get("odds")) if row.get("odds") is not None else "N/D"
     product = row.get("product") or "TRIPLE PICK"
+    away_pitcher, home_pitcher = await asyncio.to_thread(
+        _get_alert_pitcher_names, row.get("game_pk")
+    )
+    reason = _build_short_alert_reason(row)
+    book = row.get("book") or "N/D"
     text = (
         f"🔔 TRIPLE PICK — FALTAN {sub['lead_minutes']} MIN\n\n"
+        f"🎯 PICK: {row.get('selection')} ML\n"
         f"🏟️ {row.get('away')} vs {row.get('home')}\n"
-        f"🎯 {row.get('selection')} ML\n"
-        f"🕐 Inicio: {game_time} ({AUTO_TZ})\n"
+        f"🕐 Inicio: {game_time} ({AUTO_TZ})\n\n"
+        f"⚾ Abridores\n"
+        f"• {row.get('away')}: {away_pitcher}\n"
+        f"• {row.get('home')}: {home_pitcher}\n\n"
         f"🛡️ Producto: {product}\n"
-        f"💵 Cuota registrada: {odds_text}\n\n"
-        "Revisa alineaciones y cualquier cambio de última hora antes del inicio."
+        f"💵 Cuota: {odds_text} | {book}\n"
+        f"📌 Razón: {reason}\n\n"
+        "⚠️ Revisa alineaciones, abridores y cualquier cambio de última hora antes del inicio."
     )
     await context.bot.send_message(chat_id=chat_id, text=text)
     await asyncio.to_thread(_record_alert_delivery, chat_id, row, scheduled_for)
@@ -2709,7 +2787,7 @@ async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     value_count = sum(bool(p.get("value_approved")) for p in partidos)
 
     mensaje = (
-        "🔥 MLB TRIPLE PICK v2.9.5 — MARKET + TRACKING\n"
+        f"🔥 MLB TRIPLE PICK v{BOT_VERSION} — MARKET + TRACKING\n"
         f"📅 {fecha} — {AUTO_TZ}\n\n"
         "🧠 MODEL: v2.7.1 starter sample + recency + offense + form + bullpen proxy.\n"
         "💵 MARKET: Moneyline → implied probability → no-vig → model/market agreement.\n"

@@ -1,5 +1,5 @@
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters
 import asyncio
 import math
 import os
@@ -68,8 +68,8 @@ _ODDS_CACHE = {}
 _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
-# Triple Pick v2.9.5 — Visual menu + 45-minute Telegram alerts + Market/Tracking Engine.
-BOT_VERSION = "2.9.4"
+# Triple Pick v2.9.6 — Per-game alert controls + visual menu + Market/Tracking Engine.
+BOT_VERSION = "2.9.6"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -85,7 +85,7 @@ TRACK_AUTO_SETTLE = os.environ.get("TRACK_AUTO_SETTLE", "1").strip().lower() not
 TRACK_SETTLE_HOUR = int(os.environ.get("TRACK_SETTLE_HOUR", "4"))
 TRACK_SETTLE_MINUTE = int(os.environ.get("TRACK_SETTLE_MINUTE", "30"))
 
-# Triple Pick v2.9.5 — Telegram pregame alerts.
+# Triple Pick v2.9.6 — Telegram pregame alerts with per-game controls.
 ALERT_LEAD_MINUTES = int(os.environ.get("ALERT_LEAD_MINUTES", "45"))
 ALERTS_DEFAULT_ENABLED = os.environ.get("ALERTS_DEFAULT_ENABLED", "0").strip().lower() in {
     "1", "true", "yes", "on"
@@ -1657,6 +1657,19 @@ def init_tracking_db():
 
             CREATE INDEX IF NOT EXISTS idx_alert_deliveries_date
             ON alert_deliveries(pick_date, chat_id);
+
+            CREATE TABLE IF NOT EXISTS alert_game_settings (
+                chat_id INTEGER NOT NULL,
+                pick_date TEXT NOT NULL,
+                game_pk INTEGER NOT NULL,
+                selection TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(chat_id, pick_date, game_pk, selection)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_alert_game_settings_chat_date
+            ON alert_game_settings(chat_id, pick_date);
             """
         )
 
@@ -2105,6 +2118,49 @@ def _enabled_alert_chats():
         ).fetchall()
 
 
+def _set_game_alert_enabled(chat_id, pick_date, game_pk, selection, enabled):
+    init_tracking_db()
+    with _tracking_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO alert_game_settings(
+                chat_id, pick_date, game_pk, selection, enabled, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id, pick_date, game_pk, selection) DO UPDATE SET
+                enabled=excluded.enabled,
+                updated_at=excluded.updated_at
+            """,
+            (
+                int(chat_id), pick_date, int(game_pk), selection,
+                int(bool(enabled)), local_now().isoformat(),
+            ),
+        )
+
+
+def _game_alert_enabled(chat_id, pick_date, game_pk, selection):
+    """Per-game alerts default ON unless explicitly disabled."""
+    init_tracking_db()
+    with _tracking_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT enabled FROM alert_game_settings
+            WHERE chat_id=? AND pick_date=? AND game_pk=? AND selection=?
+            """,
+            (int(chat_id), pick_date, int(game_pk), selection),
+        ).fetchone()
+    return True if row is None else bool(row["enabled"])
+
+
+def _alert_status(chat_id, row, global_enabled=True):
+    if _alert_was_sent(chat_id, row["pick_date"], row["game_pk"], row["selection"]):
+        return "ENVIADA"
+    if not global_enabled or not _game_alert_enabled(
+        chat_id, row["pick_date"], row["game_pk"], row["selection"]
+    ):
+        return "DESACTIVADA"
+    return "PENDIENTE"
+
+
 def _pending_alert_picks(pick_date=None):
     init_tracking_db()
     params = []
@@ -2175,6 +2231,11 @@ async def _send_pick_alert_job(context: ContextTypes.DEFAULT_TYPE):
     sub = await asyncio.to_thread(_get_alert_subscription, chat_id)
     if not sub.get("enabled"):
         return
+    game_enabled = await asyncio.to_thread(
+        _game_alert_enabled, chat_id, row.get("pick_date"), row.get("game_pk"), row.get("selection")
+    )
+    if not game_enabled:
+        return
     if await asyncio.to_thread(
         _alert_was_sent, chat_id, row.get("pick_date"), row.get("game_pk"), row.get("selection")
     ):
@@ -2216,6 +2277,11 @@ async def schedule_alert_jobs(application, pick_date=None):
         chat_id = int(chat["chat_id"])
         lead = int(chat["lead_minutes"] or ALERT_LEAD_MINUTES)
         for row in rows:
+            if not await asyncio.to_thread(
+                _game_alert_enabled, chat_id, row["pick_date"], row["game_pk"], row["selection"]
+            ):
+                skipped += 1
+                continue
             if await asyncio.to_thread(
                 _alert_was_sent, chat_id, row["pick_date"], row["game_pk"], row["selection"]
             ):
@@ -2297,44 +2363,94 @@ async def alerts_disable(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def _build_alerts_panel(chat_id):
+    sub = await asyncio.to_thread(_get_alert_subscription, chat_id)
+    rows = await asyncio.to_thread(_pending_alert_picks, None)
+    now_utc = datetime.now(timezone.utc)
+    items = []
+    counts = {"PENDIENTE": 0, "ENVIADA": 0, "DESACTIVADA": 0}
+
+    for row in rows:
+        game_dt = _parse_iso_utc(row["game_date"])
+        if not game_dt:
+            continue
+        status = await asyncio.to_thread(_alert_status, chat_id, row, sub["enabled"])
+        if status in counts:
+            counts[status] += 1
+        alert_dt = game_dt - timedelta(minutes=sub["lead_minutes"])
+        if game_dt > now_utc or status == "ENVIADA":
+            items.append((row, game_dt, alert_dt, status))
+
+    lines = [
+        "📋 ALERTAS TRIPLE PICK",
+        f"Estado global: {'ACTIVAS' if sub['enabled'] else 'DESACTIVADAS'}",
+        f"Pendientes: {counts['PENDIENTE']} | Enviadas: {counts['ENVIADA']} | Desactivadas: {counts['DESACTIVADA']}",
+        "",
+    ]
+    keyboard = []
+    for idx, (row, game_dt, alert_dt, status) in enumerate(items[:12], 1):
+        status_icon = {"PENDIENTE": "🟡", "ENVIADA": "✅", "DESACTIVADA": "⛔"}.get(status, "•")
+        lines.append(
+            f"{idx}. {status_icon} {row['selection']} ML — {row['away']} vs {row['home']}\n"
+            f"   ⚾ Juego: {game_dt.astimezone(LOCAL_TZ).strftime('%m/%d %I:%M %p').lstrip('0')}\n"
+            f"   🔔 Aviso: {alert_dt.astimezone(LOCAL_TZ).strftime('%m/%d %I:%M %p').lstrip('0')}\n"
+            f"   Estado: {status}"
+        )
+        if status != "ENVIADA":
+            action = "off" if status == "PENDIENTE" else "on"
+            label = "⛔ Desactivar" if action == "off" else "✅ Activar"
+            callback = f"alertgame|{action}|{row['pick_date']}|{row['game_pk']}|{idx}"
+            keyboard.append([InlineKeyboardButton(f"{label} · {row['selection']}", callback_data=callback)])
+
+    if not items:
+        lines.append("No hay alertas registradas para mostrar en este momento.")
+    return "\n".join(lines), InlineKeyboardMarkup(keyboard) if keyboard else None, items
+
+
 async def alerts_upcoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    sub = await asyncio.to_thread(_get_alert_subscription, chat_id)
-    if not sub["enabled"]:
-        await update.message.reply_text(
-            "🔔 Las alertas están desactivadas. Pulsa ✅ Activar alertas para habilitarlas.",
-            reply_markup=ALERT_MENU_KEYBOARD,
-        )
+    text, inline_markup, _items = await _build_alerts_panel(chat_id)
+    await update.message.reply_text(
+        text,
+        reply_markup=inline_markup if inline_markup is not None else ALERT_MENU_KEYBOARD,
+    )
+
+
+async def alert_game_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    parts = (query.data or "").split("|")
+    if len(parts) != 5 or parts[0] != "alertgame":
+        return
+    _prefix, action, pick_date, game_pk_text, idx_text = parts
+    try:
+        game_pk = int(game_pk_text)
+        idx = int(idx_text) - 1
+    except ValueError:
         return
 
     rows = await asyncio.to_thread(_pending_alert_picks, None)
-    now_utc = datetime.now(timezone.utc)
-    upcoming = []
-    for row in rows:
-        game_dt = _parse_iso_utc(row["game_date"])
-        if not game_dt or game_dt <= now_utc:
-            continue
-        alert_dt = game_dt - timedelta(minutes=sub["lead_minutes"])
-        if alert_dt <= now_utc:
-            continue
-        if await asyncio.to_thread(
-            _alert_was_sent, chat_id, row["pick_date"], row["game_pk"], row["selection"]
-        ):
-            continue
-        upcoming.append((row, game_dt, alert_dt))
+    candidates = [r for r in rows if r["pick_date"] == pick_date and int(r["game_pk"]) == game_pk]
+    if not candidates:
+        await query.edit_message_text("⚠️ Esa selección ya no está disponible en el tracking.")
+        return
+    row = candidates[0]
+    enabled = action == "on"
+    await asyncio.to_thread(
+        _set_game_alert_enabled, chat_id, row["pick_date"], row["game_pk"], row["selection"], enabled
+    )
 
-    if not upcoming:
-        text = "📋 No hay alertas futuras pendientes en este momento."
-    else:
-        lines = ["📋 PRÓXIMAS ALERTAS\n"]
-        for row, game_dt, alert_dt in upcoming[:12]:
-            lines.append(
-                f"• {row['selection']} ML — {row['away']} vs {row['home']}\n"
-                f"  🔔 {alert_dt.astimezone(LOCAL_TZ).strftime('%m/%d %I:%M %p').lstrip('0')} | "
-                f"⚾ {game_dt.astimezone(LOCAL_TZ).strftime('%I:%M %p').lstrip('0')}"
-            )
-        text = "\n".join(lines)
-    await update.message.reply_text(text, reply_markup=ALERT_MENU_KEYBOARD)
+    if context.application.job_queue is not None:
+        name = _alert_job_name(chat_id, row)
+        for job in context.application.job_queue.get_jobs_by_name(name):
+            job.schedule_removal()
+        if enabled:
+            await schedule_alert_jobs(context.application, row["pick_date"])
+
+    text, inline_markup, _items = await _build_alerts_panel(chat_id)
+    await query.edit_message_text(text, reply_markup=inline_markup)
+
 
 async def trackstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -3003,6 +3119,7 @@ def main():
     app.add_handler(CommandHandler("alerts", alerts_menu))
     app.add_handler(CommandHandler("alertson", alerts_enable))
     app.add_handler(CommandHandler("alertsoff", alerts_disable))
+    app.add_handler(CallbackQueryHandler(alert_game_callback, pattern=r"^alertgame\|"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, visual_menu_router))
 
     if app.job_queue is not None:

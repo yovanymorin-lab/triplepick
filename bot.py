@@ -1,5 +1,5 @@
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 import asyncio
 import math
 import os
@@ -69,7 +69,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.3 — Primary-feed degradation notice + Odds diagnostics + Tracking & Calibration Engine.
-BOT_VERSION = "2.9.3"
+BOT_VERSION = "2.9.4"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -2187,25 +2187,80 @@ async def auto_settle_tracking(context: ContextTypes.DEFAULT_TYPE):
         print(f"❌ Tracking auto-settle error: {exc}")
 
 
+# ---------------------------------------------------------------------------
+# v2.9.4 VISUAL MENU
+# ---------------------------------------------------------------------------
+
+MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["⚾ Picks de hoy", "📊 Estado"],
+        ["📈 Rendimiento", "🧮 Mercado"],
+        ["📋 Historial", "🔔 Alertas"],
+        ["⚾ Juegos MLB", "🧪 Más opciones"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+    input_field_placeholder="Selecciona una opción de Triple Pick",
+)
+
+
+def _menu_text():
+    return (
+        f"⚾ MLB TRIPLE PICK v{BOT_VERSION}\n\n"
+        "Selecciona una opción del menú. Los comandos tradicionales siguen disponibles.\n\n"
+        "⚾ Picks de hoy — Triple Pick final\n"
+        "📊 Estado — Tracking Engine\n"
+        "📈 Rendimiento — Hit rate, ROI y Brier\n"
+        "🧮 Mercado — MODEL vs MARKET\n"
+        "📋 Historial — Picks registrados\n"
+        "🔔 Alertas — Estado de automatización\n"
+        "⚾ Juegos MLB — Cartelera de hoy\n"
+        "🧪 Más opciones — Herramientas avanzadas"
+    )
+
+
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(_menu_text(), reply_markup=MAIN_MENU_KEYBOARD)
+
+
+async def menu_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🧪 HERRAMIENTAS AVANZADAS\n\n"
+        "/pool — Candidate Pool completo\n"
+        "/value — Value Board Hard Rock\n"
+        "/oddsstatus — Estado del Market Engine\n"
+        "/oddsdebug — Diagnóstico de bookmakers\n"
+        "/settle — Liquidar picks finalizados\n"
+        "/calibration — Calibración del modelo\n"
+        "/myid — ID de este chat\n\n"
+        "Puedes seguir usando el menú inferior para las funciones principales.",
+        reply_markup=MAIN_MENU_KEYBOARD,
+    )
+
+
+async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Route visual keyboard labels to the existing command functions."""
+    text = (update.message.text or "").strip()
+    routes = {
+        "⚾ Picks de hoy": picks,
+        "📊 Estado": trackstatus,
+        "📈 Rendimiento": performance,
+        "🧮 Mercado": market,
+        "📋 Historial": history,
+        "🔔 Alertas": autostatus,
+        "⚾ Juegos MLB": mlb,
+        "🧪 Más opciones": menu_more,
+    }
+    handler = routes.get(text)
+    if handler is not None:
+        await handler(update, context)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "⚾ MLB TRIPLE PICK v2.9.3 — TRACKING & CALIBRATION\n\n"
-        "Comandos disponibles:\n"
-        "/mlb - Juegos de hoy\n"
-        "/picks - Triple Pick final market-aware + tracking\n"
-        "/pool - Candidate Pool completo\n"
-        "/market - Auditoría MODEL vs MARKET\n"
-        "/value - Picks con señal de valor en Hard Rock\n"
-        "/oddsstatus - Estado del Market Engine\n"
-        "/oddsdebug - Bookmakers recibidos por juego\n"
-        "/trackstatus - Estado del Tracking Engine\n"
-        "/settle - Liquidar picks finalizados\n"
-        "/performance - Hit rate, ROI y Brier\n"
-        "/calibration - Predicted vs Actual por bins\n"
-        "/history - Últimos picks registrados\n"
-        "/myid - ID de este chat\n"
-        "/autostatus - Estado del envío automático\n\n"
-        "Pipeline: MODEL → MARKET → NO-VIG → AGREEMENT → FINAL PICK → TRACK → SETTLE → CALIBRATE"
+        _menu_text() +
+        "\n\nPipeline: MODEL → MARKET → NO-VIG → AGREEMENT → FINAL PICK → TRACK → SETTLE → CALIBRATE",
+        reply_markup=MAIN_MENU_KEYBOARD,
     )
 
 
@@ -2607,6 +2662,7 @@ def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", menu))
     app.add_handler(CommandHandler("mlb", mlb))
     app.add_handler(CommandHandler("picks", picks))
     app.add_handler(CommandHandler("pool", pool))
@@ -2621,6 +2677,7 @@ def main():
     app.add_handler(CommandHandler("history", history))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("autostatus", autostatus))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, visual_menu_router))
 
     if app.job_queue is not None:
         tz = LOCAL_TZ
@@ -2660,7 +2717,7 @@ def main():
             "python-telegram-bot[job-queue] en requirements.txt."
         )
 
-    print("🤖 Bot MLB Triple Pick v2.9.1 iniciado...")
+    print(f"🤖 Bot MLB Triple Pick v{BOT_VERSION} iniciado...")
     app.run_polling()
 
 

@@ -3003,7 +3003,7 @@ def main():
         )
 
     print("🤖 Bot MLB Triple Pick v2.9 iniciado...")
-    app.run_polling()
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":

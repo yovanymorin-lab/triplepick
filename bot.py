@@ -1,8 +1,5 @@
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler,
-    PreCheckoutQueryHandler, MessageHandler, filters
-)
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
+from telegram.ext import (ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, PreCheckoutQueryHandler, filters)
 import asyncio
 import math
 import os
@@ -71,8 +68,8 @@ _ODDS_CACHE = {}
 _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
-# Triple Pick v2.9 — Tracking & Calibration Engine.
-BOT_VERSION = "2.9"
+# Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
+BOT_VERSION = "2.9.8"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -87,7 +84,6 @@ TRACK_AUTO_SETTLE = os.environ.get("TRACK_AUTO_SETTLE", "1").strip().lower() not
 }
 TRACK_SETTLE_HOUR = int(os.environ.get("TRACK_SETTLE_HOUR", "4"))
 TRACK_SETTLE_MINUTE = int(os.environ.get("TRACK_SETTLE_MINUTE", "30"))
-
 
 # Triple Pick Membership / Telegram Stars
 # Subscription prices are configured in Stars, not USD.
@@ -108,8 +104,24 @@ SUBSCRIPTION_ADMIN_IDS = {
 PLAN_RANK = {"FREE": 0, "PREMIUM": 1, "PRO": 2}
 
 
+# Triple Pick v2.9.7 — Telegram pregame alerts + optional Twilio SMS channel.
+ALERT_LEAD_MINUTES = int(os.environ.get("ALERT_LEAD_MINUTES", "45"))
+ALERTS_DEFAULT_ENABLED = os.environ.get("ALERTS_DEFAULT_ENABLED", "0").strip().lower() in {
+    "1", "true", "yes", "on"
+}
 
-# MLB Triple Pick v2.9 - v2.8 Market Engine + persistent tracking/calibration layer
+# Optional Twilio SMS channel. Secrets stay in Railway environment variables.
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
+TWILIO_FROM_NUMBER = os.environ.get("TWILIO_FROM_NUMBER", "").strip()
+TWILIO_MESSAGING_SERVICE_SID = os.environ.get("TWILIO_MESSAGING_SERVICE_SID", "").strip()
+SMS_DEFAULT_TO_NUMBER = os.environ.get("SMS_TO_NUMBER", "").strip()
+SMS_DEFAULT_ENABLED = os.environ.get("SMS_DEFAULT_ENABLED", "0").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+
+
+# MLB Triple Pick v2.9.5 - v2.8 Market Engine + primary-feed degradation notice + odds diagnostics + persistent tracking/calibration layer
 #
 # v2.7.1 preserves the v2.7 starter sample/recency engine and the 45/25/15/10/5
 # matchup structure. It makes 100/100 Data Reliability unavailable until both
@@ -1245,12 +1257,22 @@ def _event_is_local_date(event, fecha):
     return dt.astimezone(LOCAL_TZ).strftime("%Y-%m-%d") == fecha
 
 
+def _event_is_pregame(event):
+    """Only allow pregame market snapshots; never mix live odds with pregame model output."""
+    dt = _parse_iso_utc(event.get("commence_time"))
+    if dt is None:
+        return True
+    return dt > datetime.now(timezone.utc)
+
+
 def _find_odds_event(partido, events, fecha):
     away_key = _normalize_team_name(partido.get("away"))
     home_key = _normalize_team_name(partido.get("home"))
     candidates = []
     for event in events:
         if not _event_is_local_date(event, fecha):
+            continue
+        if not _event_is_pregame(event):
             continue
         if (
             _normalize_team_name(event.get("away_team")) == away_key
@@ -1487,6 +1509,22 @@ def build_daily_matchups_v28(fecha, season):
     return "ok", partidos, odds_status
 
 
+def _primary_feed_notice(partidos, odds_status):
+    """Transparent degradation notice when the primary book is absent from an otherwise healthy feed."""
+    if odds_status != "ok":
+        return ""
+    market_rows = [p for p in partidos if p.get("market_available")]
+    if not market_rows:
+        return ""
+    if any(p.get("hardrock_available") for p in market_rows):
+        return ""
+    return (
+        "⚠️ HARD ROCK TEMPORALMENTE NO DISPONIBLE EN EL FEED\n"
+        "🛡️ SURVIVAL: evaluado con el consenso de mercado disponible.\n"
+        "🟣 VALUE: suspendido hasta recuperar precio Hard Rock.\n\n"
+    )
+
+
 def _format_american(price):
     if price is None:
         return "N/D"
@@ -1555,7 +1593,7 @@ async def _reply_long(message_obj, text, limit=3900):
 
 
 # ---------------------------------------------------------------------------
-# v2.9 TRACKING & CALIBRATION ENGINE
+# v2.9.1 TRACKING & CALIBRATION ENGINE
 # ---------------------------------------------------------------------------
 
 
@@ -1572,7 +1610,7 @@ def _tracking_connection():
 
 
 def init_tracking_db():
-    """Create the v2.9 tracking schema without modifying any existing records."""
+    """Create the v2.9.1 tracking schema without modifying any existing records."""
     with _tracking_connection() as conn:
         conn.executescript(
             """
@@ -1628,48 +1666,64 @@ def init_tracking_db():
             CREATE INDEX IF NOT EXISTS idx_tracked_picks_official
             ON tracked_picks(official, product, result);
 
-            CREATE TABLE IF NOT EXISTS subscriptions (
-                user_id INTEGER NOT NULL,
-                plan TEXT NOT NULL,
-                username TEXT,
-                first_name TEXT,
-                status TEXT NOT NULL DEFAULT 'ACTIVE',
-                started_at INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL,
-                charge_id TEXT NOT NULL,
-                is_recurring INTEGER NOT NULL DEFAULT 1,
-                updated_at INTEGER NOT NULL,
-                PRIMARY KEY (user_id, plan)
+            CREATE TABLE IF NOT EXISTS alert_subscriptions (
+                chat_id INTEGER PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                lead_minutes INTEGER NOT NULL DEFAULT 45,
+                updated_at TEXT NOT NULL
             );
 
-            CREATE INDEX IF NOT EXISTS idx_subscriptions_active
-            ON subscriptions(user_id, status, expires_at);
-
-            CREATE TABLE IF NOT EXISTS subscription_payments (
+            CREATE TABLE IF NOT EXISTS alert_deliveries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                plan TEXT NOT NULL,
-                amount_stars INTEGER NOT NULL,
-                charge_id TEXT NOT NULL UNIQUE,
-                invoice_payload TEXT NOT NULL,
-                paid_at INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL,
-                is_recurring INTEGER NOT NULL DEFAULT 0,
-                is_first_recurring INTEGER NOT NULL DEFAULT 0
+                chat_id INTEGER NOT NULL,
+                pick_date TEXT NOT NULL,
+                game_pk INTEGER NOT NULL,
+                selection TEXT NOT NULL,
+                scheduled_for TEXT NOT NULL,
+                sent_at TEXT NOT NULL,
+                UNIQUE(chat_id, pick_date, game_pk, selection)
             );
 
-            CREATE TABLE IF NOT EXISTS membership_users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                trial_started_at INTEGER NOT NULL,
-                trial_expires_at INTEGER NOT NULL,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
+            CREATE INDEX IF NOT EXISTS idx_alert_deliveries_date
+            ON alert_deliveries(pick_date, chat_id);
+
+            CREATE TABLE IF NOT EXISTS alert_game_settings (
+                chat_id INTEGER NOT NULL,
+                pick_date TEXT NOT NULL,
+                game_pk INTEGER NOT NULL,
+                selection TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(chat_id, pick_date, game_pk, selection)
             );
 
-            CREATE INDEX IF NOT EXISTS idx_membership_trial_expiry
-            ON membership_users(trial_expires_at);
+            CREATE INDEX IF NOT EXISTS idx_alert_game_settings_chat_date
+            ON alert_game_settings(chat_id, pick_date);
+
+
+            CREATE TABLE IF NOT EXISTS sms_subscriptions (
+                chat_id INTEGER PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                phone_number TEXT,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS sms_deliveries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                pick_date TEXT NOT NULL,
+                game_pk INTEGER NOT NULL,
+                selection TEXT NOT NULL,
+                phone_number TEXT,
+                provider_sid TEXT,
+                status TEXT NOT NULL,
+                error TEXT,
+                sent_at TEXT NOT NULL,
+                UNIQUE(chat_id, pick_date, game_pk, selection)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sms_deliveries_date
+            ON sms_deliveries(pick_date, chat_id);
             """
         )
 
@@ -2073,6 +2127,637 @@ def _format_units(value):
     return f"{float(value):+.2f}u"
 
 
+
+def _twilio_configured():
+    sender_ok = bool(TWILIO_FROM_NUMBER or TWILIO_MESSAGING_SERVICE_SID)
+    return bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and sender_ok)
+
+
+def _normalize_e164(value):
+    """Return a conservative E.164 phone number or None."""
+    text = (value or "").strip()
+    text = re.sub(r"[\s().-]+", "", text)
+    if not re.fullmatch(r"\+[1-9]\d{7,14}", text):
+        return None
+    return text
+
+
+def _mask_phone(value):
+    phone = _normalize_e164(value)
+    if not phone:
+        return "NO CONFIGURADO"
+    if len(phone) <= 6:
+        return phone
+    return phone[:3] + "••••" + phone[-4:]
+
+
+def _get_sms_subscription(chat_id):
+    init_tracking_db()
+    with _tracking_connection() as conn:
+        row = conn.execute(
+            "SELECT enabled, phone_number, updated_at FROM sms_subscriptions WHERE chat_id=?",
+            (int(chat_id),),
+        ).fetchone()
+    if row is None:
+        return {
+            "enabled": SMS_DEFAULT_ENABLED,
+            "phone_number": _normalize_e164(SMS_DEFAULT_TO_NUMBER),
+            "updated_at": None,
+        }
+    return {
+        "enabled": bool(row["enabled"]),
+        "phone_number": _normalize_e164(row["phone_number"]),
+        "updated_at": row["updated_at"],
+    }
+
+
+def _set_sms_subscription(chat_id, enabled=None, phone_number=None):
+    init_tracking_db()
+    current = _get_sms_subscription(chat_id)
+    final_enabled = current["enabled"] if enabled is None else bool(enabled)
+    final_phone = current["phone_number"]
+    if phone_number is not None:
+        final_phone = _normalize_e164(phone_number)
+        if not final_phone:
+            raise ValueError("Número inválido. Usa formato E.164, por ejemplo +17865551234")
+    with _tracking_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO sms_subscriptions(chat_id, enabled, phone_number, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                enabled=excluded.enabled,
+                phone_number=excluded.phone_number,
+                updated_at=excluded.updated_at
+            """,
+            (int(chat_id), int(final_enabled), final_phone, local_now().isoformat()),
+        )
+    return {"enabled": final_enabled, "phone_number": final_phone}
+
+
+def _sms_was_sent(chat_id, pick_date, game_pk, selection):
+    init_tracking_db()
+    with _tracking_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT 1 FROM sms_deliveries
+            WHERE chat_id=? AND pick_date=? AND game_pk=? AND selection=? AND status='SENT'
+            """,
+            (int(chat_id), pick_date, int(game_pk), selection),
+        ).fetchone()
+    return row is not None
+
+
+def _record_sms_delivery(chat_id, row, phone_number, status, provider_sid=None, error=None):
+    init_tracking_db()
+    with _tracking_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO sms_deliveries(
+                chat_id, pick_date, game_pk, selection, phone_number,
+                provider_sid, status, error, sent_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id, pick_date, game_pk, selection) DO UPDATE SET
+                phone_number=excluded.phone_number,
+                provider_sid=excluded.provider_sid,
+                status=excluded.status,
+                error=excluded.error,
+                sent_at=excluded.sent_at
+            """,
+            (
+                int(chat_id), row.get("pick_date"), int(row.get("game_pk")), row.get("selection"),
+                phone_number, provider_sid, status, error, local_now().isoformat(),
+            ),
+        )
+
+
+def _send_twilio_sms(to_number, body):
+    """Send one SMS through Twilio REST API. Returns (ok, sid, error)."""
+    to_number = _normalize_e164(to_number)
+    if not to_number:
+        return False, None, "Número SMS inválido"
+    if not _twilio_configured():
+        return False, None, "Twilio no configurado"
+
+    url = (
+        f"https://api.twilio.com/2010-04-01/Accounts/"
+        f"{TWILIO_ACCOUNT_SID}/Messages.json"
+    )
+    data = {"To": to_number, "Body": body}
+    if TWILIO_MESSAGING_SERVICE_SID:
+        data["MessagingServiceSid"] = TWILIO_MESSAGING_SERVICE_SID
+    else:
+        data["From"] = TWILIO_FROM_NUMBER
+
+    try:
+        response = _HTTP.post(
+            url,
+            data=data,
+            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+            timeout=12,
+        )
+        payload = response.json() if response.content else {}
+        if response.ok:
+            return True, payload.get("sid"), None
+        message = payload.get("message") or f"HTTP {response.status_code}"
+        return False, payload.get("sid"), str(message)[:300]
+    except (requests.RequestException, ValueError) as exc:
+        return False, None, str(exc)[:300]
+
+
+def _set_alert_subscription(chat_id, enabled, lead_minutes=ALERT_LEAD_MINUTES):
+    init_tracking_db()
+    with _tracking_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO alert_subscriptions(chat_id, enabled, lead_minutes, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                enabled=excluded.enabled,
+                lead_minutes=excluded.lead_minutes,
+                updated_at=excluded.updated_at
+            """,
+            (int(chat_id), int(bool(enabled)), int(lead_minutes), local_now().isoformat()),
+        )
+
+
+def _get_alert_subscription(chat_id):
+    init_tracking_db()
+    with _tracking_connection() as conn:
+        row = conn.execute(
+            "SELECT enabled, lead_minutes, updated_at FROM alert_subscriptions WHERE chat_id=?",
+            (int(chat_id),),
+        ).fetchone()
+    if row is None:
+        return {
+            "enabled": ALERTS_DEFAULT_ENABLED,
+            "lead_minutes": ALERT_LEAD_MINUTES,
+            "updated_at": None,
+        }
+    return {
+        "enabled": bool(row["enabled"]),
+        "lead_minutes": int(row["lead_minutes"] or ALERT_LEAD_MINUTES),
+        "updated_at": row["updated_at"],
+    }
+
+
+def _enabled_alert_chats():
+    init_tracking_db()
+    with _tracking_connection() as conn:
+        return conn.execute(
+            "SELECT chat_id, lead_minutes FROM alert_subscriptions WHERE enabled=1"
+        ).fetchall()
+
+
+def _set_game_alert_enabled(chat_id, pick_date, game_pk, selection, enabled):
+    init_tracking_db()
+    with _tracking_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO alert_game_settings(
+                chat_id, pick_date, game_pk, selection, enabled, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id, pick_date, game_pk, selection) DO UPDATE SET
+                enabled=excluded.enabled,
+                updated_at=excluded.updated_at
+            """,
+            (
+                int(chat_id), pick_date, int(game_pk), selection,
+                int(bool(enabled)), local_now().isoformat(),
+            ),
+        )
+
+
+def _game_alert_enabled(chat_id, pick_date, game_pk, selection):
+    """Per-game alerts default ON unless explicitly disabled."""
+    init_tracking_db()
+    with _tracking_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT enabled FROM alert_game_settings
+            WHERE chat_id=? AND pick_date=? AND game_pk=? AND selection=?
+            """,
+            (int(chat_id), pick_date, int(game_pk), selection),
+        ).fetchone()
+    return True if row is None else bool(row["enabled"])
+
+
+def _alert_status(chat_id, row, global_enabled=True):
+    if _alert_was_sent(chat_id, row["pick_date"], row["game_pk"], row["selection"]):
+        return "ENVIADA"
+    if not global_enabled or not _game_alert_enabled(
+        chat_id, row["pick_date"], row["game_pk"], row["selection"]
+    ):
+        return "DESACTIVADA"
+    return "PENDIENTE"
+
+
+def _pending_alert_picks(pick_date=None):
+    init_tracking_db()
+    params = []
+    where = "WHERE result='PENDING' AND game_date IS NOT NULL"
+    if pick_date:
+        where += " AND pick_date=?"
+        params.append(pick_date)
+    with _tracking_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT MAX(id) AS id, pick_date, game_pk, game_date, away, home,
+                   selection, product, odds, book
+            FROM tracked_picks
+            {where}
+              AND source IN ('TRIPLE_PICK', 'TRIPLE_PICK_FALLBACK')
+            GROUP BY pick_date, game_pk, selection
+            ORDER BY game_date ASC
+            """,
+            params,
+        ).fetchall()
+    return rows
+
+
+def _alert_was_sent(chat_id, pick_date, game_pk, selection):
+    init_tracking_db()
+    with _tracking_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT 1 FROM alert_deliveries
+            WHERE chat_id=? AND pick_date=? AND game_pk=? AND selection=?
+            """,
+            (int(chat_id), pick_date, int(game_pk), selection),
+        ).fetchone()
+    return row is not None
+
+
+def _record_alert_delivery(chat_id, row, scheduled_for):
+    init_tracking_db()
+    with _tracking_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO alert_deliveries(
+                chat_id, pick_date, game_pk, selection, scheduled_for, sent_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(chat_id), row["pick_date"], int(row["game_pk"]), row["selection"],
+                scheduled_for.isoformat(), local_now().isoformat(),
+            ),
+        )
+
+
+def _alert_job_name(chat_id, row):
+    safe_selection = re.sub(r"[^a-zA-Z0-9]+", "_", str(row["selection"]))[:40]
+    return f"tp_alert_{chat_id}_{row['pick_date']}_{row['game_pk']}_{safe_selection}"
+
+
+async def _send_pick_alert_job(context: ContextTypes.DEFAULT_TYPE):
+    payload = context.job.data or {}
+    row = payload.get("pick") or {}
+    chat_id = int(payload.get("chat_id"))
+    scheduled_for_iso = payload.get("scheduled_for")
+    try:
+        scheduled_for = datetime.fromisoformat(scheduled_for_iso)
+    except Exception:
+        scheduled_for = local_now()
+
+    sub = await asyncio.to_thread(_get_alert_subscription, chat_id)
+    if not sub.get("enabled"):
+        return
+    game_enabled = await asyncio.to_thread(
+        _game_alert_enabled, chat_id, row.get("pick_date"), row.get("game_pk"), row.get("selection")
+    )
+    if not game_enabled:
+        return
+    if await asyncio.to_thread(
+        _alert_was_sent, chat_id, row.get("pick_date"), row.get("game_pk"), row.get("selection")
+    ):
+        return
+
+    game_dt = _parse_iso_utc(row.get("game_date"))
+    local_game = game_dt.astimezone(LOCAL_TZ) if game_dt else None
+    game_time = local_game.strftime("%I:%M %p").lstrip("0") if local_game else "N/D"
+    odds_text = _format_american(row.get("odds")) if row.get("odds") is not None else "N/D"
+    product = row.get("product") or "TRIPLE PICK"
+    text = (
+        f"🔔 TRIPLE PICK — FALTAN {sub['lead_minutes']} MIN\n\n"
+        f"🏟️ {row.get('away')} vs {row.get('home')}\n"
+        f"🎯 {row.get('selection')} ML\n"
+        f"🕐 Inicio: {game_time} ({AUTO_TZ})\n"
+        f"🛡️ Producto: {product}\n"
+        f"💵 Cuota registrada: {odds_text}\n\n"
+        "Revisa alineaciones y cualquier cambio de última hora antes del inicio."
+    )
+    await context.bot.send_message(chat_id=chat_id, text=text)
+    await asyncio.to_thread(_record_alert_delivery, chat_id, row, scheduled_for)
+
+    # SMS is a supplemental channel. Telegram remains the primary delivery.
+    sms_sub = await asyncio.to_thread(_get_sms_subscription, chat_id)
+    if sms_sub.get("enabled") and sms_sub.get("phone_number"):
+        already_sms = await asyncio.to_thread(
+            _sms_was_sent, chat_id, row.get("pick_date"), row.get("game_pk"), row.get("selection")
+        )
+        if not already_sms:
+            sms_body = (
+                f"TRIPLE PICK: faltan {sub['lead_minutes']} min. "
+                f"{row.get('selection')} ML | {row.get('away')} vs {row.get('home')} | "
+                f"Inicio {game_time}. Revisa cambios de ultima hora. Juega responsablemente."
+            )
+            ok, sid, error = await asyncio.to_thread(
+                _send_twilio_sms, sms_sub["phone_number"], sms_body
+            )
+            await asyncio.to_thread(
+                _record_sms_delivery, chat_id, row, sms_sub["phone_number"],
+                "SENT" if ok else "FAILED", sid, error
+            )
+            if not ok:
+                print(f"⚠️ SMS no enviado para chat {chat_id}: {error}")
+
+
+def _row_to_alert_dict(row):
+    return {k: row[k] for k in row.keys()}
+
+
+async def schedule_alert_jobs(application, pick_date=None):
+    """Schedule unsent Telegram alerts for every enabled chat and tracked Triple Pick."""
+    if application.job_queue is None:
+        return {"scheduled": 0, "skipped": 0, "reason": "job_queue_unavailable"}
+
+    rows = await asyncio.to_thread(_pending_alert_picks, pick_date)
+    chats = await asyncio.to_thread(_enabled_alert_chats)
+    now_utc = datetime.now(timezone.utc)
+    scheduled = skipped = 0
+
+    for chat in chats:
+        chat_id = int(chat["chat_id"])
+        lead = int(chat["lead_minutes"] or ALERT_LEAD_MINUTES)
+        for row in rows:
+            if not await asyncio.to_thread(
+                _game_alert_enabled, chat_id, row["pick_date"], row["game_pk"], row["selection"]
+            ):
+                skipped += 1
+                continue
+            if await asyncio.to_thread(
+                _alert_was_sent, chat_id, row["pick_date"], row["game_pk"], row["selection"]
+            ):
+                skipped += 1
+                continue
+            game_dt = _parse_iso_utc(row["game_date"])
+            if game_dt is None:
+                skipped += 1
+                continue
+            alert_dt = game_dt - timedelta(minutes=lead)
+            if alert_dt <= now_utc:
+                skipped += 1
+                continue
+            name = _alert_job_name(chat_id, row)
+            for existing in application.job_queue.get_jobs_by_name(name):
+                existing.schedule_removal()
+            application.job_queue.run_once(
+                _send_pick_alert_job,
+                when=alert_dt,
+                data={
+                    "chat_id": chat_id,
+                    "pick": _row_to_alert_dict(row),
+                    "scheduled_for": alert_dt.astimezone(LOCAL_TZ).isoformat(),
+                },
+                name=name,
+                chat_id=chat_id,
+            )
+            scheduled += 1
+    return {"scheduled": scheduled, "skipped": skipped, "reason": None}
+
+
+ALERT_MENU_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["✅ Activar alertas", "⛔ Desactivar alertas"],
+        ["📋 Próximas alertas", "📱 SMS"],
+        ["⬅️ Menú principal"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+    input_field_placeholder="Alertas Triple Pick",
+)
+
+SMS_MENU_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["✅ Activar SMS", "⛔ Desactivar SMS"],
+        ["📱 Estado SMS", "⬅️ Alertas"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+    input_field_placeholder="SMS Triple Pick",
+)
+
+
+async def alerts_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    sub = await asyncio.to_thread(_get_alert_subscription, chat_id)
+    state = "ACTIVAS" if sub["enabled"] else "DESACTIVADAS"
+    sms_sub = await asyncio.to_thread(_get_sms_subscription, chat_id)
+    sms_state = "ACTIVO" if sms_sub.get("enabled") else "DESACTIVADO"
+    await update.message.reply_text(
+        "🔔 ALERTAS TRIPLE PICK\n\n"
+        f"Telegram: {state}\n"
+        f"SMS: {sms_state}\n"
+        f"Aviso: {sub['lead_minutes']} minutos antes de cada juego del Triple Pick.\n\n"
+        "Usa los botones para administrar Telegram, SMS o revisar las próximas alertas.",
+        reply_markup=ALERT_MENU_KEYBOARD,
+    )
+
+
+async def alerts_enable(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    await asyncio.to_thread(_set_alert_subscription, chat_id, True, ALERT_LEAD_MINUTES)
+    info = await schedule_alert_jobs(context.application)
+    await update.message.reply_text(
+        "✅ Alertas activadas.\n"
+        f"Recibirás un aviso {ALERT_LEAD_MINUTES} minutos antes de cada juego registrado en Triple Pick.\n"
+        f"Alertas programadas ahora: {info['scheduled']}.",
+        reply_markup=ALERT_MENU_KEYBOARD,
+    )
+
+
+async def alerts_disable(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    await asyncio.to_thread(_set_alert_subscription, chat_id, False, ALERT_LEAD_MINUTES)
+    if context.application.job_queue is not None:
+        prefix = f"tp_alert_{chat_id}_"
+        for job in context.application.job_queue.jobs():
+            if job.name and job.name.startswith(prefix):
+                job.schedule_removal()
+    await update.message.reply_text(
+        "⛔ Alertas desactivadas para este chat.",
+        reply_markup=ALERT_MENU_KEYBOARD,
+    )
+
+
+async def sms_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    sub = await asyncio.to_thread(_get_sms_subscription, chat_id)
+    twilio_state = "CONFIGURADO" if _twilio_configured() else "NO CONFIGURADO"
+    state = "ACTIVO" if sub.get("enabled") else "DESACTIVADO"
+    await update.message.reply_text(
+        "📱 SMS TRIPLE PICK\n\n"
+        f"Estado SMS: {state}\n"
+        f"Número: {_mask_phone(sub.get('phone_number'))}\n"
+        f"Twilio: {twilio_state}\n"
+        f"Aviso: {ALERT_LEAD_MINUTES} minutos antes, además de Telegram.\n\n"
+        "Para registrar/cambiar el número usa:\n"
+        "/smsset +1XXXXXXXXXX\n\n"
+        "El número debe estar en formato internacional E.164.",
+        reply_markup=SMS_MENU_KEYBOARD,
+    )
+
+
+async def sms_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not context.args:
+        await update.message.reply_text(
+            "Uso: /smsset +1XXXXXXXXXX\nEjemplo de formato: +17865551234",
+            reply_markup=SMS_MENU_KEYBOARD,
+        )
+        return
+    phone = _normalize_e164(context.args[0])
+    if not phone:
+        await update.message.reply_text(
+            "❌ Número inválido. Usa formato E.164, comenzando con + y código de país.",
+            reply_markup=SMS_MENU_KEYBOARD,
+        )
+        return
+    await asyncio.to_thread(_set_sms_subscription, chat_id, None, phone)
+    await update.message.reply_text(
+        f"✅ Número SMS guardado: {_mask_phone(phone)}\n"
+        "Ahora puedes pulsar ✅ Activar SMS.",
+        reply_markup=SMS_MENU_KEYBOARD,
+    )
+
+
+async def sms_enable(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    sub = await asyncio.to_thread(_get_sms_subscription, chat_id)
+    if not sub.get("phone_number"):
+        await update.message.reply_text(
+            "⚠️ Primero registra el número con /smsset +1XXXXXXXXXX.",
+            reply_markup=SMS_MENU_KEYBOARD,
+        )
+        return
+    if not _twilio_configured():
+        await update.message.reply_text(
+            "⚠️ Twilio todavía no está configurado en Railway.\n"
+            "Necesitas TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN y TWILIO_FROM_NUMBER "
+            "o TWILIO_MESSAGING_SERVICE_SID.",
+            reply_markup=SMS_MENU_KEYBOARD,
+        )
+        return
+    await asyncio.to_thread(_set_sms_subscription, chat_id, True, None)
+    await update.message.reply_text(
+        f"✅ SMS activado para {_mask_phone(sub.get('phone_number'))}.\n"
+        "Se enviará junto con la alerta de Telegram.",
+        reply_markup=SMS_MENU_KEYBOARD,
+    )
+
+
+async def sms_disable(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    await asyncio.to_thread(_set_sms_subscription, chat_id, False, None)
+    await update.message.reply_text(
+        "⛔ SMS desactivado. Las alertas de Telegram no cambian.",
+        reply_markup=SMS_MENU_KEYBOARD,
+    )
+
+
+async def sms_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await sms_menu(update, context)
+
+
+async def _build_alerts_panel(chat_id):
+    sub = await asyncio.to_thread(_get_alert_subscription, chat_id)
+    rows = await asyncio.to_thread(_pending_alert_picks, None)
+    now_utc = datetime.now(timezone.utc)
+    items = []
+    counts = {"PENDIENTE": 0, "ENVIADA": 0, "DESACTIVADA": 0}
+
+    for row in rows:
+        game_dt = _parse_iso_utc(row["game_date"])
+        if not game_dt:
+            continue
+        status = await asyncio.to_thread(_alert_status, chat_id, row, sub["enabled"])
+        if status in counts:
+            counts[status] += 1
+        alert_dt = game_dt - timedelta(minutes=sub["lead_minutes"])
+        if game_dt > now_utc or status == "ENVIADA":
+            items.append((row, game_dt, alert_dt, status))
+
+    lines = [
+        "📋 ALERTAS TRIPLE PICK",
+        f"Estado global: {'ACTIVAS' if sub['enabled'] else 'DESACTIVADAS'}",
+        f"Pendientes: {counts['PENDIENTE']} | Enviadas: {counts['ENVIADA']} | Desactivadas: {counts['DESACTIVADA']}",
+        "",
+    ]
+    keyboard = []
+    for idx, (row, game_dt, alert_dt, status) in enumerate(items[:12], 1):
+        status_icon = {"PENDIENTE": "🟡", "ENVIADA": "✅", "DESACTIVADA": "⛔"}.get(status, "•")
+        lines.append(
+            f"{idx}. {status_icon} {row['selection']} ML — {row['away']} vs {row['home']}\n"
+            f"   ⚾ Juego: {game_dt.astimezone(LOCAL_TZ).strftime('%m/%d %I:%M %p').lstrip('0')}\n"
+            f"   🔔 Aviso: {alert_dt.astimezone(LOCAL_TZ).strftime('%m/%d %I:%M %p').lstrip('0')}\n"
+            f"   Estado: {status}"
+        )
+        if status != "ENVIADA":
+            action = "off" if status == "PENDIENTE" else "on"
+            label = "⛔ Desactivar" if action == "off" else "✅ Activar"
+            callback = f"alertgame|{action}|{row['pick_date']}|{row['game_pk']}|{idx}"
+            keyboard.append([InlineKeyboardButton(f"{label} · {row['selection']}", callback_data=callback)])
+
+    if not items:
+        lines.append("No hay alertas registradas para mostrar en este momento.")
+    return "\n".join(lines), InlineKeyboardMarkup(keyboard) if keyboard else None, items
+
+
+async def alerts_upcoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    text, inline_markup, _items = await _build_alerts_panel(chat_id)
+    await update.message.reply_text(
+        text,
+        reply_markup=inline_markup if inline_markup is not None else ALERT_MENU_KEYBOARD,
+    )
+
+
+async def alert_game_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    parts = (query.data or "").split("|")
+    if len(parts) != 5 or parts[0] != "alertgame":
+        return
+    _prefix, action, pick_date, game_pk_text, idx_text = parts
+    try:
+        game_pk = int(game_pk_text)
+        idx = int(idx_text) - 1
+    except ValueError:
+        return
+
+    rows = await asyncio.to_thread(_pending_alert_picks, None)
+    candidates = [r for r in rows if r["pick_date"] == pick_date and int(r["game_pk"]) == game_pk]
+    if not candidates:
+        await query.edit_message_text("⚠️ Esa selección ya no está disponible en el tracking.")
+        return
+    row = candidates[0]
+    enabled = action == "on"
+    await asyncio.to_thread(
+        _set_game_alert_enabled, chat_id, row["pick_date"], row["game_pk"], row["selection"], enabled
+    )
+
+    if context.application.job_queue is not None:
+        name = _alert_job_name(chat_id, row)
+        for job in context.application.job_queue.get_jobs_by_name(name):
+            job.schedule_removal()
+        if enabled:
+            await schedule_alert_jobs(context.application, row["pick_date"])
+
+    text, inline_markup, _items = await _build_alerts_panel(chat_id)
+    await query.edit_message_text(text, reply_markup=inline_markup)
+
+
 async def trackstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         info = await asyncio.to_thread(tracking_status_snapshot)
@@ -2080,7 +2765,7 @@ async def trackstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Tracking DB error: {exc}")
         return
     await update.message.reply_text(
-        "🧾 TRACKING ENGINE — v2.9\n"
+        "🧾 TRACKING ENGINE — v2.9.1\n"
         f"DB: {info['path']}\n"
         f"Railway Volume: {info['railway_volume'] or 'NO DETECTADO'}\n"
         f"Total snapshots: {info['total']}\n"
@@ -2098,7 +2783,7 @@ async def settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ No pude liquidar el tracking: {exc}")
         return
     await update.message.reply_text(
-        "✅ TRACK SETTLEMENT — v2.9\n"
+        "✅ TRACK SETTLEMENT — v2.9.1\n"
         f"Pending al iniciar: {info['pending_before']}\n"
         f"WIN: {info['wins']} | LOSS: {info['losses']} | VOID: {info['void']}\n"
         f"Aún pendientes: {info['still_pending']}"
@@ -2115,7 +2800,7 @@ async def performance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     n = int(overall["n"] or 0)
     if n == 0:
         await update.message.reply_text(
-            "📊 PERFORMANCE — v2.9\nAún no hay picks oficiales liquidados."
+            "📊 PERFORMANCE — v2.9.1\nAún no hay picks oficiales liquidados."
         )
         return
 
@@ -2128,7 +2813,7 @@ async def performance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     brier_text = "N/D" if brier is None else f"{float(brier):.4f}"
     msg = (
-        "📊 PERFORMANCE — v2.9\n"
+        "📊 PERFORMANCE — v2.9.1\n"
         f"Official settled: {n} | Sample: {_sample_label(n)}\n"
         f"W-L: {wins}-{int(overall['losses'] or 0)} | Hit Rate: {hit*100:.1f}%\n"
         f"Brier: {brier_text}\n"
@@ -2169,12 +2854,12 @@ async def calibration(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not rows:
         await update.message.reply_text(
-            "🧪 CALIBRATION — v2.9\nAún no hay muestra oficial suficiente para formar bins."
+            "🧪 CALIBRATION — v2.9.1\nAún no hay muestra oficial suficiente para formar bins."
         )
         return
 
     msg = (
-        "🧪 CALIBRATION — v2.9\n"
+        "🧪 CALIBRATION — v2.9.1\n"
         "Pred = probabilidad proxy promedio | Actual = hit rate observado.\n\n"
     )
     for row in rows:
@@ -2196,10 +2881,10 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not rows:
-        await update.message.reply_text("📚 HISTORY — v2.9\nAún no hay picks registrados.")
+        await update.message.reply_text("📚 HISTORY — v2.9.1\nAún no hay picks registrados.")
         return
 
-    msg = "📚 HISTORY — v2.9\nÚltimos registros:\n\n"
+    msg = "📚 HISTORY — v2.9.1\nÚltimos registros:\n\n"
     for row in rows:
         official = "OFF" if row["official"] else "AUDIT"
         odds = _format_american(row["odds"])
@@ -2227,10 +2912,60 @@ async def auto_settle_tracking(context: ContextTypes.DEFAULT_TYPE):
         print(f"❌ Tracking auto-settle error: {exc}")
 
 
+# ---------------------------------------------------------------------------
+# v2.9.8 MEMBERSHIP / TELEGRAM STARS
+# ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# TELEGRAM STARS MEMBERSHIP
-# ---------------------------------------------------------------------------
+def init_membership_db():
+    """Create subscription and one-time FREE trial tables without touching tracking/alert data."""
+    with _tracking_connection() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                user_id INTEGER NOT NULL,
+                plan TEXT NOT NULL,
+                username TEXT,
+                first_name TEXT,
+                status TEXT NOT NULL DEFAULT 'ACTIVE',
+                started_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                charge_id TEXT NOT NULL,
+                is_recurring INTEGER NOT NULL DEFAULT 1,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (user_id, plan)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_subscriptions_active
+            ON subscriptions(user_id, status, expires_at);
+
+            CREATE TABLE IF NOT EXISTS subscription_payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                plan TEXT NOT NULL,
+                amount_stars INTEGER NOT NULL,
+                charge_id TEXT NOT NULL UNIQUE,
+                invoice_payload TEXT NOT NULL,
+                paid_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                is_recurring INTEGER NOT NULL DEFAULT 0,
+                is_first_recurring INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS membership_users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                trial_started_at INTEGER NOT NULL,
+                trial_expires_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_membership_trial_expiry
+            ON membership_users(trial_expires_at);
+            """
+        )
+
 
 def _subscription_now_ts():
     return int(datetime.now(timezone.utc).timestamp())
@@ -2603,44 +3338,129 @@ async def _premium_gate(update, required="PREMIUM"):
     return False
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    trial = await asyncio.to_thread(_ensure_trial_user, update.effective_user)
-    await update.message.reply_text(
-        "⚾ MLB TRIPLE PICK v2.9 — TRACKING & CALIBRATION\n\n"
-        "Comandos disponibles:\n"
-        "/mlb - Juegos de hoy\n"
-        "/picks - Triple Pick final market-aware + tracking\n"
-        "/pool - Candidate Pool completo\n"
-        "/market - Auditoría MODEL vs MARKET\n"
-        "/value - Picks con señal de valor en Hard Rock\n"
-        "/oddsstatus - Estado del Market Engine\n"
-        "/trackstatus - Estado del Tracking Engine\n"
-        "/settle - Liquidar picks finalizados\n"
-        "/performance - Hit rate, ROI y Brier\n"
-        "/calibration - Predicted vs Actual por bins\n"
-        "/history - Últimos picks registrados\n"
-        "/myid - ID de este chat\n"
-        "/autostatus - Estado del envío automático\n"
-        "/subscribe - Ver planes y activar membresía\n"
-        "/account - Ver estado de mi suscripción\n\n"
-        "Pipeline: MODEL → MARKET → NO-VIG → AGREEMENT → FINAL PICK → TRACK → SETTLE → CALIBRATE"
+# ---------------------------------------------------------------------------
+# v2.9.4 VISUAL MENU
+# ---------------------------------------------------------------------------
+
+MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["⚾ Picks de hoy", "📊 Estado"],
+        ["📈 Rendimiento", "🧮 Mercado"],
+        ["📋 Historial", "🔔 Alertas"],
+        ["👤 Mi cuenta", "⭐ Suscripción"],
+        ["⚾ Juegos MLB", "🧪 Más opciones"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+    input_field_placeholder="Selecciona una opción de Triple Pick",
+)
+
+MORE_MENU_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["🔎 Candidate Pool", "🟣 Value Board"],
+        ["💵 Estado mercado", "🧪 Diagnóstico odds"],
+        ["🧾 Liquidar picks", "🎯 Calibración"],
+        ["🆔 Mi ID", "⬅️ Menú principal"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+    input_field_placeholder="Herramientas avanzadas Triple Pick",
+)
+
+
+def _menu_text():
+    return (
+        f"⚾ MLB TRIPLE PICK v{BOT_VERSION}\n\n"
+        "Selecciona una opción del menú. No necesitas escribir comandos.\n\n"
+        "⚾ Picks de hoy — Triple Pick final\n"
+        "📊 Estado — Tracking Engine\n"
+        "📈 Rendimiento — Hit rate, ROI y Brier\n"
+        "🧮 Mercado — MODEL vs MARKET\n"
+        "📋 Historial — Picks registrados\n"
+        "🔔 Alertas — Telegram + SMS opcional 45 min antes\n"
+        "👤 Mi cuenta — Estado de tu membresía\n"
+        "⭐ Suscripción — FREE, PREMIUM y PRO\n"
+        "⚾ Juegos MLB — Cartelera de hoy\n"
+        "🧪 Más opciones — Herramientas avanzadas"
     )
+
+
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(_menu_text(), reply_markup=MAIN_MENU_KEYBOARD)
+
+
+async def menu_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🧪 HERRAMIENTAS AVANZADAS\n\n"
+        "Selecciona una herramienta. No necesitas escribir comandos.\n\n"
+        "🔎 Candidate Pool — auditoría completa del slate\n"
+        "🟣 Value Board — candidatos de valor\n"
+        "💵 Estado mercado — estado de cuotas/API\n"
+        "🧪 Diagnóstico odds — revisión de bookmakers\n"
+        "🧾 Liquidar picks — actualizar resultados\n"
+        "🎯 Calibración — predicted vs actual\n"
+        "🆔 Mi ID — identificador del chat",
+        reply_markup=MORE_MENU_KEYBOARD,
+    )
+
+
+async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Route visual keyboard labels to the existing command functions."""
+    text = (update.message.text or "").strip()
+    routes = {
+        "⚾ Picks de hoy": picks,
+        "📊 Estado": trackstatus,
+        "📈 Rendimiento": performance,
+        "🧮 Mercado": market,
+        "📋 Historial": history,
+        "🔔 Alertas": alerts_menu,
+        "👤 Mi cuenta": account_command,
+        "⭐ Suscripción": subscription_command,
+        "✅ Activar alertas": alerts_enable,
+        "⛔ Desactivar alertas": alerts_disable,
+        "📋 Próximas alertas": alerts_upcoming,
+        "📱 SMS": sms_menu,
+        "✅ Activar SMS": sms_enable,
+        "⛔ Desactivar SMS": sms_disable,
+        "📱 Estado SMS": sms_status,
+        "⬅️ Alertas": alerts_menu,
+        "⬅️ Menú principal": menu,
+        "⚾ Juegos MLB": mlb,
+        "🧪 Más opciones": menu_more,
+        "🔎 Candidate Pool": pool,
+        "🟣 Value Board": value,
+        "💵 Estado mercado": oddsstatus,
+        "🧪 Diagnóstico odds": oddsdebug,
+        "🧾 Liquidar picks": settle,
+        "🎯 Calibración": calibration,
+        "🆔 Mi ID": myid,
+    }
+    handler = routes.get(text)
+    if handler is not None:
+        await handler(update, context)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await asyncio.to_thread(_ensure_trial_user, update.effective_user)
     plan, row = await asyncio.to_thread(_best_active_plan, update.effective_user.id)
     if plan == "FREE":
-        membership_text = (
-            "🆓 PRUEBA FREE ACTIVADA\n"
-            f"Tienes {_remaining_trial_text(row['trial_expires_at'])} de acceso de prueba.\n"
-            "Luego: PREMIUM $10/mes | PRO $20/mes"
+        membership = (
+            f"🆓 FREE activo — {_remaining_trial_text(row['trial_expires_at'])} restantes.\n"
+            "Después: ⭐ PREMIUM $10/mes | 🔥 PRO $20/mes"
         )
     elif plan == "EXPIRED":
-        membership_text = "🔴 Tu prueba FREE ya finalizó. PREMIUM $10/mes | PRO $20/mes"
+        membership = "🔴 Tu prueba FREE finalizó. Usa ⭐ Suscripción para continuar."
     else:
-        membership_text = f"💎 Membresía activa: {plan}"
-    await update.message.reply_text(membership_text, reply_markup=_membership_keyboard())
+        membership = f"💎 Membresía activa: {plan}"
+
+    await update.message.reply_text(
+        _menu_text() + "\n\n" + membership,
+        reply_markup=MAIN_MENU_KEYBOARD,
+    )
 
 
 async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Triple Pick v2.9: market-aware selection plus immutable recommendation tracking."""
+    """Triple Pick v2.9.1: market-aware selection plus immutable recommendation tracking."""
     if not await _premium_gate(update, "PREMIUM"):
         return
     now = local_now()
@@ -2663,7 +3483,7 @@ async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     value_count = sum(bool(p.get("value_approved")) for p in partidos)
 
     mensaje = (
-        "🔥 MLB TRIPLE PICK v2.9 — MARKET + TRACKING\n"
+        "🔥 MLB TRIPLE PICK v2.9.5 — MARKET + TRACKING\n"
         f"📅 {fecha} — {AUTO_TZ}\n\n"
         "🧠 MODEL: v2.7.1 starter sample + recency + offense + form + bullpen proxy.\n"
         "💵 MARKET: Moneyline → implied probability → no-vig → model/market agreement.\n"
@@ -2687,6 +3507,7 @@ async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🏦 Primary book: {ODDS_PRIMARY_BOOKMAKER}\n"
             "🏆 Triple Pick final usa solo HYBRID/SURVIVAL; VALUE puro vive en /value.\n\n"
         )
+        mensaje += _primary_feed_notice(partidos, odds_status)
 
     if not triple_pick:
         mensaje += (
@@ -2729,17 +3550,24 @@ async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             if mode == "market":
                 mensaje += (
-                    f"🧾 Tracking v2.9: {track_info['inserted']} nuevo(s), "
+                    f"🧾 Tracking v2.9.5: {track_info['inserted']} nuevo(s), "
                     f"{track_info['existing']} ya registrado(s). "
                     "SURVIVAL/HYBRID = muestra oficial.\n"
                 )
             else:
                 mensaje += (
-                    f"🧾 Tracking v2.9: {track_info['inserted']} fallback nuevo(s). "
+                    f"🧾 Tracking v2.9.5: {track_info['inserted']} fallback nuevo(s). "
                     "Se guardan para auditoría, fuera de métricas oficiales.\n"
                 )
         except Exception as exc:
             mensaje += f"⚠️ Tracking no pudo guardar este snapshot: {exc}\n"
+
+        try:
+            alert_info = await schedule_alert_jobs(context.application, fecha)
+            if alert_info.get("scheduled"):
+                mensaje += f"🔔 Alertas 45 min: {alert_info['scheduled']} programada(s).\n"
+        except Exception as exc:
+            mensaje += f"⚠️ No pude programar alertas: {exc}\n"
 
     mensaje += (
         "ℹ️ SURVIVAL no exige +EV estricto; VALUE sí exige un gap positivo mínimo y "
@@ -2764,13 +3592,14 @@ async def pool(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     mensaje = (
-        "🔎 MLB CANDIDATE POOL — v2.9\n"
+        "🔎 MLB CANDIDATE POOL — v2.9.5\n"
         f"📅 {fecha}\n"
         f"Market: {'ON' if odds_status == 'ok' else 'OFF/FALLBACK'} | "
         f"Primary: {ODDS_PRIMARY_BOOKMAKER}\n\n"
         "C=Confidence | DR=Data Reliability | MP=Model Probability Proxy | "
         "MKT=consensus no-vig | VG=value gap.\n\n"
     )
+    mensaje += _primary_feed_notice(partidos, odds_status)
     for i, p in enumerate(partidos, 1):
         icon = "✅" if p.get("eligible") else "❌"
         vg = p.get("value_gap")
@@ -2812,10 +3641,11 @@ async def market(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     mensaje = (
-        "💵 MLB MARKET AUDIT — v2.9\n"
+        "💵 MLB MARKET AUDIT — v2.9.5\n"
         f"📅 {fecha}\n"
-        f"Primary: {ODDS_PRIMARY_BOOKMAKER} | Books: {ODDS_BOOKMAKERS}\n\n"
+        f"Primary: {ODDS_PRIMARY_BOOKMAKER} | Books: {ODDS_BOOKMAKERS}\n""⏱️ PREMATCH ONLY: juegos iniciados/live se excluyen del Market Engine.\n\n"
     )
+    mensaje += _primary_feed_notice(partidos, odds_status)
     for i, p in enumerate(partidos, 1):
         vg = p.get("value_gap")
         vg_text = "N/D" if vg is None else f"{vg * 100:+.1f} pp"
@@ -2849,6 +3679,16 @@ async def value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    primary_notice = _primary_feed_notice(partidos, odds_status)
+    if primary_notice:
+        await update.message.reply_text(
+            "🟣 MLB VALUE BOARD — v2.9.5\n"
+            f"📅 {fecha}\n\n"
+            + primary_notice
+            + "VALUE requiere un precio accionable de Hard Rock; no se sustituye por consenso."
+        )
+        return
+
     candidatos = [p for p in partidos if p.get("value_approved")]
     candidatos.sort(
         key=lambda p: (
@@ -2860,7 +3700,7 @@ async def value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     mensaje = (
-        "🟣 MLB VALUE BOARD — v2.9\n"
+        "🟣 MLB VALUE BOARD — v2.9.5\n"
         f"📅 {fecha}\n"
         "Regla: Model Gate aprobado + precio Hard Rock + gap ≥3.5 pp; "
         "divergencias >10 pp se mandan a REVIEW, no a VALUE automático.\n\n"
@@ -2894,6 +3734,89 @@ async def oddsstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Last request cost: {_ODDS_LAST_META.get('last') or 'N/D'}\n"
         f"Last error: {_ODDS_LAST_META.get('error') or 'ninguno'}"
     )
+
+
+async def oddsdebug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Diagnóstico seguro de bookmakers recibidos desde The Odds API.
+
+    No muestra la API key ni modifica gates/scoring. Sirve para verificar si
+    hardrockbet_fl está realmente presente en la respuesta cruda por evento.
+    """
+    fecha = local_now().strftime("%Y-%m-%d")
+    odds_status, events = await asyncio.to_thread(get_mlb_moneyline_odds, fecha)
+
+    if odds_status == "not_configured":
+        await update.message.reply_text(
+            "🧪 ODDS DEBUG — v2.9.5\n"
+            "❌ ODDS_API_KEY no configurada."
+        )
+        return
+    if odds_status != "ok":
+        await update.message.reply_text(
+            "🧪 ODDS DEBUG — v2.9.5\n"
+            f"❌ Odds API status: {odds_status}\n"
+            f"Last error: {_ODDS_LAST_META.get('error') or 'N/D'}"
+        )
+        return
+
+    requested = [b.strip() for b in ODDS_BOOKMAKERS.split(",") if b.strip()]
+    all_keys = sorted({
+        str(book.get("key"))
+        for event in events
+        for book in event.get("bookmakers", [])
+        if book.get("key")
+    })
+    primary_anywhere = ODDS_PRIMARY_BOOKMAKER in all_keys
+
+    msg = (
+        "🧪 ODDS DEBUG — v2.9.5\n"
+        f"📅 {fecha} — {AUTO_TZ}\n"
+        f"🎯 Primary esperado: {ODDS_PRIMARY_BOOKMAKER}\n"
+        f"📨 Solicitados: {', '.join(requested) or 'N/D'}\n"
+        f"📥 Recibidos globalmente: {', '.join(all_keys) or 'NINGUNO'}\n"
+        f"🏦 Primary presente en algún evento: {'SÍ' if primary_anywhere else 'NO'}\n"
+        f"📦 Eventos API: {len(events)} | Quota restante: {_ODDS_LAST_META.get('remaining') or 'N/D'}\n\n"
+    )
+
+    shown = 0
+    for event in events:
+        if not _event_is_local_date(event, fecha):
+            continue
+        # Se muestra también si ya inició para diagnosticar la respuesta cruda,
+        # pero se etiqueta LIVE/STARTED; /market sigue siendo PREMATCH ONLY.
+        pregame = _event_is_pregame(event)
+        keys = [
+            str(book.get("key"))
+            for book in event.get("bookmakers", [])
+            if book.get("key")
+        ]
+        titles = [
+            str(book.get("title") or book.get("key"))
+            for book in event.get("bookmakers", [])
+            if book.get("key")
+        ]
+        has_primary = ODDS_PRIMARY_BOOKMAKER in keys
+        away = event.get("away_team") or "Away"
+        home = event.get("home_team") or "Home"
+        state = "PREMATCH" if pregame else "STARTED/LIVE"
+        msg += (
+            f"{shown + 1}. {away} vs {home}\n"
+            f"   ⏱️ {state} | Primary: {'✅' if has_primary else '❌'}\n"
+            f"   🔑 Keys: {', '.join(keys) or 'NINGUNA'}\n"
+            f"   🏷️ Books: {', '.join(titles) or 'NINGUNO'}\n\n"
+        )
+        shown += 1
+        if shown >= 20:
+            break
+
+    if shown == 0:
+        msg += "No se encontraron eventos de la fecha local en la respuesta.\n"
+
+    msg += (
+        "ℹ️ Este comando es diagnóstico solamente: no altera picks, gates, "
+        "tracking ni calibración."
+    )
+    await _reply_long(update.message, msg)
 
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2934,6 +3857,15 @@ async def enviar_picks_automaticos(context: ContextTypes.DEFAULT_TYPE):
         print(f"❌ Error en auto-picks: {exc}")
 
 
+async def post_init_schedule_alerts(application):
+    """Rebuild future alert jobs after a Railway restart/deploy."""
+    try:
+        info = await schedule_alert_jobs(application)
+        print(f"🔔 Alertas restauradas al iniciar: {info['scheduled']} programada(s).")
+    except Exception as exc:
+        print(f"⚠️ No pude restaurar alertas al iniciar: {exc}")
+
+
 def main():
     if not TOKEN:
         raise RuntimeError(
@@ -2942,9 +3874,11 @@ def main():
         )
 
     init_tracking_db()
-    app = ApplicationBuilder().token(TOKEN).build()
+    init_membership_db()
+    app = ApplicationBuilder().token(TOKEN).post_init(post_init_schedule_alerts).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", menu))
     app.add_handler(CommandHandler("subscribe", subscription_command))
     app.add_handler(CommandHandler("account", account_command))
     app.add_handler(CallbackQueryHandler(membership_callback, pattern=r"^tp_"))
@@ -2956,6 +3890,7 @@ def main():
     app.add_handler(CommandHandler("market", market))
     app.add_handler(CommandHandler("value", value))
     app.add_handler(CommandHandler("oddsstatus", oddsstatus))
+    app.add_handler(CommandHandler("oddsdebug", oddsdebug))
     app.add_handler(CommandHandler("trackstatus", trackstatus))
     app.add_handler(CommandHandler("settle", settle))
     app.add_handler(CommandHandler("performance", performance))
@@ -2963,6 +3898,15 @@ def main():
     app.add_handler(CommandHandler("history", history))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("autostatus", autostatus))
+    app.add_handler(CommandHandler("alerts", alerts_menu))
+    app.add_handler(CommandHandler("alertson", alerts_enable))
+    app.add_handler(CommandHandler("alertsoff", alerts_disable))
+    app.add_handler(CommandHandler("sms", sms_menu))
+    app.add_handler(CommandHandler("smsset", sms_set))
+    app.add_handler(CommandHandler("smson", sms_enable))
+    app.add_handler(CommandHandler("smsoff", sms_disable))
+    app.add_handler(CallbackQueryHandler(alert_game_callback, pattern=r"^alertgame\|"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, visual_menu_router))
 
     if app.job_queue is not None:
         tz = LOCAL_TZ
@@ -3002,7 +3946,10 @@ def main():
             "python-telegram-bot[job-queue] en requirements.txt."
         )
 
-    print("🤖 Bot MLB Triple Pick v2.9 iniciado...")
+    print(
+        "📱 Twilio SMS: " + ("CONFIGURADO" if _twilio_configured() else "NO CONFIGURADO")
+    )
+    print(f"🤖 Bot MLB Triple Pick v{BOT_VERSION} iniciado...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

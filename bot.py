@@ -1,5 +1,8 @@
-from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler,
+    PreCheckoutQueryHandler, MessageHandler, filters
+)
 import asyncio
 import math
 import os
@@ -68,8 +71,8 @@ _ODDS_CACHE = {}
 _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
-# Triple Pick v2.9.7 — Rich Telegram pregame alerts + per-game controls + Market/Tracking Engine.
-BOT_VERSION = "2.9.7"
+# Triple Pick v2.9 — Tracking & Calibration Engine.
+BOT_VERSION = "2.9"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -85,14 +88,28 @@ TRACK_AUTO_SETTLE = os.environ.get("TRACK_AUTO_SETTLE", "1").strip().lower() not
 TRACK_SETTLE_HOUR = int(os.environ.get("TRACK_SETTLE_HOUR", "4"))
 TRACK_SETTLE_MINUTE = int(os.environ.get("TRACK_SETTLE_MINUTE", "30"))
 
-# Triple Pick v2.9.7 — Rich Telegram pregame alerts with pitchers, market context and short reason.
-ALERT_LEAD_MINUTES = int(os.environ.get("ALERT_LEAD_MINUTES", "45"))
-ALERTS_DEFAULT_ENABLED = os.environ.get("ALERTS_DEFAULT_ENABLED", "0").strip().lower() in {
+
+# Triple Pick Membership / Telegram Stars
+# Subscription prices are configured in Stars, not USD.
+SUBSCRIPTION_PERIOD = 30 * 24 * 60 * 60  # Telegram currently requires exactly 30 days.
+FREE_TRIAL_PERIOD = 7 * 24 * 60 * 60  # One-time 7-day trial per Telegram user ID.
+PREMIUM_TARGET_USD = 10
+PRO_TARGET_USD = 20
+PREMIUM_STARS = int(os.environ.get("PREMIUM_STARS", "300"))
+PRO_STARS = int(os.environ.get("PRO_STARS", "500"))
+SUBSCRIPTION_ENFORCE = os.environ.get("SUBSCRIPTION_ENFORCE", "0").strip().lower() in {
     "1", "true", "yes", "on"
 }
+SUBSCRIPTION_ADMIN_IDS = {
+    int(x.strip())
+    for x in os.environ.get("SUBSCRIPTION_ADMIN_IDS", "").split(",")
+    if x.strip().lstrip("-").isdigit()
+}
+PLAN_RANK = {"FREE": 0, "PREMIUM": 1, "PRO": 2}
 
 
-# MLB Triple Pick v2.9.5 - v2.8 Market Engine + primary-feed degradation notice + odds diagnostics + persistent tracking/calibration layer
+
+# MLB Triple Pick v2.9 - v2.8 Market Engine + persistent tracking/calibration layer
 #
 # v2.7.1 preserves the v2.7 starter sample/recency engine and the 45/25/15/10/5
 # matchup structure. It makes 100/100 Data Reliability unavailable until both
@@ -1228,22 +1245,12 @@ def _event_is_local_date(event, fecha):
     return dt.astimezone(LOCAL_TZ).strftime("%Y-%m-%d") == fecha
 
 
-def _event_is_pregame(event):
-    """Only allow pregame market snapshots; never mix live odds with pregame model output."""
-    dt = _parse_iso_utc(event.get("commence_time"))
-    if dt is None:
-        return True
-    return dt > datetime.now(timezone.utc)
-
-
 def _find_odds_event(partido, events, fecha):
     away_key = _normalize_team_name(partido.get("away"))
     home_key = _normalize_team_name(partido.get("home"))
     candidates = []
     for event in events:
         if not _event_is_local_date(event, fecha):
-            continue
-        if not _event_is_pregame(event):
             continue
         if (
             _normalize_team_name(event.get("away_team")) == away_key
@@ -1480,22 +1487,6 @@ def build_daily_matchups_v28(fecha, season):
     return "ok", partidos, odds_status
 
 
-def _primary_feed_notice(partidos, odds_status):
-    """Transparent degradation notice when the primary book is absent from an otherwise healthy feed."""
-    if odds_status != "ok":
-        return ""
-    market_rows = [p for p in partidos if p.get("market_available")]
-    if not market_rows:
-        return ""
-    if any(p.get("hardrock_available") for p in market_rows):
-        return ""
-    return (
-        "⚠️ HARD ROCK TEMPORALMENTE NO DISPONIBLE EN EL FEED\n"
-        "🛡️ SURVIVAL: evaluado con el consenso de mercado disponible.\n"
-        "🟣 VALUE: suspendido hasta recuperar precio Hard Rock.\n\n"
-    )
-
-
 def _format_american(price):
     if price is None:
         return "N/D"
@@ -1564,7 +1555,7 @@ async def _reply_long(message_obj, text, limit=3900):
 
 
 # ---------------------------------------------------------------------------
-# v2.9.1 TRACKING & CALIBRATION ENGINE
+# v2.9 TRACKING & CALIBRATION ENGINE
 # ---------------------------------------------------------------------------
 
 
@@ -1581,7 +1572,7 @@ def _tracking_connection():
 
 
 def init_tracking_db():
-    """Create the v2.9.1 tracking schema without modifying any existing records."""
+    """Create the v2.9 tracking schema without modifying any existing records."""
     with _tracking_connection() as conn:
         conn.executescript(
             """
@@ -1637,39 +1628,48 @@ def init_tracking_db():
             CREATE INDEX IF NOT EXISTS idx_tracked_picks_official
             ON tracked_picks(official, product, result);
 
-            CREATE TABLE IF NOT EXISTS alert_subscriptions (
-                chat_id INTEGER PRIMARY KEY,
-                enabled INTEGER NOT NULL DEFAULT 0,
-                lead_minutes INTEGER NOT NULL DEFAULT 45,
-                updated_at TEXT NOT NULL
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                user_id INTEGER NOT NULL,
+                plan TEXT NOT NULL,
+                username TEXT,
+                first_name TEXT,
+                status TEXT NOT NULL DEFAULT 'ACTIVE',
+                started_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                charge_id TEXT NOT NULL,
+                is_recurring INTEGER NOT NULL DEFAULT 1,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (user_id, plan)
             );
 
-            CREATE TABLE IF NOT EXISTS alert_deliveries (
+            CREATE INDEX IF NOT EXISTS idx_subscriptions_active
+            ON subscriptions(user_id, status, expires_at);
+
+            CREATE TABLE IF NOT EXISTS subscription_payments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER NOT NULL,
-                pick_date TEXT NOT NULL,
-                game_pk INTEGER NOT NULL,
-                selection TEXT NOT NULL,
-                scheduled_for TEXT NOT NULL,
-                sent_at TEXT NOT NULL,
-                UNIQUE(chat_id, pick_date, game_pk, selection)
+                user_id INTEGER NOT NULL,
+                plan TEXT NOT NULL,
+                amount_stars INTEGER NOT NULL,
+                charge_id TEXT NOT NULL UNIQUE,
+                invoice_payload TEXT NOT NULL,
+                paid_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                is_recurring INTEGER NOT NULL DEFAULT 0,
+                is_first_recurring INTEGER NOT NULL DEFAULT 0
             );
 
-            CREATE INDEX IF NOT EXISTS idx_alert_deliveries_date
-            ON alert_deliveries(pick_date, chat_id);
-
-            CREATE TABLE IF NOT EXISTS alert_game_settings (
-                chat_id INTEGER NOT NULL,
-                pick_date TEXT NOT NULL,
-                game_pk INTEGER NOT NULL,
-                selection TEXT NOT NULL,
-                enabled INTEGER NOT NULL DEFAULT 1,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY(chat_id, pick_date, game_pk, selection)
+            CREATE TABLE IF NOT EXISTS membership_users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                trial_started_at INTEGER NOT NULL,
+                trial_expires_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
             );
 
-            CREATE INDEX IF NOT EXISTS idx_alert_game_settings_chat_date
-            ON alert_game_settings(chat_id, pick_date);
+            CREATE INDEX IF NOT EXISTS idx_membership_trial_expiry
+            ON membership_users(trial_expires_at);
             """
         )
 
@@ -2073,463 +2073,6 @@ def _format_units(value):
     return f"{float(value):+.2f}u"
 
 
-
-def _set_alert_subscription(chat_id, enabled, lead_minutes=ALERT_LEAD_MINUTES):
-    init_tracking_db()
-    with _tracking_connection() as conn:
-        conn.execute(
-            """
-            INSERT INTO alert_subscriptions(chat_id, enabled, lead_minutes, updated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(chat_id) DO UPDATE SET
-                enabled=excluded.enabled,
-                lead_minutes=excluded.lead_minutes,
-                updated_at=excluded.updated_at
-            """,
-            (int(chat_id), int(bool(enabled)), int(lead_minutes), local_now().isoformat()),
-        )
-
-
-def _get_alert_subscription(chat_id):
-    init_tracking_db()
-    with _tracking_connection() as conn:
-        row = conn.execute(
-            "SELECT enabled, lead_minutes, updated_at FROM alert_subscriptions WHERE chat_id=?",
-            (int(chat_id),),
-        ).fetchone()
-    if row is None:
-        return {
-            "enabled": ALERTS_DEFAULT_ENABLED,
-            "lead_minutes": ALERT_LEAD_MINUTES,
-            "updated_at": None,
-        }
-    return {
-        "enabled": bool(row["enabled"]),
-        "lead_minutes": int(row["lead_minutes"] or ALERT_LEAD_MINUTES),
-        "updated_at": row["updated_at"],
-    }
-
-
-def _enabled_alert_chats():
-    init_tracking_db()
-    with _tracking_connection() as conn:
-        return conn.execute(
-            "SELECT chat_id, lead_minutes FROM alert_subscriptions WHERE enabled=1"
-        ).fetchall()
-
-
-def _set_game_alert_enabled(chat_id, pick_date, game_pk, selection, enabled):
-    init_tracking_db()
-    with _tracking_connection() as conn:
-        conn.execute(
-            """
-            INSERT INTO alert_game_settings(
-                chat_id, pick_date, game_pk, selection, enabled, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(chat_id, pick_date, game_pk, selection) DO UPDATE SET
-                enabled=excluded.enabled,
-                updated_at=excluded.updated_at
-            """,
-            (
-                int(chat_id), pick_date, int(game_pk), selection,
-                int(bool(enabled)), local_now().isoformat(),
-            ),
-        )
-
-
-def _game_alert_enabled(chat_id, pick_date, game_pk, selection):
-    """Per-game alerts default ON unless explicitly disabled."""
-    init_tracking_db()
-    with _tracking_connection() as conn:
-        row = conn.execute(
-            """
-            SELECT enabled FROM alert_game_settings
-            WHERE chat_id=? AND pick_date=? AND game_pk=? AND selection=?
-            """,
-            (int(chat_id), pick_date, int(game_pk), selection),
-        ).fetchone()
-    return True if row is None else bool(row["enabled"])
-
-
-def _alert_status(chat_id, row, global_enabled=True):
-    if _alert_was_sent(chat_id, row["pick_date"], row["game_pk"], row["selection"]):
-        return "ENVIADA"
-    if not global_enabled or not _game_alert_enabled(
-        chat_id, row["pick_date"], row["game_pk"], row["selection"]
-    ):
-        return "DESACTIVADA"
-    return "PENDIENTE"
-
-
-def _pending_alert_picks(pick_date=None):
-    init_tracking_db()
-    params = []
-    where = "WHERE result='PENDING' AND game_date IS NOT NULL"
-    if pick_date:
-        where += " AND pick_date=?"
-        params.append(pick_date)
-    with _tracking_connection() as conn:
-        rows = conn.execute(
-            f"""
-            SELECT MAX(id) AS id, pick_date, game_pk, game_date, away, home,
-                   selection, product, odds, book, difference, confidence,
-                   data_reliability, market_grade, model_probability,
-                   market_probability, hardrock_no_vig
-            FROM tracked_picks
-            {where}
-              AND source IN ('TRIPLE_PICK', 'TRIPLE_PICK_FALLBACK')
-            GROUP BY pick_date, game_pk, selection
-            ORDER BY game_date ASC
-            """,
-            params,
-        ).fetchall()
-    return rows
-
-
-def _alert_was_sent(chat_id, pick_date, game_pk, selection):
-    init_tracking_db()
-    with _tracking_connection() as conn:
-        row = conn.execute(
-            """
-            SELECT 1 FROM alert_deliveries
-            WHERE chat_id=? AND pick_date=? AND game_pk=? AND selection=?
-            """,
-            (int(chat_id), pick_date, int(game_pk), selection),
-        ).fetchone()
-    return row is not None
-
-
-def _record_alert_delivery(chat_id, row, scheduled_for):
-    init_tracking_db()
-    with _tracking_connection() as conn:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO alert_deliveries(
-                chat_id, pick_date, game_pk, selection, scheduled_for, sent_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                int(chat_id), row["pick_date"], int(row["game_pk"]), row["selection"],
-                scheduled_for.isoformat(), local_now().isoformat(),
-            ),
-        )
-
-
-def _alert_job_name(chat_id, row):
-    safe_selection = re.sub(r"[^a-zA-Z0-9]+", "_", str(row["selection"]))[:40]
-    return f"tp_alert_{chat_id}_{row['pick_date']}_{row['game_pk']}_{safe_selection}"
-
-
-def _get_alert_pitcher_names(game_pk):
-    """Return probable pitcher names for an alert without rebuilding the full slate."""
-    if not game_pk:
-        return "Por confirmar", "Por confirmar"
-    data = safe_get_json(
-        f"{MLB_API}/schedule",
-        params={
-            "sportId": 1,
-            "gamePk": int(game_pk),
-            "hydrate": "probablePitcher",
-        },
-        cache_ttl=60,
-    )
-    try:
-        game = data["dates"][0]["games"][0]
-        away = (
-            game.get("teams", {}).get("away", {}).get("probablePitcher", {}).get("fullName")
-            or "Por confirmar"
-        )
-        home = (
-            game.get("teams", {}).get("home", {}).get("probablePitcher", {}).get("fullName")
-            or "Por confirmar"
-        )
-        return away, home
-    except (KeyError, IndexError, TypeError):
-        return "Por confirmar", "Por confirmar"
-
-
-def _build_short_alert_reason(row):
-    """Build one compact, source-grounded reason from metrics already stored for the pick."""
-    parts = []
-    difference = row.get("difference")
-    confidence = row.get("confidence")
-    data_reliability = row.get("data_reliability")
-    market_grade = row.get("market_grade")
-
-    try:
-        difference = float(difference) if difference is not None else None
-    except (TypeError, ValueError):
-        difference = None
-    try:
-        confidence = float(confidence) if confidence is not None else None
-    except (TypeError, ValueError):
-        confidence = None
-    try:
-        data_reliability = float(data_reliability) if data_reliability is not None else None
-    except (TypeError, ValueError):
-        data_reliability = None
-
-    if difference is not None:
-        if difference >= 10:
-            parts.append(f"ventaja clara del modelo (+{difference:.1f})")
-        elif difference >= 5:
-            parts.append(f"ventaja del modelo (+{difference:.1f})")
-
-    if confidence is not None:
-        parts.append(f"confianza {confidence:.1f}/100")
-
-    if market_grade and market_grade not in {"⚪ MARKET OFF", "⚪ SIN MERCADO", "🔴 NO BET"}:
-        parts.append(str(market_grade).replace("🟢 ", "").replace("🔵 ", "").replace("🟣 ", ""))
-
-    if data_reliability is not None and data_reliability >= 85 and len(parts) < 3:
-        parts.append(f"datos {data_reliability:.0f}/100")
-
-    return " · ".join(parts[:3]) if parts else "Selección registrada por el sistema Triple Pick."
-
-
-async def _send_pick_alert_job(context: ContextTypes.DEFAULT_TYPE):
-    payload = context.job.data or {}
-    row = payload.get("pick") or {}
-    chat_id = int(payload.get("chat_id"))
-    scheduled_for_iso = payload.get("scheduled_for")
-    try:
-        scheduled_for = datetime.fromisoformat(scheduled_for_iso)
-    except Exception:
-        scheduled_for = local_now()
-
-    sub = await asyncio.to_thread(_get_alert_subscription, chat_id)
-    if not sub.get("enabled"):
-        return
-    game_enabled = await asyncio.to_thread(
-        _game_alert_enabled, chat_id, row.get("pick_date"), row.get("game_pk"), row.get("selection")
-    )
-    if not game_enabled:
-        return
-    if await asyncio.to_thread(
-        _alert_was_sent, chat_id, row.get("pick_date"), row.get("game_pk"), row.get("selection")
-    ):
-        return
-
-    game_dt = _parse_iso_utc(row.get("game_date"))
-    local_game = game_dt.astimezone(LOCAL_TZ) if game_dt else None
-    game_time = local_game.strftime("%I:%M %p").lstrip("0") if local_game else "N/D"
-    odds_text = _format_american(row.get("odds")) if row.get("odds") is not None else "N/D"
-    product = row.get("product") or "TRIPLE PICK"
-    away_pitcher, home_pitcher = await asyncio.to_thread(
-        _get_alert_pitcher_names, row.get("game_pk")
-    )
-    reason = _build_short_alert_reason(row)
-    book = row.get("book") or "N/D"
-    text = (
-        f"🔔 TRIPLE PICK — FALTAN {sub['lead_minutes']} MIN\n\n"
-        f"🎯 PICK: {row.get('selection')} ML\n"
-        f"🏟️ {row.get('away')} vs {row.get('home')}\n"
-        f"🕐 Inicio: {game_time} ({AUTO_TZ})\n\n"
-        f"⚾ Abridores\n"
-        f"• {row.get('away')}: {away_pitcher}\n"
-        f"• {row.get('home')}: {home_pitcher}\n\n"
-        f"🛡️ Producto: {product}\n"
-        f"💵 Cuota: {odds_text} | {book}\n"
-        f"📌 Razón: {reason}\n\n"
-        "⚠️ Revisa alineaciones, abridores y cualquier cambio de última hora antes del inicio."
-    )
-    await context.bot.send_message(chat_id=chat_id, text=text)
-    await asyncio.to_thread(_record_alert_delivery, chat_id, row, scheduled_for)
-
-
-def _row_to_alert_dict(row):
-    return {k: row[k] for k in row.keys()}
-
-
-async def schedule_alert_jobs(application, pick_date=None):
-    """Schedule unsent Telegram alerts for every enabled chat and tracked Triple Pick."""
-    if application.job_queue is None:
-        return {"scheduled": 0, "skipped": 0, "reason": "job_queue_unavailable"}
-
-    rows = await asyncio.to_thread(_pending_alert_picks, pick_date)
-    chats = await asyncio.to_thread(_enabled_alert_chats)
-    now_utc = datetime.now(timezone.utc)
-    scheduled = skipped = 0
-
-    for chat in chats:
-        chat_id = int(chat["chat_id"])
-        lead = int(chat["lead_minutes"] or ALERT_LEAD_MINUTES)
-        for row in rows:
-            if not await asyncio.to_thread(
-                _game_alert_enabled, chat_id, row["pick_date"], row["game_pk"], row["selection"]
-            ):
-                skipped += 1
-                continue
-            if await asyncio.to_thread(
-                _alert_was_sent, chat_id, row["pick_date"], row["game_pk"], row["selection"]
-            ):
-                skipped += 1
-                continue
-            game_dt = _parse_iso_utc(row["game_date"])
-            if game_dt is None:
-                skipped += 1
-                continue
-            alert_dt = game_dt - timedelta(minutes=lead)
-            if alert_dt <= now_utc:
-                skipped += 1
-                continue
-            name = _alert_job_name(chat_id, row)
-            for existing in application.job_queue.get_jobs_by_name(name):
-                existing.schedule_removal()
-            application.job_queue.run_once(
-                _send_pick_alert_job,
-                when=alert_dt,
-                data={
-                    "chat_id": chat_id,
-                    "pick": _row_to_alert_dict(row),
-                    "scheduled_for": alert_dt.astimezone(LOCAL_TZ).isoformat(),
-                },
-                name=name,
-                chat_id=chat_id,
-            )
-            scheduled += 1
-    return {"scheduled": scheduled, "skipped": skipped, "reason": None}
-
-
-ALERT_MENU_KEYBOARD = ReplyKeyboardMarkup(
-    [
-        ["✅ Activar alertas", "⛔ Desactivar alertas"],
-        ["📋 Próximas alertas", "⬅️ Menú principal"],
-    ],
-    resize_keyboard=True,
-    is_persistent=True,
-    input_field_placeholder="Alertas Triple Pick",
-)
-
-
-async def alerts_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    sub = await asyncio.to_thread(_get_alert_subscription, chat_id)
-    state = "ACTIVAS" if sub["enabled"] else "DESACTIVADAS"
-    await update.message.reply_text(
-        "🔔 ALERTAS TRIPLE PICK\n\n"
-        f"Estado: {state}\n"
-        f"Aviso: {sub['lead_minutes']} minutos antes de cada juego del Triple Pick.\n\n"
-        "Usa los botones para activar, desactivar o revisar las próximas alertas.",
-        reply_markup=ALERT_MENU_KEYBOARD,
-    )
-
-
-async def alerts_enable(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    await asyncio.to_thread(_set_alert_subscription, chat_id, True, ALERT_LEAD_MINUTES)
-    info = await schedule_alert_jobs(context.application)
-    await update.message.reply_text(
-        "✅ Alertas activadas.\n"
-        f"Recibirás un aviso {ALERT_LEAD_MINUTES} minutos antes de cada juego registrado en Triple Pick.\n"
-        f"Alertas programadas ahora: {info['scheduled']}.",
-        reply_markup=ALERT_MENU_KEYBOARD,
-    )
-
-
-async def alerts_disable(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    await asyncio.to_thread(_set_alert_subscription, chat_id, False, ALERT_LEAD_MINUTES)
-    if context.application.job_queue is not None:
-        prefix = f"tp_alert_{chat_id}_"
-        for job in context.application.job_queue.jobs():
-            if job.name and job.name.startswith(prefix):
-                job.schedule_removal()
-    await update.message.reply_text(
-        "⛔ Alertas desactivadas para este chat.",
-        reply_markup=ALERT_MENU_KEYBOARD,
-    )
-
-
-async def _build_alerts_panel(chat_id):
-    sub = await asyncio.to_thread(_get_alert_subscription, chat_id)
-    rows = await asyncio.to_thread(_pending_alert_picks, None)
-    now_utc = datetime.now(timezone.utc)
-    items = []
-    counts = {"PENDIENTE": 0, "ENVIADA": 0, "DESACTIVADA": 0}
-
-    for row in rows:
-        game_dt = _parse_iso_utc(row["game_date"])
-        if not game_dt:
-            continue
-        status = await asyncio.to_thread(_alert_status, chat_id, row, sub["enabled"])
-        if status in counts:
-            counts[status] += 1
-        alert_dt = game_dt - timedelta(minutes=sub["lead_minutes"])
-        if game_dt > now_utc or status == "ENVIADA":
-            items.append((row, game_dt, alert_dt, status))
-
-    lines = [
-        "📋 ALERTAS TRIPLE PICK",
-        f"Estado global: {'ACTIVAS' if sub['enabled'] else 'DESACTIVADAS'}",
-        f"Pendientes: {counts['PENDIENTE']} | Enviadas: {counts['ENVIADA']} | Desactivadas: {counts['DESACTIVADA']}",
-        "",
-    ]
-    keyboard = []
-    for idx, (row, game_dt, alert_dt, status) in enumerate(items[:12], 1):
-        status_icon = {"PENDIENTE": "🟡", "ENVIADA": "✅", "DESACTIVADA": "⛔"}.get(status, "•")
-        lines.append(
-            f"{idx}. {status_icon} {row['selection']} ML — {row['away']} vs {row['home']}\n"
-            f"   ⚾ Juego: {game_dt.astimezone(LOCAL_TZ).strftime('%m/%d %I:%M %p').lstrip('0')}\n"
-            f"   🔔 Aviso: {alert_dt.astimezone(LOCAL_TZ).strftime('%m/%d %I:%M %p').lstrip('0')}\n"
-            f"   Estado: {status}"
-        )
-        if status != "ENVIADA":
-            action = "off" if status == "PENDIENTE" else "on"
-            label = "⛔ Desactivar" if action == "off" else "✅ Activar"
-            callback = f"alertgame|{action}|{row['pick_date']}|{row['game_pk']}|{idx}"
-            keyboard.append([InlineKeyboardButton(f"{label} · {row['selection']}", callback_data=callback)])
-
-    if not items:
-        lines.append("No hay alertas registradas para mostrar en este momento.")
-    return "\n".join(lines), InlineKeyboardMarkup(keyboard) if keyboard else None, items
-
-
-async def alerts_upcoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    text, inline_markup, _items = await _build_alerts_panel(chat_id)
-    await update.message.reply_text(
-        text,
-        reply_markup=inline_markup if inline_markup is not None else ALERT_MENU_KEYBOARD,
-    )
-
-
-async def alert_game_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    chat_id = query.message.chat_id
-    parts = (query.data or "").split("|")
-    if len(parts) != 5 or parts[0] != "alertgame":
-        return
-    _prefix, action, pick_date, game_pk_text, idx_text = parts
-    try:
-        game_pk = int(game_pk_text)
-        idx = int(idx_text) - 1
-    except ValueError:
-        return
-
-    rows = await asyncio.to_thread(_pending_alert_picks, None)
-    candidates = [r for r in rows if r["pick_date"] == pick_date and int(r["game_pk"]) == game_pk]
-    if not candidates:
-        await query.edit_message_text("⚠️ Esa selección ya no está disponible en el tracking.")
-        return
-    row = candidates[0]
-    enabled = action == "on"
-    await asyncio.to_thread(
-        _set_game_alert_enabled, chat_id, row["pick_date"], row["game_pk"], row["selection"], enabled
-    )
-
-    if context.application.job_queue is not None:
-        name = _alert_job_name(chat_id, row)
-        for job in context.application.job_queue.get_jobs_by_name(name):
-            job.schedule_removal()
-        if enabled:
-            await schedule_alert_jobs(context.application, row["pick_date"])
-
-    text, inline_markup, _items = await _build_alerts_panel(chat_id)
-    await query.edit_message_text(text, reply_markup=inline_markup)
-
-
 async def trackstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         info = await asyncio.to_thread(tracking_status_snapshot)
@@ -2537,7 +2080,7 @@ async def trackstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Tracking DB error: {exc}")
         return
     await update.message.reply_text(
-        "🧾 TRACKING ENGINE — v2.9.1\n"
+        "🧾 TRACKING ENGINE — v2.9\n"
         f"DB: {info['path']}\n"
         f"Railway Volume: {info['railway_volume'] or 'NO DETECTADO'}\n"
         f"Total snapshots: {info['total']}\n"
@@ -2555,7 +2098,7 @@ async def settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ No pude liquidar el tracking: {exc}")
         return
     await update.message.reply_text(
-        "✅ TRACK SETTLEMENT — v2.9.1\n"
+        "✅ TRACK SETTLEMENT — v2.9\n"
         f"Pending al iniciar: {info['pending_before']}\n"
         f"WIN: {info['wins']} | LOSS: {info['losses']} | VOID: {info['void']}\n"
         f"Aún pendientes: {info['still_pending']}"
@@ -2572,7 +2115,7 @@ async def performance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     n = int(overall["n"] or 0)
     if n == 0:
         await update.message.reply_text(
-            "📊 PERFORMANCE — v2.9.1\nAún no hay picks oficiales liquidados."
+            "📊 PERFORMANCE — v2.9\nAún no hay picks oficiales liquidados."
         )
         return
 
@@ -2585,7 +2128,7 @@ async def performance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     brier_text = "N/D" if brier is None else f"{float(brier):.4f}"
     msg = (
-        "📊 PERFORMANCE — v2.9.1\n"
+        "📊 PERFORMANCE — v2.9\n"
         f"Official settled: {n} | Sample: {_sample_label(n)}\n"
         f"W-L: {wins}-{int(overall['losses'] or 0)} | Hit Rate: {hit*100:.1f}%\n"
         f"Brier: {brier_text}\n"
@@ -2626,12 +2169,12 @@ async def calibration(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not rows:
         await update.message.reply_text(
-            "🧪 CALIBRATION — v2.9.1\nAún no hay muestra oficial suficiente para formar bins."
+            "🧪 CALIBRATION — v2.9\nAún no hay muestra oficial suficiente para formar bins."
         )
         return
 
     msg = (
-        "🧪 CALIBRATION — v2.9.1\n"
+        "🧪 CALIBRATION — v2.9\n"
         "Pred = probabilidad proxy promedio | Actual = hit rate observado.\n\n"
     )
     for row in rows:
@@ -2653,10 +2196,10 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not rows:
-        await update.message.reply_text("📚 HISTORY — v2.9.1\nAún no hay picks registrados.")
+        await update.message.reply_text("📚 HISTORY — v2.9\nAún no hay picks registrados.")
         return
 
-    msg = "📚 HISTORY — v2.9.1\nÚltimos registros:\n\n"
+    msg = "📚 HISTORY — v2.9\nÚltimos registros:\n\n"
     for row in rows:
         official = "OFF" if row["official"] else "AUDIT"
         odds = _format_american(row["odds"])
@@ -2684,89 +2227,422 @@ async def auto_settle_tracking(context: ContextTypes.DEFAULT_TYPE):
         print(f"❌ Tracking auto-settle error: {exc}")
 
 
+
 # ---------------------------------------------------------------------------
-# v2.9.4 VISUAL MENU
+# TELEGRAM STARS MEMBERSHIP
 # ---------------------------------------------------------------------------
 
-MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
-    [
-        ["⚾ Picks de hoy", "📊 Estado"],
-        ["📈 Rendimiento", "🧮 Mercado"],
-        ["📋 Historial", "🔔 Alertas"],
-        ["⚾ Juegos MLB", "🧪 Más opciones"],
-    ],
-    resize_keyboard=True,
-    is_persistent=True,
-    input_field_placeholder="Selecciona una opción de Triple Pick",
-)
+def _subscription_now_ts():
+    return int(datetime.now(timezone.utc).timestamp())
 
 
-def _menu_text():
-    return (
-        f"⚾ MLB TRIPLE PICK v{BOT_VERSION}\n\n"
-        "Selecciona una opción del menú. Los comandos tradicionales siguen disponibles.\n\n"
-        "⚾ Picks de hoy — Triple Pick final\n"
-        "📊 Estado — Tracking Engine\n"
-        "📈 Rendimiento — Hit rate, ROI y Brier\n"
-        "🧮 Mercado — MODEL vs MARKET\n"
-        "📋 Historial — Picks registrados\n"
-        "🔔 Alertas — Avisos 45 min antes del juego\n"
-        "⚾ Juegos MLB — Cartelera de hoy\n"
-        "🧪 Más opciones — Herramientas avanzadas"
+def _subscription_plan_from_payload(payload):
+    if not payload or not payload.startswith("TRIPLE_PICK_SUB:"):
+        return None
+    plan = payload.split(":", 1)[1].strip().upper()
+    return plan if plan in {"PREMIUM", "PRO"} else None
+
+
+def _ensure_trial_user(user):
+    """Create the one-time 7-day FREE trial on first use; never reset it."""
+    now_ts = _subscription_now_ts()
+    trial_expires = now_ts + FREE_TRIAL_PERIOD
+    with _tracking_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO membership_users (
+                user_id, username, first_name, trial_started_at,
+                trial_expires_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                first_name = excluded.first_name,
+                updated_at = excluded.updated_at
+            """,
+            (
+                int(user.id), user.username, user.first_name, now_ts,
+                trial_expires, now_ts, now_ts,
+            ),
+        )
+        return conn.execute(
+            """
+            SELECT user_id, trial_started_at, trial_expires_at
+            FROM membership_users
+            WHERE user_id = ?
+            """,
+            (int(user.id),),
+        ).fetchone()
+
+
+def _trial_row(user_id):
+    with _tracking_connection() as conn:
+        return conn.execute(
+            """
+            SELECT user_id, trial_started_at, trial_expires_at
+            FROM membership_users
+            WHERE user_id = ?
+            """,
+            (int(user_id),),
+        ).fetchone()
+
+
+def _trial_status(user_id):
+    row = _trial_row(user_id)
+    if row is None:
+        return False, None
+    return int(row["trial_expires_at"]) > _subscription_now_ts(), row
+
+
+def _remaining_trial_text(expires_at):
+    remaining = max(0, int(expires_at) - _subscription_now_ts())
+    days, rem = divmod(remaining, 86400)
+    hours = rem // 3600
+    if days > 0:
+        return f"{days} día(s) y {hours} h"
+    if hours > 0:
+        return f"{hours} h"
+    minutes = max(1, remaining // 60)
+    return f"{minutes} min"
+
+
+def _active_subscription_rows(user_id):
+    now_ts = _subscription_now_ts()
+    with _tracking_connection() as conn:
+        return conn.execute(
+            """
+            SELECT user_id, plan, status, expires_at, charge_id, is_recurring
+            FROM subscriptions
+            WHERE user_id = ? AND status = 'ACTIVE' AND expires_at > ?
+            ORDER BY expires_at DESC
+            """,
+            (int(user_id), now_ts),
+        ).fetchall()
+
+
+def _best_active_plan(user_id):
+    if int(user_id) in SUBSCRIPTION_ADMIN_IDS:
+        return "PRO", None
+    rows = _active_subscription_rows(user_id)
+    if rows:
+        best = max(rows, key=lambda r: PLAN_RANK.get(r["plan"], 0))
+        return best["plan"], best
+    trial_active, trial = _trial_status(user_id)
+    if trial_active:
+        return "FREE", trial
+    return "EXPIRED", trial
+
+
+def _has_plan(user_id, required_plan="PREMIUM"):
+    plan, _row = _best_active_plan(user_id)
+    if plan == "FREE":
+        # During the 7-day trial, FREE users can test PREMIUM-level content.
+        return required_plan == "PREMIUM"
+    return PLAN_RANK.get(plan, -1) >= PLAN_RANK.get(required_plan, 1)
+
+
+def _save_successful_subscription(user, payment):
+    plan = _subscription_plan_from_payload(payment.invoice_payload)
+    if plan is None or payment.currency != "XTR":
+        return None
+
+    now_ts = _subscription_now_ts()
+    expires_at = int(payment.subscription_expiration_date or (now_ts + SUBSCRIPTION_PERIOD))
+    charge_id = payment.telegram_payment_charge_id
+    recurring = bool(payment.is_recurring)
+    first_recurring = bool(payment.is_first_recurring)
+
+    with _tracking_connection() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO subscription_payments (
+                user_id, plan, amount_stars, charge_id, invoice_payload,
+                paid_at, expires_at, is_recurring, is_first_recurring
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(user.id), plan, int(payment.total_amount), charge_id,
+                payment.invoice_payload, now_ts, expires_at,
+                int(recurring), int(first_recurring),
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO subscriptions (
+                user_id, plan, username, first_name, status, started_at,
+                expires_at, charge_id, is_recurring, updated_at
+            ) VALUES (?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, plan) DO UPDATE SET
+                username = excluded.username,
+                first_name = excluded.first_name,
+                status = 'ACTIVE',
+                expires_at = MAX(subscriptions.expires_at, excluded.expires_at),
+                charge_id = excluded.charge_id,
+                is_recurring = excluded.is_recurring,
+                updated_at = excluded.updated_at
+            """,
+            (
+                int(user.id), plan, user.username, user.first_name,
+                now_ts, expires_at, charge_id, int(recurring), now_ts,
+            ),
+        )
+    return plan, expires_at
+
+
+def _format_expiry(expires_at):
+    if not expires_at:
+        return "N/D"
+    return datetime.fromtimestamp(int(expires_at), tz=LOCAL_TZ).strftime("%d %b %Y, %I:%M %p")
+
+
+def _membership_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⭐ Ver planes", callback_data="tp_plans")],
+        [InlineKeyboardButton("👤 Mi cuenta", callback_data="tp_account")],
+    ])
+
+
+def _plans_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"⭐ PREMIUM — {PREMIUM_STARS} Stars/30 días", callback_data="tp_buy_premium")],
+        [InlineKeyboardButton(f"🔥 PRO — {PRO_STARS} Stars/30 días", callback_data="tp_buy_pro")],
+        [InlineKeyboardButton("👤 Mi cuenta", callback_data="tp_account")],
+    ])
+
+
+async def _send_plans(chat_id, context):
+    text = (
+        "💎 TRIPLE PICK — MEMBRESÍAS\n\n"
+        "🆓 FREE — 7 DÍAS\n"
+        "• Prueba única por usuario\n"
+        "• Acceso a Triple Pick durante la prueba\n\n"
+        "⭐ PREMIUM — $10/mes (precio objetivo)\n"
+        "• Triple Pick diario\n"
+        "• Historial y seguimiento\n"
+        "• Alertas premium\n\n"
+        "🔥 PRO — $20/mes (precio objetivo)\n"
+        "• Todo PREMIUM\n"
+        "• Player Props y selecciones adicionales\n"
+        "• Alertas y actualizaciones prioritarias\n\n"
+        "Las suscripciones se cobran en Telegram Stars y se renuevan cada 30 días."
+    )
+    await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=_plans_keyboard())
+
+
+async def subscription_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _send_plans(update.effective_chat.id, context)
+
+
+async def account_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await asyncio.to_thread(_ensure_trial_user, user)
+    user_id = user.id
+    plan, row = await asyncio.to_thread(_best_active_plan, user_id)
+    if plan == "FREE":
+        expiry = _format_expiry(row["trial_expires_at"])
+        remaining = _remaining_trial_text(row["trial_expires_at"])
+        text = (
+            "👤 MI CUENTA\n\n"
+            "Plan: FREE — PRUEBA 7 DÍAS\n"
+            "Estado: 🟢 ACTIVO\n"
+            f"Tiempo restante: {remaining}\n"
+            f"Finaliza: {expiry}\n\n"
+            "Después puedes continuar con PREMIUM ($10/mes) o PRO ($20/mes)."
+        )
+    elif plan == "EXPIRED":
+        text = (
+            "👤 MI CUENTA\n\n"
+            "Plan: FREE\n"
+            "Estado: 🔴 PRUEBA FINALIZADA\n\n"
+            "Elige PREMIUM ($10/mes) o PRO ($20/mes) para continuar."
+        )
+    else:
+        expiry = _format_expiry(row["expires_at"]) if row is not None else "ADMIN"
+        text = (
+            "👤 MI CUENTA\n\n"
+            f"Plan: {plan}\n"
+            "Estado: 🟢 ACTIVO\n"
+            f"Válido hasta: {expiry}\n"
+            "Renovación: automática mientras la suscripción siga activa en Telegram."
+        )
+    await update.effective_message.reply_text(text, reply_markup=_membership_keyboard())
+
+
+async def membership_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action = query.data
+    if action == "tp_plans":
+        await _send_plans(query.message.chat_id, context)
+        return
+    if action == "tp_account":
+        await asyncio.to_thread(_ensure_trial_user, query.from_user)
+        user_id = query.from_user.id
+        plan, row = await asyncio.to_thread(_best_active_plan, user_id)
+        if plan == "FREE":
+            text = (
+                "👤 MI CUENTA\n\n"
+                "Plan: FREE — PRUEBA 7 DÍAS\n"
+                "Estado: 🟢 ACTIVO\n"
+                f"Tiempo restante: {_remaining_trial_text(row['trial_expires_at'])}\n"
+                f"Finaliza: {_format_expiry(row['trial_expires_at'])}"
+            )
+        elif plan == "EXPIRED":
+            text = (
+                "👤 MI CUENTA\n\n"
+                "Plan: FREE\n"
+                "Estado: 🔴 PRUEBA FINALIZADA\n\n"
+                "PREMIUM: $10/mes | PRO: $20/mes"
+            )
+        else:
+            expiry = _format_expiry(row["expires_at"]) if row is not None else "ADMIN"
+            text = f"👤 MI CUENTA\n\nPlan: {plan}\nEstado: 🟢 ACTIVO\nVálido hasta: {expiry}"
+        await context.bot.send_message(chat_id=query.message.chat_id, text=text, reply_markup=_membership_keyboard())
+        return
+
+    plan = None
+    stars = None
+    if action == "tp_buy_premium":
+        plan, stars = "PREMIUM", PREMIUM_STARS
+    elif action == "tp_buy_pro":
+        plan, stars = "PRO", PRO_STARS
+    if plan is None:
+        return
+
+    if stars < 1 or stars > 10000:
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="❌ Precio de suscripción inválido. Debe estar entre 1 y 10000 Stars.",
+        )
+        return
+
+    payload = f"TRIPLE_PICK_SUB:{plan}"
+    try:
+        link = await context.bot.create_invoice_link(
+            title=f"Triple Pick {plan}",
+            description=f"Membresía {plan} de Triple Pick por 30 días con renovación automática.",
+            payload=payload,
+            provider_token="",
+            currency="XTR",
+            prices=[LabeledPrice(label=f"Triple Pick {plan}", amount=int(stars))],
+            subscription_period=SUBSCRIPTION_PERIOD,
+        )
+    except TypeError:
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=(
+                "❌ Esta versión de python-telegram-bot no soporta subscription_period. "
+                "Actualiza python-telegram-bot antes de activar cobros."
+            ),
+        )
+        return
+    except Exception as exc:
+        print(f"Subscription invoice error: {exc}")
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="❌ No pude crear el enlace de pago en este momento.",
+        )
+        return
+
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text=(
+            f"{plan} — {stars} Stars cada 30 días\n\n"
+            "Telegram mostrará los términos de la suscripción antes de confirmar el pago."
+        ),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⭐ PAGAR CON STARS", url=link)]]),
     )
 
 
-async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(_menu_text(), reply_markup=MAIN_MENU_KEYBOARD)
+async def precheckout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.pre_checkout_query
+    plan = _subscription_plan_from_payload(query.invoice_payload)
+    expected = PREMIUM_STARS if plan == "PREMIUM" else PRO_STARS if plan == "PRO" else None
+    ok = (
+        plan is not None
+        and query.currency == "XTR"
+        and expected is not None
+        and int(query.total_amount) == int(expected)
+    )
+    if ok:
+        await query.answer(ok=True)
+    else:
+        await query.answer(ok=False, error_message="La orden no coincide con un plan válido de Triple Pick.")
 
 
-async def menu_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🧪 HERRAMIENTAS AVANZADAS\n\n"
-        "/pool — Candidate Pool completo\n"
-        "/value — Value Board Hard Rock\n"
-        "/oddsstatus — Estado del Market Engine\n"
-        "/oddsdebug — Diagnóstico de bookmakers\n"
-        "/settle — Liquidar picks finalizados\n"
-        "/calibration — Calibración del modelo\n"
-        "/myid — ID de este chat\n\n"
-        "Puedes seguir usando el menú inferior para las funciones principales.",
-        reply_markup=MAIN_MENU_KEYBOARD,
+async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    payment = update.effective_message.successful_payment
+    if payment is None:
+        return
+    saved = await asyncio.to_thread(_save_successful_subscription, update.effective_user, payment)
+    if not saved:
+        await update.effective_message.reply_text("⚠️ Pago recibido, pero no pude asociarlo a un plan válido.")
+        return
+    plan, expires_at = saved
+    await update.effective_message.reply_text(
+        "✅ SUSCRIPCIÓN ACTIVADA\n\n"
+        f"Plan: {plan}\n"
+        f"Válido hasta: {_format_expiry(expires_at)}\n\n"
+        "Tu acceso premium ya está habilitado.",
+        reply_markup=_membership_keyboard(),
     )
 
 
-async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Route visual keyboard labels to the existing command functions."""
-    text = (update.message.text or "").strip()
-    routes = {
-        "⚾ Picks de hoy": picks,
-        "📊 Estado": trackstatus,
-        "📈 Rendimiento": performance,
-        "🧮 Mercado": market,
-        "📋 Historial": history,
-        "🔔 Alertas": alerts_menu,
-        "✅ Activar alertas": alerts_enable,
-        "⛔ Desactivar alertas": alerts_disable,
-        "📋 Próximas alertas": alerts_upcoming,
-        "⬅️ Menú principal": menu,
-        "⚾ Juegos MLB": mlb,
-        "🧪 Más opciones": menu_more,
-    }
-    handler = routes.get(text)
-    if handler is not None:
-        await handler(update, context)
+async def _premium_gate(update, required="PREMIUM"):
+    """Return True when access is allowed. Enforcement is opt-in for safe rollout."""
+    if not SUBSCRIPTION_ENFORCE:
+        return True
+    user = update.effective_user
+    if user:
+        await asyncio.to_thread(_ensure_trial_user, user)
+    if user and await asyncio.to_thread(_has_plan, user.id, required):
+        return True
+    await update.effective_message.reply_text(
+        "🔒 Tu prueba FREE de 7 días finalizó o esta función requiere un nivel superior de Triple Pick.",
+        reply_markup=_plans_keyboard(),
+    )
+    return False
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    trial = await asyncio.to_thread(_ensure_trial_user, update.effective_user)
     await update.message.reply_text(
-        _menu_text() +
-        "\n\nPipeline: MODEL → MARKET → NO-VIG → AGREEMENT → FINAL PICK → TRACK → SETTLE → CALIBRATE",
-        reply_markup=MAIN_MENU_KEYBOARD,
+        "⚾ MLB TRIPLE PICK v2.9 — TRACKING & CALIBRATION\n\n"
+        "Comandos disponibles:\n"
+        "/mlb - Juegos de hoy\n"
+        "/picks - Triple Pick final market-aware + tracking\n"
+        "/pool - Candidate Pool completo\n"
+        "/market - Auditoría MODEL vs MARKET\n"
+        "/value - Picks con señal de valor en Hard Rock\n"
+        "/oddsstatus - Estado del Market Engine\n"
+        "/trackstatus - Estado del Tracking Engine\n"
+        "/settle - Liquidar picks finalizados\n"
+        "/performance - Hit rate, ROI y Brier\n"
+        "/calibration - Predicted vs Actual por bins\n"
+        "/history - Últimos picks registrados\n"
+        "/myid - ID de este chat\n"
+        "/autostatus - Estado del envío automático\n"
+        "/subscribe - Ver planes y activar membresía\n"
+        "/account - Ver estado de mi suscripción\n\n"
+        "Pipeline: MODEL → MARKET → NO-VIG → AGREEMENT → FINAL PICK → TRACK → SETTLE → CALIBRATE"
     )
+    plan, row = await asyncio.to_thread(_best_active_plan, update.effective_user.id)
+    if plan == "FREE":
+        membership_text = (
+            "🆓 PRUEBA FREE ACTIVADA\n"
+            f"Tienes {_remaining_trial_text(row['trial_expires_at'])} de acceso de prueba.\n"
+            "Luego: PREMIUM $10/mes | PRO $20/mes"
+        )
+    elif plan == "EXPIRED":
+        membership_text = "🔴 Tu prueba FREE ya finalizó. PREMIUM $10/mes | PRO $20/mes"
+    else:
+        membership_text = f"💎 Membresía activa: {plan}"
+    await update.message.reply_text(membership_text, reply_markup=_membership_keyboard())
 
 
 async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Triple Pick v2.9.1: market-aware selection plus immutable recommendation tracking."""
+    """Triple Pick v2.9: market-aware selection plus immutable recommendation tracking."""
+    if not await _premium_gate(update, "PREMIUM"):
+        return
     now = local_now()
     fecha = now.strftime("%Y-%m-%d")
     season = now.year
@@ -2787,7 +2663,7 @@ async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     value_count = sum(bool(p.get("value_approved")) for p in partidos)
 
     mensaje = (
-        f"🔥 MLB TRIPLE PICK v{BOT_VERSION} — MARKET + TRACKING\n"
+        "🔥 MLB TRIPLE PICK v2.9 — MARKET + TRACKING\n"
         f"📅 {fecha} — {AUTO_TZ}\n\n"
         "🧠 MODEL: v2.7.1 starter sample + recency + offense + form + bullpen proxy.\n"
         "💵 MARKET: Moneyline → implied probability → no-vig → model/market agreement.\n"
@@ -2811,7 +2687,6 @@ async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🏦 Primary book: {ODDS_PRIMARY_BOOKMAKER}\n"
             "🏆 Triple Pick final usa solo HYBRID/SURVIVAL; VALUE puro vive en /value.\n\n"
         )
-        mensaje += _primary_feed_notice(partidos, odds_status)
 
     if not triple_pick:
         mensaje += (
@@ -2854,24 +2729,17 @@ async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             if mode == "market":
                 mensaje += (
-                    f"🧾 Tracking v2.9.5: {track_info['inserted']} nuevo(s), "
+                    f"🧾 Tracking v2.9: {track_info['inserted']} nuevo(s), "
                     f"{track_info['existing']} ya registrado(s). "
                     "SURVIVAL/HYBRID = muestra oficial.\n"
                 )
             else:
                 mensaje += (
-                    f"🧾 Tracking v2.9.5: {track_info['inserted']} fallback nuevo(s). "
+                    f"🧾 Tracking v2.9: {track_info['inserted']} fallback nuevo(s). "
                     "Se guardan para auditoría, fuera de métricas oficiales.\n"
                 )
         except Exception as exc:
             mensaje += f"⚠️ Tracking no pudo guardar este snapshot: {exc}\n"
-
-        try:
-            alert_info = await schedule_alert_jobs(context.application, fecha)
-            if alert_info.get("scheduled"):
-                mensaje += f"🔔 Alertas 45 min: {alert_info['scheduled']} programada(s).\n"
-        except Exception as exc:
-            mensaje += f"⚠️ No pude programar alertas: {exc}\n"
 
     mensaje += (
         "ℹ️ SURVIVAL no exige +EV estricto; VALUE sí exige un gap positivo mínimo y "
@@ -2896,14 +2764,13 @@ async def pool(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     mensaje = (
-        "🔎 MLB CANDIDATE POOL — v2.9.5\n"
+        "🔎 MLB CANDIDATE POOL — v2.9\n"
         f"📅 {fecha}\n"
         f"Market: {'ON' if odds_status == 'ok' else 'OFF/FALLBACK'} | "
         f"Primary: {ODDS_PRIMARY_BOOKMAKER}\n\n"
         "C=Confidence | DR=Data Reliability | MP=Model Probability Proxy | "
         "MKT=consensus no-vig | VG=value gap.\n\n"
     )
-    mensaje += _primary_feed_notice(partidos, odds_status)
     for i, p in enumerate(partidos, 1):
         icon = "✅" if p.get("eligible") else "❌"
         vg = p.get("value_gap")
@@ -2945,11 +2812,10 @@ async def market(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     mensaje = (
-        "💵 MLB MARKET AUDIT — v2.9.5\n"
+        "💵 MLB MARKET AUDIT — v2.9\n"
         f"📅 {fecha}\n"
-        f"Primary: {ODDS_PRIMARY_BOOKMAKER} | Books: {ODDS_BOOKMAKERS}\n""⏱️ PREMATCH ONLY: juegos iniciados/live se excluyen del Market Engine.\n\n"
+        f"Primary: {ODDS_PRIMARY_BOOKMAKER} | Books: {ODDS_BOOKMAKERS}\n\n"
     )
-    mensaje += _primary_feed_notice(partidos, odds_status)
     for i, p in enumerate(partidos, 1):
         vg = p.get("value_gap")
         vg_text = "N/D" if vg is None else f"{vg * 100:+.1f} pp"
@@ -2966,6 +2832,8 @@ async def market(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show only Hard Rock value/hybrid candidates that pass the model gate."""
+    if not await _premium_gate(update, "PRO"):
+        return
     now = local_now()
     fecha = now.strftime("%Y-%m-%d")
     season = now.year
@@ -2981,16 +2849,6 @@ async def value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    primary_notice = _primary_feed_notice(partidos, odds_status)
-    if primary_notice:
-        await update.message.reply_text(
-            "🟣 MLB VALUE BOARD — v2.9.5\n"
-            f"📅 {fecha}\n\n"
-            + primary_notice
-            + "VALUE requiere un precio accionable de Hard Rock; no se sustituye por consenso."
-        )
-        return
-
     candidatos = [p for p in partidos if p.get("value_approved")]
     candidatos.sort(
         key=lambda p: (
@@ -3002,7 +2860,7 @@ async def value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     mensaje = (
-        "🟣 MLB VALUE BOARD — v2.9.5\n"
+        "🟣 MLB VALUE BOARD — v2.9\n"
         f"📅 {fecha}\n"
         "Regla: Model Gate aprobado + precio Hard Rock + gap ≥3.5 pp; "
         "divergencias >10 pp se mandan a REVIEW, no a VALUE automático.\n\n"
@@ -3036,89 +2894,6 @@ async def oddsstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Last request cost: {_ODDS_LAST_META.get('last') or 'N/D'}\n"
         f"Last error: {_ODDS_LAST_META.get('error') or 'ninguno'}"
     )
-
-
-async def oddsdebug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Diagnóstico seguro de bookmakers recibidos desde The Odds API.
-
-    No muestra la API key ni modifica gates/scoring. Sirve para verificar si
-    hardrockbet_fl está realmente presente en la respuesta cruda por evento.
-    """
-    fecha = local_now().strftime("%Y-%m-%d")
-    odds_status, events = await asyncio.to_thread(get_mlb_moneyline_odds, fecha)
-
-    if odds_status == "not_configured":
-        await update.message.reply_text(
-            "🧪 ODDS DEBUG — v2.9.5\n"
-            "❌ ODDS_API_KEY no configurada."
-        )
-        return
-    if odds_status != "ok":
-        await update.message.reply_text(
-            "🧪 ODDS DEBUG — v2.9.5\n"
-            f"❌ Odds API status: {odds_status}\n"
-            f"Last error: {_ODDS_LAST_META.get('error') or 'N/D'}"
-        )
-        return
-
-    requested = [b.strip() for b in ODDS_BOOKMAKERS.split(",") if b.strip()]
-    all_keys = sorted({
-        str(book.get("key"))
-        for event in events
-        for book in event.get("bookmakers", [])
-        if book.get("key")
-    })
-    primary_anywhere = ODDS_PRIMARY_BOOKMAKER in all_keys
-
-    msg = (
-        "🧪 ODDS DEBUG — v2.9.5\n"
-        f"📅 {fecha} — {AUTO_TZ}\n"
-        f"🎯 Primary esperado: {ODDS_PRIMARY_BOOKMAKER}\n"
-        f"📨 Solicitados: {', '.join(requested) or 'N/D'}\n"
-        f"📥 Recibidos globalmente: {', '.join(all_keys) or 'NINGUNO'}\n"
-        f"🏦 Primary presente en algún evento: {'SÍ' if primary_anywhere else 'NO'}\n"
-        f"📦 Eventos API: {len(events)} | Quota restante: {_ODDS_LAST_META.get('remaining') or 'N/D'}\n\n"
-    )
-
-    shown = 0
-    for event in events:
-        if not _event_is_local_date(event, fecha):
-            continue
-        # Se muestra también si ya inició para diagnosticar la respuesta cruda,
-        # pero se etiqueta LIVE/STARTED; /market sigue siendo PREMATCH ONLY.
-        pregame = _event_is_pregame(event)
-        keys = [
-            str(book.get("key"))
-            for book in event.get("bookmakers", [])
-            if book.get("key")
-        ]
-        titles = [
-            str(book.get("title") or book.get("key"))
-            for book in event.get("bookmakers", [])
-            if book.get("key")
-        ]
-        has_primary = ODDS_PRIMARY_BOOKMAKER in keys
-        away = event.get("away_team") or "Away"
-        home = event.get("home_team") or "Home"
-        state = "PREMATCH" if pregame else "STARTED/LIVE"
-        msg += (
-            f"{shown + 1}. {away} vs {home}\n"
-            f"   ⏱️ {state} | Primary: {'✅' if has_primary else '❌'}\n"
-            f"   🔑 Keys: {', '.join(keys) or 'NINGUNA'}\n"
-            f"   🏷️ Books: {', '.join(titles) or 'NINGUNO'}\n\n"
-        )
-        shown += 1
-        if shown >= 20:
-            break
-
-    if shown == 0:
-        msg += "No se encontraron eventos de la fecha local en la respuesta.\n"
-
-    msg += (
-        "ℹ️ Este comando es diagnóstico solamente: no altera picks, gates, "
-        "tracking ni calibración."
-    )
-    await _reply_long(update.message, msg)
 
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3159,15 +2934,6 @@ async def enviar_picks_automaticos(context: ContextTypes.DEFAULT_TYPE):
         print(f"❌ Error en auto-picks: {exc}")
 
 
-async def post_init_schedule_alerts(application):
-    """Rebuild future alert jobs after a Railway restart/deploy."""
-    try:
-        info = await schedule_alert_jobs(application)
-        print(f"🔔 Alertas restauradas al iniciar: {info['scheduled']} programada(s).")
-    except Exception as exc:
-        print(f"⚠️ No pude restaurar alertas al iniciar: {exc}")
-
-
 def main():
     if not TOKEN:
         raise RuntimeError(
@@ -3176,17 +2942,20 @@ def main():
         )
 
     init_tracking_db()
-    app = ApplicationBuilder().token(TOKEN).post_init(post_init_schedule_alerts).build()
+    app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("menu", menu))
+    app.add_handler(CommandHandler("subscribe", subscription_command))
+    app.add_handler(CommandHandler("account", account_command))
+    app.add_handler(CallbackQueryHandler(membership_callback, pattern=r"^tp_"))
+    app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
+    app.add_handler(MessageHandler(filters.StatusUpdate.SUCCESSFUL_PAYMENT, successful_payment_handler))
     app.add_handler(CommandHandler("mlb", mlb))
     app.add_handler(CommandHandler("picks", picks))
     app.add_handler(CommandHandler("pool", pool))
     app.add_handler(CommandHandler("market", market))
     app.add_handler(CommandHandler("value", value))
     app.add_handler(CommandHandler("oddsstatus", oddsstatus))
-    app.add_handler(CommandHandler("oddsdebug", oddsdebug))
     app.add_handler(CommandHandler("trackstatus", trackstatus))
     app.add_handler(CommandHandler("settle", settle))
     app.add_handler(CommandHandler("performance", performance))
@@ -3194,11 +2963,6 @@ def main():
     app.add_handler(CommandHandler("history", history))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("autostatus", autostatus))
-    app.add_handler(CommandHandler("alerts", alerts_menu))
-    app.add_handler(CommandHandler("alertson", alerts_enable))
-    app.add_handler(CommandHandler("alertsoff", alerts_disable))
-    app.add_handler(CallbackQueryHandler(alert_game_callback, pattern=r"^alertgame\|"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, visual_menu_router))
 
     if app.job_queue is not None:
         tz = LOCAL_TZ
@@ -3238,7 +3002,7 @@ def main():
             "python-telegram-bot[job-queue] en requirements.txt."
         )
 
-    print(f"🤖 Bot MLB Triple Pick v{BOT_VERSION} iniciado...")
+    print("🤖 Bot MLB Triple Pick v2.9 iniciado...")
     app.run_polling()
 
 

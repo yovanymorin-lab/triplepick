@@ -2949,7 +2949,7 @@ def main():
     app.add_handler(CommandHandler("account", account_command))
     app.add_handler(CallbackQueryHandler(membership_callback, pattern=r"^tp_"))
     app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
-    app.add_handler(MessageHandler(filters.StatusUpdate.SUCCESSFUL_PAYMENT, successful_payment_handler))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
     app.add_handler(CommandHandler("mlb", mlb))
     app.add_handler(CommandHandler("picks", picks))
     app.add_handler(CommandHandler("pool", pool))

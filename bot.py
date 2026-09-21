@@ -3131,6 +3131,121 @@ def _format_expiry(expires_at):
     return datetime.fromtimestamp(int(expires_at), tz=LOCAL_TZ).strftime("%d %b %Y, %I:%M %p")
 
 
+
+def _membership_admin_stats():
+    """Return membership counts for the private admin dashboard."""
+    now_ts = _subscription_now_ts()
+    day_ago = now_ts - 24 * 60 * 60
+    week_ago = now_ts - 7 * 24 * 60 * 60
+
+    with _tracking_connection() as conn:
+        total_users = conn.execute(
+            "SELECT COUNT(*) FROM membership_users"
+        ).fetchone()[0]
+
+        free_active = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM membership_users m
+            WHERE m.trial_expires_at > ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM subscriptions s
+                  WHERE s.user_id = m.user_id
+                    AND s.status = 'ACTIVE'
+                    AND s.expires_at > ?
+                    AND s.plan IN ('PREMIUM', 'PRO')
+              )
+            """,
+            (now_ts, now_ts),
+        ).fetchone()[0]
+
+        free_expired = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM membership_users m
+            WHERE m.trial_expires_at <= ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM subscriptions s
+                  WHERE s.user_id = m.user_id
+                    AND s.status = 'ACTIVE'
+                    AND s.expires_at > ?
+                    AND s.plan IN ('PREMIUM', 'PRO')
+              )
+            """,
+            (now_ts, now_ts),
+        ).fetchone()[0]
+
+        premium_active = conn.execute(
+            """
+            SELECT COUNT(DISTINCT user_id)
+            FROM subscriptions
+            WHERE plan = 'PREMIUM' AND status = 'ACTIVE' AND expires_at > ?
+            """,
+            (now_ts,),
+        ).fetchone()[0]
+
+        pro_active = conn.execute(
+            """
+            SELECT COUNT(DISTINCT user_id)
+            FROM subscriptions
+            WHERE plan = 'PRO' AND status = 'ACTIVE' AND expires_at > ?
+            """,
+            (now_ts,),
+        ).fetchone()[0]
+
+        paid_active = conn.execute(
+            """
+            SELECT COUNT(DISTINCT user_id)
+            FROM subscriptions
+            WHERE status = 'ACTIVE' AND expires_at > ?
+              AND plan IN ('PREMIUM', 'PRO')
+            """,
+            (now_ts,),
+        ).fetchone()[0]
+
+        new_today = conn.execute(
+            "SELECT COUNT(*) FROM membership_users WHERE created_at >= ?",
+            (day_ago,),
+        ).fetchone()[0]
+
+        new_week = conn.execute(
+            "SELECT COUNT(*) FROM membership_users WHERE created_at >= ?",
+            (week_ago,),
+        ).fetchone()[0]
+
+    return {
+        "total_users": int(total_users),
+        "free_active": int(free_active),
+        "free_expired": int(free_expired),
+        "premium_active": int(premium_active),
+        "pro_active": int(pro_active),
+        "paid_active": int(paid_active),
+        "new_today": int(new_today),
+        "new_week": int(new_week),
+    }
+
+
+async def adminstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Private membership counter for configured Triple Pick administrators."""
+    user = update.effective_user
+    if user is None or int(user.id) not in SUBSCRIPTION_ADMIN_IDS:
+        await update.effective_message.reply_text("⛔ Comando exclusivo para administradores.")
+        return
+
+    stats = await asyncio.to_thread(_membership_admin_stats)
+    text = (
+        "📊 TRIPLE PICK — SUSCRIPCIONES\n\n"
+        f"👥 Usuarios registrados: {stats['total_users']}\n\n"
+        f"🆓 FREE activos: {stats['free_active']}\n"
+        f"⏳ FREE vencidos: {stats['free_expired']}\n\n"
+        f"⭐ PREMIUM activos: {stats['premium_active']}\n"
+        f"🚀 PRO activos: {stats['pro_active']}\n\n"
+        f"💳 Suscripciones pagadas activas: {stats['paid_active']}\n"
+        f"📅 Nuevos FREE últimas 24 h: {stats['new_today']}\n"
+        f"📅 Nuevos FREE últimos 7 días: {stats['new_week']}"
+    )
+    await update.effective_message.reply_text(text)
+
 def _membership_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("⭐ Ver planes", callback_data="tp_plans")],
@@ -3919,6 +4034,7 @@ def main():
     app.add_handler(CommandHandler("menu", menu))
     app.add_handler(CommandHandler("subscribe", subscription_command))
     app.add_handler(CommandHandler("account", account_command))
+    app.add_handler(CommandHandler("adminstats", adminstats_command))
     app.add_handler(CallbackQueryHandler(membership_callback, pattern=r"^tp_"))
     app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))

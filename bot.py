@@ -88,7 +88,7 @@ TRACK_SETTLE_MINUTE = int(os.environ.get("TRACK_SETTLE_MINUTE", "30"))
 # Triple Pick Membership / Telegram Stars
 # Subscription prices are configured in Stars, not USD.
 SUBSCRIPTION_PERIOD = 30 * 24 * 60 * 60  # Telegram currently requires exactly 30 days.
-FREE_TRIAL_PERIOD = 7 * 24 * 60 * 60  # One-time 7-day trial per Telegram user ID.
+FREE_TRIAL_PERIOD = 30 * 24 * 60 * 60  # One-time 30-day trial per Telegram user ID.
 PREMIUM_TARGET_USD = 10
 PRO_TARGET_USD = 20
 PREMIUM_STARS = int(os.environ.get("PREMIUM_STARS", "300"))
@@ -2979,7 +2979,7 @@ def _subscription_plan_from_payload(payload):
 
 
 def _ensure_trial_user(user):
-    """Create the one-time 7-day FREE trial on first use; never reset it."""
+    """Create the one-time 30-day FREE trial on first use; never reset it."""
     now_ts = _subscription_now_ts()
     trial_expires = now_ts + FREE_TRIAL_PERIOD
     with _tracking_connection() as conn:
@@ -3064,13 +3064,15 @@ def _best_active_plan(user_id):
     trial_active, trial = _trial_status(user_id)
     if trial_active:
         return "FREE", trial
+    if trial is None:
+        return "NONE", None
     return "EXPIRED", trial
 
 
 def _has_plan(user_id, required_plan="PREMIUM"):
     plan, _row = _best_active_plan(user_id)
     if plan == "FREE":
-        # During the 7-day trial, FREE users can test PREMIUM-level content.
+        # During the 30-day trial, FREE users can test PREMIUM-level content.
         return required_plan == "PREMIUM"
     return PLAN_RANK.get(plan, -1) >= PLAN_RANK.get(required_plan, 1)
 
@@ -3137,28 +3139,21 @@ def _membership_keyboard():
 
 
 def _plans_keyboard():
+    # Modo de prueba: por ahora solo se ofrece la suscripción FREE de 30 días.
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"⭐ PREMIUM — {PREMIUM_STARS} Stars/30 días", callback_data="tp_buy_premium")],
-        [InlineKeyboardButton(f"🔥 PRO — {PRO_STARS} Stars/30 días", callback_data="tp_buy_pro")],
+        [InlineKeyboardButton("🆓 SUSCRIBIRME FREE — 30 DÍAS", callback_data="tp_join_free")],
         [InlineKeyboardButton("👤 Mi cuenta", callback_data="tp_account")],
     ])
 
 
 async def _send_plans(chat_id, context):
     text = (
-        "💎 TRIPLE PICK — MEMBRESÍAS\n\n"
-        "🆓 FREE — 7 DÍAS\n"
-        "• Prueba única por usuario\n"
-        "• Acceso a Triple Pick durante la prueba\n\n"
-        "⭐ PREMIUM — $10/mes (precio objetivo)\n"
-        "• Triple Pick diario\n"
-        "• Historial y seguimiento\n"
-        "• Alertas premium\n\n"
-        "🔥 PRO — $20/mes (precio objetivo)\n"
-        "• Todo PREMIUM\n"
-        "• Player Props y selecciones adicionales\n"
-        "• Alertas y actualizaciones prioritarias\n\n"
-        "Las suscripciones se cobran en Telegram Stars y se renuevan cada 30 días."
+        "💎 TRIPLE PICK — PRUEBA DE SUSCRIPCIÓN\n\n"
+        "🆓 FREE — 30 DÍAS\n"
+        "• Activación manual mediante el botón de suscripción\n"
+        "• Una sola prueba por usuario de Telegram\n"
+        "• Acceso a Triple Pick durante los 30 días\n\n"
+        "Pulsa el botón para activar tu prueba FREE."
     )
     await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=_plans_keyboard())
 
@@ -3169,15 +3164,21 @@ async def subscription_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def account_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    await asyncio.to_thread(_ensure_trial_user, user)
     user_id = user.id
     plan, row = await asyncio.to_thread(_best_active_plan, user_id)
-    if plan == "FREE":
+    if plan == "NONE":
+        text = (
+            "👤 MI CUENTA\n\n"
+            "Plan: SIN SUSCRIPCIÓN\n"
+            "Estado: ⚪ NO ACTIVADO\n\n"
+            "Pulsa ⭐ Suscripción y después 🆓 SUSCRIBIRME FREE — 30 DÍAS."
+        )
+    elif plan == "FREE":
         expiry = _format_expiry(row["trial_expires_at"])
         remaining = _remaining_trial_text(row["trial_expires_at"])
         text = (
             "👤 MI CUENTA\n\n"
-            "Plan: FREE — PRUEBA 7 DÍAS\n"
+            "Plan: FREE — PRUEBA 30 DÍAS\n"
             "Estado: 🟢 ACTIVO\n"
             f"Tiempo restante: {remaining}\n"
             f"Finaliza: {expiry}\n\n"
@@ -3209,14 +3210,52 @@ async def membership_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     if action == "tp_plans":
         await _send_plans(query.message.chat_id, context)
         return
+    if action == "tp_join_free":
+        current_plan, current_row = await asyncio.to_thread(_best_active_plan, query.from_user.id)
+        if current_plan == "FREE":
+            text = (
+                "✅ YA ESTÁS SUSCRITO\n\n"
+                "Plan: FREE — PRUEBA 30 DÍAS\n"
+                f"Tiempo restante: {_remaining_trial_text(current_row['trial_expires_at'])}\n"
+                f"Finaliza: {_format_expiry(current_row['trial_expires_at'])}"
+            )
+        elif current_plan == "EXPIRED":
+            text = (
+                "⚠️ PRUEBA FREE YA UTILIZADA\n\n"
+                "La prueba gratuita de 30 días solo puede activarse una vez por usuario."
+            )
+        elif current_plan in {"PREMIUM", "PRO"}:
+            text = f"✅ Ya tienes una membresía activa: {current_plan}."
+        else:
+            row = await asyncio.to_thread(_ensure_trial_user, query.from_user)
+            text = (
+                "✅ SUSCRIPCIÓN FREE ACTIVADA\n\n"
+                "Plan: FREE — PRUEBA 30 DÍAS\n"
+                "Estado: 🟢 ACTIVO\n"
+                f"Finaliza: {_format_expiry(row['trial_expires_at'])}\n\n"
+                "Ahora puedes entrar a 👤 Mi cuenta para comprobar tu suscripción."
+            )
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=text,
+            reply_markup=_membership_keyboard(),
+        )
+        return
+
     if action == "tp_account":
-        await asyncio.to_thread(_ensure_trial_user, query.from_user)
         user_id = query.from_user.id
         plan, row = await asyncio.to_thread(_best_active_plan, user_id)
-        if plan == "FREE":
+        if plan == "NONE":
             text = (
                 "👤 MI CUENTA\n\n"
-                "Plan: FREE — PRUEBA 7 DÍAS\n"
+                "Plan: SIN SUSCRIPCIÓN\n"
+                "Estado: ⚪ NO ACTIVADO\n\n"
+                "Pulsa ⭐ Ver planes para activar FREE por 30 días."
+            )
+        elif plan == "FREE":
+            text = (
+                "👤 MI CUENTA\n\n"
+                "Plan: FREE — PRUEBA 30 DÍAS\n"
                 "Estado: 🟢 ACTIVO\n"
                 f"Tiempo restante: {_remaining_trial_text(row['trial_expires_at'])}\n"
                 f"Finaliza: {_format_expiry(row['trial_expires_at'])}"
@@ -3327,12 +3366,10 @@ async def _premium_gate(update, required="PREMIUM"):
     if not SUBSCRIPTION_ENFORCE:
         return True
     user = update.effective_user
-    if user:
-        await asyncio.to_thread(_ensure_trial_user, user)
     if user and await asyncio.to_thread(_has_plan, user.id, required):
         return True
     await update.effective_message.reply_text(
-        "🔒 Tu prueba FREE de 7 días finalizó o esta función requiere un nivel superior de Triple Pick.",
+        "🔒 Tu prueba FREE de 30 días finalizó o esta función requiere un nivel superior de Triple Pick.",
         reply_markup=_plans_keyboard(),
     )
     return False
@@ -3441,9 +3478,10 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await asyncio.to_thread(_ensure_trial_user, update.effective_user)
     plan, row = await asyncio.to_thread(_best_active_plan, update.effective_user.id)
-    if plan == "FREE":
+    if plan == "NONE":
+        membership = "⚪ Aún no tienes suscripción. Pulsa ⭐ Suscripción para activar FREE por 30 días."
+    elif plan == "FREE":
         membership = (
             f"🆓 FREE activo — {_remaining_trial_text(row['trial_expires_at'])} restantes.\n"
             "Después: ⭐ PREMIUM $10/mes | 🔥 PRO $20/mes"

@@ -1666,6 +1666,24 @@ def init_tracking_db():
             CREATE INDEX IF NOT EXISTS idx_tracked_picks_official
             ON tracked_picks(official, product, result);
 
+            CREATE TABLE IF NOT EXISTS official_daily_picks (
+                pick_date TEXT NOT NULL,
+                slot INTEGER NOT NULL,
+                game_pk INTEGER NOT NULL,
+                game_date TEXT,
+                away TEXT NOT NULL,
+                home TEXT NOT NULL,
+                selection TEXT NOT NULL,
+                pitcher TEXT,
+                created_by INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (pick_date, slot)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_official_daily_picks_date
+            ON official_daily_picks(pick_date, slot);
+
             CREATE TABLE IF NOT EXISTS alert_subscriptions (
                 chat_id INTEGER PRIMARY KEY,
                 enabled INTEGER NOT NULL DEFAULT 0,
@@ -2353,27 +2371,47 @@ def _alert_status(chat_id, row, global_enabled=True):
 
 
 def _pending_alert_picks(pick_date=None):
+    """Return alert picks, preferring admin-confirmed official picks for each date."""
     init_tracking_db()
     params = []
-    where = "WHERE result='PENDING' AND game_date IS NOT NULL"
+    where = "WHERE tp.result='PENDING' AND tp.game_date IS NOT NULL"
     if pick_date:
-        where += " AND pick_date=?"
+        where += " AND tp.pick_date=?"
         params.append(pick_date)
     with _tracking_connection() as conn:
         rows = conn.execute(
             f"""
-            SELECT MAX(id) AS id, pick_date, game_pk, game_date, away, home,
-                   selection, product, odds, book
-            FROM tracked_picks
+            SELECT MAX(tp.id) AS id, tp.pick_date, tp.game_pk, tp.game_date, tp.away, tp.home,
+                   tp.selection, tp.product, tp.odds, tp.book
+            FROM tracked_picks tp
             {where}
-              AND source IN ('TRIPLE_PICK', 'TRIPLE_PICK_FALLBACK')
-            GROUP BY pick_date, game_pk, selection
-            ORDER BY game_date ASC
+              AND (
+                    (
+                      EXISTS (
+                        SELECT 1 FROM tracked_picks x
+                        WHERE x.pick_date = tp.pick_date
+                          AND x.source = 'CHANNEL_OFFICIAL'
+                          AND x.result = 'PENDING'
+                      )
+                      AND tp.source = 'CHANNEL_OFFICIAL'
+                    )
+                    OR
+                    (
+                      NOT EXISTS (
+                        SELECT 1 FROM tracked_picks x
+                        WHERE x.pick_date = tp.pick_date
+                          AND x.source = 'CHANNEL_OFFICIAL'
+                          AND x.result = 'PENDING'
+                      )
+                      AND tp.source IN ('TRIPLE_PICK', 'TRIPLE_PICK_FALLBACK')
+                    )
+                  )
+            GROUP BY tp.pick_date, tp.game_pk, tp.selection
+            ORDER BY tp.game_date ASC
             """,
             params,
         ).fetchall()
     return rows
-
 
 def _alert_was_sent(chat_id, pick_date, game_pk, selection):
     init_tracking_db()
@@ -3436,6 +3474,291 @@ def _admin_paid_rows(limit=25):
         ).fetchall()
 
 
+def _official_pick_rows(pick_date):
+    init_tracking_db()
+    with _tracking_connection() as conn:
+        return conn.execute(
+            """
+            SELECT pick_date, slot, game_pk, game_date, away, home, selection, pitcher,
+                   created_by, created_at, updated_at
+            FROM official_daily_picks
+            WHERE pick_date=?
+            ORDER BY slot ASC
+            """,
+            (pick_date,),
+        ).fetchall()
+
+
+def _clear_official_picks(pick_date):
+    init_tracking_db()
+    with _tracking_connection() as conn:
+        conn.execute("DELETE FROM official_daily_picks WHERE pick_date=?", (pick_date,))
+        conn.execute(
+            "DELETE FROM tracked_picks WHERE pick_date=? AND source='CHANNEL_OFFICIAL' AND result='PENDING'",
+            (pick_date,),
+        )
+
+
+def _today_schedule_games(pick_date):
+    data = safe_get_json(
+        f"{MLB_API}/schedule",
+        params={"sportId": 1, "date": pick_date, "hydrate": "probablePitcher,team"},
+        cache_ttl=60,
+    )
+    games = []
+    for block in (data or {}).get("dates", []):
+        for game in block.get("games", []):
+            away = game.get("teams", {}).get("away", {})
+            home = game.get("teams", {}).get("home", {})
+            games.append({
+                "game_pk": int(game.get("gamePk") or 0),
+                "game_date": game.get("gameDate"),
+                "away": away.get("team", {}).get("name") or "Visitante",
+                "home": home.get("team", {}).get("name") or "Local",
+                "away_pitcher": away.get("probablePitcher", {}).get("fullName") or "Por confirmar",
+                "home_pitcher": home.get("probablePitcher", {}).get("fullName") or "Por confirmar",
+            })
+    return games
+
+
+def _resolve_official_team(team_text, games):
+    key = _normalize_team_name(team_text)
+    exact = []
+    partial = []
+    for game in games:
+        for side in ("away", "home"):
+            name = game[side]
+            nkey = _normalize_team_name(name)
+            if key == nkey:
+                exact.append((game, side))
+            elif key and (key in nkey or nkey in key):
+                partial.append((game, side))
+    matches = exact or partial
+    if len(matches) != 1:
+        return None
+    game, side = matches[0]
+    return {
+        "game_pk": game["game_pk"],
+        "game_date": game["game_date"],
+        "away": game["away"],
+        "home": game["home"],
+        "selection": game[side],
+        "pitcher": game[f"{side}_pitcher"],
+    }
+
+
+def _save_official_team_picks(pick_date, team_names, admin_user_id):
+    """Resolve three team names against today's MLB schedule and persist one canonical slate."""
+    clean = [str(x).strip() for x in team_names if str(x).strip()]
+    if len(clean) != 3:
+        return False, "Debes enviar exactamente 3 equipos.", []
+
+    games = _today_schedule_games(pick_date)
+    if not games:
+        return False, "No pude obtener la cartelera MLB para esa fecha.", []
+
+    resolved = []
+    used_games = set()
+    for team in clean:
+        item = _resolve_official_team(team, games)
+        if item is None:
+            return False, f"No pude identificar de forma única el equipo: {team}", []
+        if item["game_pk"] in used_games:
+            return False, f"Hay dos selecciones del mismo partido: {item['away']} vs {item['home']}", []
+        used_games.add(item["game_pk"])
+        resolved.append(item)
+
+    now_iso = local_now().isoformat()
+    with _tracking_connection() as conn:
+        # The channel-confirmed slate becomes the only official slate for today's performance sample.
+        conn.execute(
+            "UPDATE tracked_picks SET official=0 WHERE pick_date=? AND source IN ('TRIPLE_PICK','TRIPLE_PICK_FALLBACK')",
+            (pick_date,),
+        )
+        conn.execute("DELETE FROM official_daily_picks WHERE pick_date=?", (pick_date,))
+        conn.execute(
+            "DELETE FROM tracked_picks WHERE pick_date=? AND source='CHANNEL_OFFICIAL' AND result='PENDING'",
+            (pick_date,),
+        )
+
+        for slot, item in enumerate(resolved, 1):
+            conn.execute(
+                """
+                INSERT INTO official_daily_picks (
+                    pick_date, slot, game_pk, game_date, away, home, selection, pitcher,
+                    created_by, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    pick_date, slot, item["game_pk"], item["game_date"], item["away"], item["home"],
+                    item["selection"], item["pitcher"], int(admin_user_id), now_iso, now_iso,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO tracked_picks (
+                    created_at, pick_date, game_pk, game_date, away, home, selection,
+                    product, source, official, market_family, line, odds, book,
+                    model_version, bot_version, result, units_risked, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'OFFICIAL', 'CHANNEL_OFFICIAL', 1,
+                          'FULL_GAME_ML', NULL, NULL, NULL, 'CHANNEL_OFFICIAL', ?,
+                          'PENDING', 1.0, 'Confirmed by admin for channel/bot sync')
+                """,
+                (
+                    now_iso, pick_date, item["game_pk"], item["game_date"], item["away"], item["home"],
+                    item["selection"], BOT_VERSION,
+                ),
+            )
+    return True, "OK", resolved
+
+
+def _format_official_picks_text(rows, title="🎯 PICKS OFICIALES TRIPLE PICK"):
+    if not rows:
+        return title + "\n\nTodavía no hay picks oficiales cargados para hoy."
+    medals = ["🥇", "🥈", "🥉"]
+    lines = [title, ""]
+    for i, row in enumerate(rows):
+        time_text = format_game_time_local(row["game_date"]) if row["game_date"] else "N/D"
+        lines.extend([
+            f"{medals[i] if i < 3 else '•'} PICK #{row['slot']}",
+            f"🏟️ {row['away']} vs {row['home']}",
+            f"🎯 {row['selection']} ML",
+            f"⚾ Pitcher: {row['pitcher'] or 'Por confirmar'}",
+            f"🕐 {time_text}",
+            "",
+        ])
+    lines.append("✅ Esta es la lista maestra usada por el bot, las alertas y el canal.")
+    return "\n".join(lines)
+
+
+OFFICIAL_PICKS_ADMIN_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["📋 Ver picks oficiales", "📝 Cargar 3 picks"],
+        ["🤖 Usar picks del modelo", "🗑️ Borrar picks oficiales"],
+        ["⬅️ Panel Admin"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+    input_field_placeholder="Picks oficiales Triple Pick",
+)
+
+
+async def admin_official_picks_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user is None or int(user.id) not in SUBSCRIPTION_ADMIN_IDS:
+        await update.effective_message.reply_text("⛔ Acceso exclusivo para administradores.")
+        return
+    fecha = local_now().strftime("%Y-%m-%d")
+    rows = await asyncio.to_thread(_official_pick_rows, fecha)
+    await update.effective_message.reply_text(
+        _format_official_picks_text(rows) +
+        "\n\n📝 Cargar 3 picks: pega los tres equipos, uno por línea.\n"
+        "🤖 Usar picks del modelo: toma el Triple Pick calculado por el bot y lo fija como oficial.",
+        reply_markup=OFFICIAL_PICKS_ADMIN_KEYBOARD,
+    )
+
+
+async def admin_official_start_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user is None or int(user.id) not in SUBSCRIPTION_ADMIN_IDS:
+        await update.effective_message.reply_text("⛔ Acceso exclusivo para administradores.")
+        return
+    context.user_data["awaiting_official_picks"] = True
+    await update.effective_message.reply_text(
+        "📝 CARGAR PICKS OFICIALES\n\n"
+        "Envía exactamente 3 equipos MLB, uno por línea, tal como quieres que aparezcan en el canal.\n\n"
+        "Ejemplo:\n"
+        "Minnesota Twins\n"
+        "New York Yankees\n"
+        "Los Angeles Dodgers\n\n"
+        "El bot identificará automáticamente rival, pitcher, horario y partido.\n"
+        "Pulsa ❌ Cancelar carga para salir.",
+        reply_markup=ReplyKeyboardMarkup([["❌ Cancelar carga"]], resize_keyboard=True, is_persistent=True),
+    )
+
+
+async def _handle_official_picks_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("awaiting_official_picks"):
+        return False
+    user = update.effective_user
+    if user is None or int(user.id) not in SUBSCRIPTION_ADMIN_IDS:
+        context.user_data.pop("awaiting_official_picks", None)
+        return False
+    text = (update.message.text or "").strip()
+    if text == "❌ Cancelar carga":
+        context.user_data.pop("awaiting_official_picks", None)
+        await update.effective_message.reply_text("Carga cancelada.", reply_markup=OFFICIAL_PICKS_ADMIN_KEYBOARD)
+        return True
+    teams = [line.strip().lstrip("123.-) ") for line in text.splitlines() if line.strip()]
+    if len(teams) != 3:
+        await update.effective_message.reply_text(
+            "⚠️ Necesito exactamente 3 líneas, una por equipo. Inténtalo nuevamente o pulsa ❌ Cancelar carga."
+        )
+        return True
+    fecha = local_now().strftime("%Y-%m-%d")
+    ok, msg, _resolved = await asyncio.to_thread(_save_official_team_picks, fecha, teams, user.id)
+    if not ok:
+        await update.effective_message.reply_text(f"❌ {msg}\n\nCorrige los nombres y vuelve a enviarlos.")
+        return True
+    context.user_data.pop("awaiting_official_picks", None)
+    rows = await asyncio.to_thread(_official_pick_rows, fecha)
+    try:
+        await schedule_alert_jobs(context.application, fecha)
+    except Exception as exc:
+        print(f"Official picks alert scheduling error: {exc}")
+    await update.effective_message.reply_text(
+        "✅ PICKS OFICIALES GUARDADOS\n\n" + _format_official_picks_text(rows),
+        reply_markup=OFFICIAL_PICKS_ADMIN_KEYBOARD,
+    )
+    return True
+
+
+async def admin_official_use_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user is None or int(user.id) not in SUBSCRIPTION_ADMIN_IDS:
+        await update.effective_message.reply_text("⛔ Acceso exclusivo para administradores.")
+        return
+    now = local_now()
+    fecha = now.strftime("%Y-%m-%d")
+    status, partidos, odds_status = await asyncio.to_thread(build_daily_matchups_v28, fecha, now.year)
+    if status != "ok":
+        await update.effective_message.reply_text("❌ No pude obtener el slate actual de MLB.")
+        return
+    triple_pick, _mode = _select_triple_pick_v28(partidos, odds_status)
+    if len(triple_pick) < 3:
+        await update.effective_message.reply_text(
+            f"⚠️ El modelo solo produjo {len(triple_pick)} pick(s). No se fijó ningún slate oficial."
+        )
+        return
+    teams = [p["favorite"] for p in triple_pick[:3]]
+    ok, msg, _ = await asyncio.to_thread(_save_official_team_picks, fecha, teams, user.id)
+    if not ok:
+        await update.effective_message.reply_text(f"❌ {msg}")
+        return
+    rows = await asyncio.to_thread(_official_pick_rows, fecha)
+    try:
+        await schedule_alert_jobs(context.application, fecha)
+    except Exception as exc:
+        print(f"Official picks alert scheduling error: {exc}")
+    await update.effective_message.reply_text(
+        "✅ EL TRIPLE PICK DEL MODELO QUEDÓ FIJADO COMO OFICIAL\n\n" + _format_official_picks_text(rows),
+        reply_markup=OFFICIAL_PICKS_ADMIN_KEYBOARD,
+    )
+
+
+async def admin_official_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user is None or int(user.id) not in SUBSCRIPTION_ADMIN_IDS:
+        await update.effective_message.reply_text("⛔ Acceso exclusivo para administradores.")
+        return
+    fecha = local_now().strftime("%Y-%m-%d")
+    await asyncio.to_thread(_clear_official_picks, fecha)
+    await update.effective_message.reply_text(
+        "🗑️ Picks oficiales de hoy eliminados.\n\nMientras no cargues otros, ⚾ Picks de hoy volverá a usar el modelo.",
+        reply_markup=OFFICIAL_PICKS_ADMIN_KEYBOARD,
+    )
+
+
 def _admin_identity(row):
     username = (row['username'] or '').strip() if 'username' in row.keys() else ''
     first_name = (row['first_name'] or '').strip() if 'first_name' in row.keys() else ''
@@ -3445,7 +3768,8 @@ def _admin_identity(row):
 ADMIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["📊 Estadísticas", "👥 Usuarios"],
-        ["⏳ Vencen pronto", "💳 Suscripciones"],
+        ["🎯 Picks oficiales", "⏳ Vencen pronto"],
+        ["💳 Suscripciones"],
         ["⬅️ Menú principal"],
     ],
     resize_keyboard=True,
@@ -3463,6 +3787,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🛡️ PANEL ADMIN — TRIPLE PICK\n\n"
         "📊 Estadísticas — conteo general\n"
         "👥 Usuarios — listado de miembros\n"
+        "🎯 Picks oficiales — lista maestra del canal y el bot\n"
         "⏳ Vencen pronto — próximos 7 días\n"
         "💳 Suscripciones — PREMIUM/PRO activas",
         reply_markup=ADMIN_MENU_KEYBOARD,
@@ -3840,6 +4165,8 @@ async def menu_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Route visual keyboard labels to the existing command functions."""
+    if await _handle_official_picks_input(update, context):
+        return
     text = (update.message.text or "").strip()
     routes = {
         "⚾ Picks de hoy": picks,
@@ -3869,6 +4196,12 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "🎯 Calibración": calibration,
         "🆔 Mi ID": myid,
         "🛡️ Panel Admin": admin_panel,
+        "🎯 Picks oficiales": admin_official_picks_panel,
+        "📋 Ver picks oficiales": admin_official_picks_panel,
+        "📝 Cargar 3 picks": admin_official_start_input,
+        "🤖 Usar picks del modelo": admin_official_use_model,
+        "🗑️ Borrar picks oficiales": admin_official_clear,
+        "⬅️ Panel Admin": admin_panel,
         "📊 Estadísticas": adminstats_command,
         "👥 Usuarios": adminusers_command,
         "⏳ Vencen pronto": admin_expiring_command,
@@ -3906,6 +4239,22 @@ async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = local_now()
     fecha = now.strftime("%Y-%m-%d")
     season = now.year
+
+    official_rows = await asyncio.to_thread(_official_pick_rows, fecha)
+    if official_rows:
+        mensaje = _format_official_picks_text(
+            official_rows,
+            title=f"🔥 TRIPLE PICK OFICIAL — {fecha}"
+        )
+        mensaje += "\n\n📺 Estos picks son exactamente los confirmados para el canal Triple Pick."
+        try:
+            alert_info = await schedule_alert_jobs(context.application, fecha)
+            if alert_info.get("scheduled"):
+                mensaje += f"\n🔔 Alertas 45 min: {alert_info['scheduled']} programada(s)."
+        except Exception as exc:
+            mensaje += f"\n⚠️ No pude programar alertas: {exc}"
+        await _reply_long(update.message, mensaje)
+        return
 
     status, partidos, odds_status = await asyncio.to_thread(
         build_daily_matchups_v28, fecha, season
@@ -4327,6 +4676,7 @@ def main():
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CommandHandler("adminexpiring", admin_expiring_command))
     app.add_handler(CommandHandler("adminsubs", admin_subscriptions_command))
+    app.add_handler(CommandHandler("official", admin_official_picks_panel))
     app.add_handler(CallbackQueryHandler(membership_callback, pattern=r"^tp_"))
     app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))

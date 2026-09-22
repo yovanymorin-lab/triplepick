@@ -3394,6 +3394,122 @@ async def adminstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
     await update.effective_message.reply_text(text)
 
+
+def _admin_expiring_rows(days=7, limit=25):
+    """Return memberships expiring within the next N days."""
+    now_ts = _subscription_now_ts()
+    cutoff = now_ts + int(days) * 86400
+    with _tracking_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT m.user_id, m.username, m.first_name, m.trial_expires_at,
+                   s.plan AS paid_plan, s.expires_at AS paid_expires_at
+            FROM membership_users m
+            LEFT JOIN subscriptions s
+              ON s.user_id = m.user_id
+             AND s.status = 'ACTIVE'
+             AND s.expires_at > ?
+             AND s.plan IN ('PREMIUM','PRO')
+            WHERE (s.expires_at BETWEEN ? AND ?)
+               OR (s.user_id IS NULL AND m.trial_expires_at BETWEEN ? AND ?)
+            ORDER BY COALESCE(s.expires_at, m.trial_expires_at) ASC
+            LIMIT ?
+            """,
+            (now_ts, now_ts, cutoff, now_ts, cutoff, int(limit)),
+        ).fetchall()
+    return rows
+
+
+def _admin_paid_rows(limit=25):
+    now_ts = _subscription_now_ts()
+    with _tracking_connection() as conn:
+        return conn.execute(
+            """
+            SELECT user_id, plan, username, first_name, expires_at
+            FROM subscriptions
+            WHERE status = 'ACTIVE' AND expires_at > ?
+              AND plan IN ('PREMIUM','PRO')
+            ORDER BY expires_at ASC
+            LIMIT ?
+            """,
+            (now_ts, int(limit)),
+        ).fetchall()
+
+
+def _admin_identity(row):
+    username = (row['username'] or '').strip() if 'username' in row.keys() else ''
+    first_name = (row['first_name'] or '').strip() if 'first_name' in row.keys() else ''
+    return f"@{username}" if username else (first_name or f"ID {row['user_id']}")
+
+
+ADMIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["📊 Estadísticas", "👥 Usuarios"],
+        ["⏳ Vencen pronto", "💳 Suscripciones"],
+        ["⬅️ Menú principal"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+    input_field_placeholder="Panel administrativo Triple Pick",
+)
+
+
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user is None or int(user.id) not in SUBSCRIPTION_ADMIN_IDS:
+        await update.effective_message.reply_text("⛔ Acceso exclusivo para administradores.")
+        return
+    await update.effective_message.reply_text(
+        "🛡️ PANEL ADMIN — TRIPLE PICK\n\n"
+        "📊 Estadísticas — conteo general\n"
+        "👥 Usuarios — listado de miembros\n"
+        "⏳ Vencen pronto — próximos 7 días\n"
+        "💳 Suscripciones — PREMIUM/PRO activas",
+        reply_markup=ADMIN_MENU_KEYBOARD,
+    )
+
+
+async def admin_expiring_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user is None or int(user.id) not in SUBSCRIPTION_ADMIN_IDS:
+        await update.effective_message.reply_text("⛔ Comando exclusivo para administradores.")
+        return
+    rows = await asyncio.to_thread(_admin_expiring_rows, 7, 25)
+    if not rows:
+        text = "⏳ VENCEN PRONTO\n\nNo hay membresías que venzan en los próximos 7 días."
+    else:
+        lines = []
+        for i, row in enumerate(rows, 1):
+            paid = row['paid_plan']
+            exp = int(row['paid_expires_at'] or row['trial_expires_at'])
+            plan = paid or 'FREE'
+            lines.append(
+                f"{i}. {_admin_identity(row)} — {plan}\n"
+                f"   {_remaining_trial_text(exp)} | {_format_expiry(exp)}"
+            )
+        text = "⏳ VENCEN PRONTO — 7 DÍAS\n\n" + "\n\n".join(lines)
+    await update.effective_message.reply_text(text, reply_markup=ADMIN_MENU_KEYBOARD)
+
+
+async def admin_subscriptions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user is None or int(user.id) not in SUBSCRIPTION_ADMIN_IDS:
+        await update.effective_message.reply_text("⛔ Comando exclusivo para administradores.")
+        return
+    rows = await asyncio.to_thread(_admin_paid_rows, 25)
+    if not rows:
+        text = "💳 SUSCRIPCIONES ACTIVAS\n\nNo hay suscripciones PREMIUM/PRO activas."
+    else:
+        lines = []
+        for i, row in enumerate(rows, 1):
+            exp = int(row['expires_at'])
+            lines.append(
+                f"{i}. {_admin_identity(row)} — {row['plan']}\n"
+                f"   {_remaining_trial_text(exp)} | {_format_expiry(exp)}"
+            )
+        text = "💳 SUSCRIPCIONES ACTIVAS\n\n" + "\n\n".join(lines)
+    await update.effective_message.reply_text(text, reply_markup=ADMIN_MENU_KEYBOARD)
+
 def _membership_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("⭐ Ver planes", callback_data="tp_plans")],
@@ -3655,6 +3771,24 @@ MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
     input_field_placeholder="Selecciona una opción de Triple Pick",
 )
 
+
+def _main_menu_keyboard_for(user_id=None):
+    rows = [
+        ["⚾ Picks de hoy", "📊 Estado"],
+        ["📈 Rendimiento", "🧮 Mercado"],
+        ["📋 Historial", "🔔 Alertas"],
+        ["👤 Mi cuenta", "⭐ Suscripción"],
+        ["⚾ Juegos MLB", "🧪 Más opciones"],
+    ]
+    if user_id is not None and int(user_id) in SUBSCRIPTION_ADMIN_IDS:
+        rows.append(["🛡️ Panel Admin"])
+    return ReplyKeyboardMarkup(
+        rows,
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Selecciona una opción de Triple Pick",
+    )
+
 MORE_MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["🔎 Candidate Pool", "🟣 Value Board"],
@@ -3686,7 +3820,7 @@ def _menu_text():
 
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(_menu_text(), reply_markup=MAIN_MENU_KEYBOARD)
+    await update.message.reply_text(_menu_text(), reply_markup=_main_menu_keyboard_for(update.effective_user.id if update.effective_user else None))
 
 
 async def menu_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3734,6 +3868,11 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "🧾 Liquidar picks": settle,
         "🎯 Calibración": calibration,
         "🆔 Mi ID": myid,
+        "🛡️ Panel Admin": admin_panel,
+        "📊 Estadísticas": adminstats_command,
+        "👥 Usuarios": adminusers_command,
+        "⏳ Vencen pronto": admin_expiring_command,
+        "💳 Suscripciones": admin_subscriptions_command,
     }
     handler = routes.get(text)
     if handler is not None:
@@ -3756,7 +3895,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         _menu_text() + "\n\n" + membership,
-        reply_markup=MAIN_MENU_KEYBOARD,
+        reply_markup=_main_menu_keyboard_for(update.effective_user.id if update.effective_user else None),
     )
 
 
@@ -4185,6 +4324,9 @@ def main():
     app.add_handler(CommandHandler("account", account_command))
     app.add_handler(CommandHandler("adminstats", adminstats_command))
     app.add_handler(CommandHandler("adminusers", adminusers_command))
+    app.add_handler(CommandHandler("admin", admin_panel))
+    app.add_handler(CommandHandler("adminexpiring", admin_expiring_command))
+    app.add_handler(CommandHandler("adminsubs", admin_subscriptions_command))
     app.add_handler(CallbackQueryHandler(membership_callback, pattern=r"^tp_"))
     app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))

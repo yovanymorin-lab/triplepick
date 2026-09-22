@@ -2371,10 +2371,10 @@ def _alert_status(chat_id, row, global_enabled=True):
 
 
 def _pending_alert_picks(pick_date=None):
-    """Return alert picks, preferring admin-confirmed official picks for each date."""
+    """Return only admin-confirmed channel picks for alerts."""
     init_tracking_db()
     params = []
-    where = "WHERE tp.result='PENDING' AND tp.game_date IS NOT NULL"
+    where = "WHERE tp.result='PENDING' AND tp.game_date IS NOT NULL AND tp.source='CHANNEL_OFFICIAL'"
     if pick_date:
         where += " AND tp.pick_date=?"
         params.append(pick_date)
@@ -2385,27 +2385,6 @@ def _pending_alert_picks(pick_date=None):
                    tp.selection, tp.product, tp.odds, tp.book
             FROM tracked_picks tp
             {where}
-              AND (
-                    (
-                      EXISTS (
-                        SELECT 1 FROM tracked_picks x
-                        WHERE x.pick_date = tp.pick_date
-                          AND x.source = 'CHANNEL_OFFICIAL'
-                          AND x.result = 'PENDING'
-                      )
-                      AND tp.source = 'CHANNEL_OFFICIAL'
-                    )
-                    OR
-                    (
-                      NOT EXISTS (
-                        SELECT 1 FROM tracked_picks x
-                        WHERE x.pick_date = tp.pick_date
-                          AND x.source = 'CHANNEL_OFFICIAL'
-                          AND x.result = 'PENDING'
-                      )
-                      AND tp.source IN ('TRIPLE_PICK', 'TRIPLE_PICK_FALLBACK')
-                    )
-                  )
             GROUP BY tp.pick_date, tp.game_pk, tp.selection
             ORDER BY tp.game_date ASC
             """,
@@ -3754,7 +3733,7 @@ async def admin_official_clear(update: Update, context: ContextTypes.DEFAULT_TYP
     fecha = local_now().strftime("%Y-%m-%d")
     await asyncio.to_thread(_clear_official_picks, fecha)
     await update.effective_message.reply_text(
-        "🗑️ Picks oficiales de hoy eliminados.\n\nMientras no cargues otros, ⚾ Picks de hoy volverá a usar el modelo.",
+        "🗑️ Picks oficiales de hoy eliminados.\n\nHasta que cargues otros, ⚾ Picks de hoy mostrará que están pendientes de publicación.",
         reply_markup=OFFICIAL_PICKS_ADMIN_KEYBOARD,
     )
 
@@ -4255,6 +4234,14 @@ async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mensaje += f"\n⚠️ No pude programar alertas: {exc}"
         await _reply_long(update.message, mensaje)
         return
+
+    await update.message.reply_text(
+        "🔥 TRIPLE PICK OFICIAL — HOY\n\n"
+        "⏳ Los picks oficiales todavía no han sido publicados.\n\n"
+        "Vuelve a consultar más tarde.",
+        reply_markup=_main_menu_keyboard_for(update.effective_user.id if update.effective_user else None),
+    )
+    return
 
     status, partidos, odds_status = await asyncio.to_thread(
         build_daily_matchups_v28, fecha, season

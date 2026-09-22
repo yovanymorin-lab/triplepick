@@ -3251,6 +3251,128 @@ def _membership_admin_stats():
     }
 
 
+
+def _membership_admin_users(page=1, page_size=15):
+    """Return one page of membership users with their current plan/status."""
+    now_ts = _subscription_now_ts()
+    page = max(1, int(page or 1))
+    page_size = max(1, min(25, int(page_size or 15)))
+    offset = (page - 1) * page_size
+
+    with _tracking_connection() as conn:
+        total = int(conn.execute(
+            "SELECT COUNT(*) FROM membership_users"
+        ).fetchone()[0])
+
+        rows = conn.execute(
+            """
+            SELECT
+                m.user_id, m.username, m.first_name,
+                m.trial_started_at, m.trial_expires_at, m.created_at,
+                (
+                    SELECT s.plan
+                    FROM subscriptions s
+                    WHERE s.user_id = m.user_id
+                      AND s.status = 'ACTIVE'
+                      AND s.expires_at > ?
+                      AND s.plan IN ('PREMIUM', 'PRO')
+                    ORDER BY CASE s.plan WHEN 'PRO' THEN 2 WHEN 'PREMIUM' THEN 1 ELSE 0 END DESC,
+                             s.expires_at DESC
+                    LIMIT 1
+                ) AS paid_plan,
+                (
+                    SELECT s.expires_at
+                    FROM subscriptions s
+                    WHERE s.user_id = m.user_id
+                      AND s.status = 'ACTIVE'
+                      AND s.expires_at > ?
+                      AND s.plan IN ('PREMIUM', 'PRO')
+                    ORDER BY CASE s.plan WHEN 'PRO' THEN 2 WHEN 'PREMIUM' THEN 1 ELSE 0 END DESC,
+                             s.expires_at DESC
+                    LIMIT 1
+                ) AS paid_expires_at
+            FROM membership_users m
+            ORDER BY m.created_at DESC, m.user_id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (now_ts, now_ts, page_size, offset),
+        ).fetchall()
+
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    return total, total_pages, rows
+
+
+def _format_admin_user_line(row, index):
+    username = (row["username"] or "").strip()
+    first_name = (row["first_name"] or "").strip()
+    identity = f"@{username}" if username else (first_name or f"ID {row['user_id']}")
+    joined = datetime.fromtimestamp(
+        int(row["created_at"]), tz=LOCAL_TZ
+    ).strftime("%d/%m/%Y")
+
+    if row["paid_plan"]:
+        plan = row["paid_plan"]
+        expires_at = int(row["paid_expires_at"] or 0)
+        remaining = _remaining_trial_text(expires_at) if expires_at else "N/D"
+        status = f"{plan} · {remaining}"
+        expiry = _format_expiry(expires_at)
+    else:
+        trial_expires = int(row["trial_expires_at"] or 0)
+        if trial_expires > _subscription_now_ts():
+            status = f"FREE · {_remaining_trial_text(trial_expires)}"
+        else:
+            status = "FREE VENCIDO"
+        expiry = _format_expiry(trial_expires)
+
+    return (
+        f"{index}. {identity}\n"
+        f"   ID: {row['user_id']} | Alta: {joined}\n"
+        f"   {status} | Vence: {expiry}"
+    )
+
+
+async def adminusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Private paginated membership list for configured administrators."""
+    user = update.effective_user
+    if user is None or int(user.id) not in SUBSCRIPTION_ADMIN_IDS:
+        await update.effective_message.reply_text("⛔ Comando exclusivo para administradores.")
+        return
+
+    page = 1
+    if context.args:
+        try:
+            page = max(1, int(context.args[0]))
+        except (TypeError, ValueError):
+            await update.effective_message.reply_text("Uso: /adminusers o /adminusers 2")
+            return
+
+    total, total_pages, rows = await asyncio.to_thread(_membership_admin_users, page, 15)
+    if page > total_pages:
+        await update.effective_message.reply_text(
+            f"No existe la página {page}. Total de páginas: {total_pages}."
+        )
+        return
+
+    header = (
+        "👥 TRIPLE PICK — USUARIOS\n\n"
+        f"Total registrados: {total}\n"
+        f"Página {page}/{total_pages}\n\n"
+    )
+    if not rows:
+        body = "No hay usuarios registrados."
+    else:
+        start = (page - 1) * 15 + 1
+        body = "\n\n".join(
+            _format_admin_user_line(row, start + i)
+            for i, row in enumerate(rows)
+        )
+
+    footer = ""
+    if total_pages > 1:
+        footer = "\n\nNavegación: /adminusers 1, /adminusers 2, etc."
+
+    await update.effective_message.reply_text(header + body + footer)
+
 async def adminstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Private membership counter for configured Triple Pick administrators."""
     user = update.effective_user
@@ -4062,6 +4184,7 @@ def main():
     app.add_handler(CommandHandler("subscribe", subscription_command))
     app.add_handler(CommandHandler("account", account_command))
     app.add_handler(CommandHandler("adminstats", adminstats_command))
+    app.add_handler(CommandHandler("adminusers", adminusers_command))
     app.add_handler(CallbackQueryHandler(membership_callback, pattern=r"^tp_"))
     app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))

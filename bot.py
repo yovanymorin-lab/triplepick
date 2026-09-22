@@ -69,7 +69,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "2.9.8"
+BOT_VERSION = "3.0.0"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -1675,6 +1675,9 @@ def init_tracking_db():
                 home TEXT NOT NULL,
                 selection TEXT NOT NULL,
                 pitcher TEXT,
+                pick_text TEXT,
+                market_family TEXT NOT NULL DEFAULT 'FULL_GAME_ML',
+                line REAL,
                 created_by INTEGER,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -1744,6 +1747,16 @@ def init_tracking_db():
             ON sms_deliveries(pick_date, chat_id);
             """
         )
+
+        # Schema migration for v3.0 official market-aware picks.
+        # Existing Railway SQLite volumes are upgraded in place without deleting data.
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(official_daily_picks)").fetchall()}
+        if "pick_text" not in cols:
+            conn.execute("ALTER TABLE official_daily_picks ADD COLUMN pick_text TEXT")
+        if "market_family" not in cols:
+            conn.execute("ALTER TABLE official_daily_picks ADD COLUMN market_family TEXT NOT NULL DEFAULT 'FULL_GAME_ML'")
+        if "line" not in cols:
+            conn.execute("ALTER TABLE official_daily_picks ADD COLUMN line REAL")
 
 
 def _product_from_market_grade(grade):
@@ -1889,25 +1902,66 @@ def _settle_one_row(conn, row, game):
     if home_score is None or away_score is None:
         return "PENDING"
 
+    home_score = int(home_score)
+    away_score = int(away_score)
     home_name = ((home.get("team") or {}).get("name") or row["home"])
     away_name = ((away.get("team") or {}).get("name") or row["away"])
-    if home_score == away_score:
-        # MLB games normally cannot end tied; keep unresolved rather than inventing a result.
-        return "PENDING"
+    family = (row["market_family"] or "FULL_GAME_ML").upper()
+    line = row["line"]
+    result = None
+    outcome = None
 
-    winner = home_name if home_score > away_score else away_name
-    won = _normalize_team_name(row["selection"]) == _normalize_team_name(winner)
-    result = "WIN" if won else "LOSS"
-    outcome = 1 if won else 0
+    if family == "FULL_GAME_ML":
+        if home_score == away_score:
+            return "PENDING"
+        winner = home_name if home_score > away_score else away_name
+        won = _normalize_team_name(row["selection"]) == _normalize_team_name(winner)
+        result = "WIN" if won else "LOSS"
+        outcome = 1 if won else 0
+    elif family == "RUN_LINE" and line is not None:
+        selected_home = _normalize_team_name(row["selection"]) == _normalize_team_name(home_name)
+        selected_score = home_score if selected_home else away_score
+        opponent_score = away_score if selected_home else home_score
+        adjusted = selected_score + float(line)
+        if adjusted == opponent_score:
+            result = "PUSH"
+        else:
+            won = adjusted > opponent_score
+            result = "WIN" if won else "LOSS"
+            outcome = 1 if won else 0
+    elif family in {"TEAM_TOTAL_OVER", "TEAM_TOTAL_UNDER"} and line is not None:
+        selected_home = _normalize_team_name(row["selection"]) == _normalize_team_name(home_name)
+        team_score = home_score if selected_home else away_score
+        target = float(line)
+        if team_score == target:
+            result = "PUSH"
+        else:
+            won = team_score > target if family.endswith("OVER") else team_score < target
+            result = "WIN" if won else "LOSS"
+            outcome = 1 if won else 0
+    elif family in {"FULL_GAME_TOTAL_OVER", "FULL_GAME_TOTAL_UNDER"} and line is not None:
+        total = home_score + away_score
+        target = float(line)
+        if total == target:
+            result = "PUSH"
+        else:
+            won = total > target if family.endswith("OVER") else total < target
+            result = "WIN" if won else "LOSS"
+            outcome = 1 if won else 0
+    else:
+        # Unknown market: keep pending instead of settling incorrectly.
+        return "PENDING"
 
     profit = _american_profit_per_unit(row["odds"])
     units = None
-    if profit is not None:
-        units = profit if won else -float(row["units_risked"] or 1.0)
+    if result == "PUSH":
+        units = 0.0
+    elif profit is not None:
+        units = profit if result == "WIN" else -float(row["units_risked"] or 1.0)
 
     model_p = row["model_probability"]
     brier = None
-    if model_p is not None:
+    if model_p is not None and outcome is not None:
         try:
             brier = (float(model_p) - float(outcome)) ** 2
         except (TypeError, ValueError):
@@ -1921,14 +1975,8 @@ def _settle_one_row(conn, row, game):
         WHERE id=?
         """,
         (
-            result,
-            outcome,
-            units,
-            int(home_score),
-            int(away_score),
-            local_now().isoformat(),
-            brier,
-            row["id"],
+            result, outcome, units, home_score, away_score,
+            local_now().isoformat(), brier, row["id"],
         ),
     )
     return result
@@ -1947,13 +1995,13 @@ def settle_pending_picks():
         ).fetchall()
 
         if not pending:
-            return {"pending_before": 0, "wins": 0, "losses": 0, "void": 0, "still_pending": 0}
+            return {"pending_before": 0, "wins": 0, "losses": 0, "pushes": 0, "void": 0, "still_pending": 0}
 
         by_date = {}
         for row in pending:
             by_date.setdefault(row["pick_date"], []).append(row)
 
-        wins = losses = void = still_pending = 0
+        wins = losses = pushes = void = still_pending = 0
         for pick_date, rows in by_date.items():
             data = safe_get_json(
                 f"{MLB_API}/schedule",
@@ -1983,6 +2031,8 @@ def settle_pending_picks():
                     wins += 1
                 elif settled == "LOSS":
                     losses += 1
+                elif settled == "PUSH":
+                    pushes += 1
                 elif settled == "VOID":
                     void += 1
                 else:
@@ -1992,6 +2042,7 @@ def settle_pending_picks():
             "pending_before": len(pending),
             "wins": wins,
             "losses": losses,
+            "pushes": pushes,
             "void": void,
             "still_pending": still_pending,
         }
@@ -2382,10 +2433,10 @@ def _pending_alert_picks(pick_date=None):
         rows = conn.execute(
             f"""
             SELECT MAX(tp.id) AS id, tp.pick_date, tp.game_pk, tp.game_date, tp.away, tp.home,
-                   tp.selection, tp.product, tp.odds, tp.book
+                   tp.selection, tp.product, tp.odds, tp.book, tp.market_family, tp.line
             FROM tracked_picks tp
             {where}
-            GROUP BY tp.pick_date, tp.game_pk, tp.selection
+            GROUP BY tp.pick_date, tp.game_pk, tp.selection, tp.market_family, tp.line
             ORDER BY tp.game_date ASC
             """,
             params,
@@ -2426,6 +2477,27 @@ def _alert_job_name(chat_id, row):
     return f"tp_alert_{chat_id}_{row['pick_date']}_{row['game_pk']}_{safe_selection}"
 
 
+def _tracked_pick_display(row):
+    """Render a tracked pick without assuming every market is moneyline."""
+    family = (row["market_family"] if hasattr(row, "keys") and "market_family" in row.keys() else row.get("market_family")) or "FULL_GAME_ML"
+    selection = row["selection"] if hasattr(row, "keys") and "selection" in row.keys() else row.get("selection")
+    line = row["line"] if hasattr(row, "keys") and "line" in row.keys() else row.get("line")
+    if family == "FULL_GAME_ML":
+        return f"{selection} ML"
+    if family == "RUN_LINE":
+        sign = "+" if line is not None and float(line) > 0 else ""
+        return f"{selection} {sign}{_fmt_line(line)}" if line is not None else str(selection)
+    if family == "TEAM_TOTAL_OVER":
+        return f"{selection} Team Total Over {_fmt_line(line)}"
+    if family == "TEAM_TOTAL_UNDER":
+        return f"{selection} Team Total Under {_fmt_line(line)}"
+    if family == "FULL_GAME_TOTAL_OVER":
+        return f"{selection} Over {_fmt_line(line)}"
+    if family == "FULL_GAME_TOTAL_UNDER":
+        return f"{selection} Under {_fmt_line(line)}"
+    return str(selection)
+
+
 async def _send_pick_alert_job(context: ContextTypes.DEFAULT_TYPE):
     payload = context.job.data or {}
     row = payload.get("pick") or {}
@@ -2457,7 +2529,7 @@ async def _send_pick_alert_job(context: ContextTypes.DEFAULT_TYPE):
     text = (
         f"🔔 TRIPLE PICK — FALTAN {sub['lead_minutes']} MIN\n\n"
         f"🏟️ {row.get('away')} vs {row.get('home')}\n"
-        f"🎯 {row.get('selection')} ML\n"
+        f"🎯 {_tracked_pick_display(row)}\n"
         f"🕐 Inicio: {game_time} ({AUTO_TZ})\n"
         f"🛡️ Producto: {product}\n"
         f"💵 Cuota registrada: {odds_text}\n\n"
@@ -2475,7 +2547,7 @@ async def _send_pick_alert_job(context: ContextTypes.DEFAULT_TYPE):
         if not already_sms:
             sms_body = (
                 f"TRIPLE PICK: faltan {sub['lead_minutes']} min. "
-                f"{row.get('selection')} ML | {row.get('away')} vs {row.get('home')} | "
+                f"{_tracked_pick_display(row)} | {row.get('away')} vs {row.get('home')} | "
                 f"Inicio {game_time}. Revisa cambios de ultima hora. Juega responsablemente."
             )
             ok, sid, error = await asyncio.to_thread(
@@ -2714,7 +2786,7 @@ async def _build_alerts_panel(chat_id):
     for idx, (row, game_dt, alert_dt, status) in enumerate(items[:12], 1):
         status_icon = {"PENDIENTE": "🟡", "ENVIADA": "✅", "DESACTIVADA": "⛔"}.get(status, "•")
         lines.append(
-            f"{idx}. {status_icon} {row['selection']} ML — {row['away']} vs {row['home']}\n"
+            f"{idx}. {status_icon} {_tracked_pick_display(row)} — {row['away']} vs {row['home']}\n"
             f"   ⚾ Juego: {game_dt.astimezone(LOCAL_TZ).strftime('%m/%d %I:%M %p').lstrip('0')}\n"
             f"   🔔 Aviso: {alert_dt.astimezone(LOCAL_TZ).strftime('%m/%d %I:%M %p').lstrip('0')}\n"
             f"   Estado: {status}"
@@ -3459,7 +3531,7 @@ def _official_pick_rows(pick_date):
         return conn.execute(
             """
             SELECT pick_date, slot, game_pk, game_date, away, home, selection, pitcher,
-                   created_by, created_at, updated_at
+                   pick_text, market_family, line, created_by, created_at, updated_at
             FROM official_daily_picks
             WHERE pick_date=?
             ORDER BY slot ASC
@@ -3501,6 +3573,7 @@ def _today_schedule_games(pick_date):
 
 
 def _resolve_official_team(team_text, games):
+    """Resolve one team name/nickname against the day's MLB schedule."""
     key = _normalize_team_name(team_text)
     exact = []
     partial = []
@@ -3523,14 +3596,121 @@ def _resolve_official_team(team_text, games):
         "home": game["home"],
         "selection": game[side],
         "pitcher": game[f"{side}_pitcher"],
+        "side": side,
     }
 
 
-def _save_official_team_picks(pick_date, team_names, admin_user_id):
-    """Resolve three team names against today's MLB schedule and persist one canonical slate."""
-    clean = [str(x).strip() for x in team_names if str(x).strip()]
+def _resolve_official_matchup(left_text, right_text, games):
+    """Resolve a written A vs B matchup to one scheduled MLB game."""
+    left = _resolve_official_team(left_text, games)
+    right = _resolve_official_team(right_text, games)
+    if not left or not right or left["game_pk"] != right["game_pk"]:
+        return None
+    game = next((g for g in games if int(g["game_pk"]) == int(left["game_pk"])), None)
+    if not game:
+        return None
+    return {
+        "game_pk": game["game_pk"],
+        "game_date": game["game_date"],
+        "away": game["away"],
+        "home": game["home"],
+        "selection": f"{game['away']} vs {game['home']}",
+        "pitcher": f"{game['away_pitcher']} / {game['home_pitcher']}",
+    }
+
+
+def _fmt_line(value):
+    value = float(value)
+    if value.is_integer():
+        return str(int(value))
+    return (f"{value:.2f}").rstrip("0").rstrip(".")
+
+
+def _parse_official_pick(raw_text, games):
+    """Parse an admin-entered channel pick and bind it to today's MLB game.
+
+    Supported examples:
+      Baltimore Orioles ML
+      Orioles Over 3.5                    -> team total over
+      Orioles Team Total Over 3.5
+      Orioles +1.5                        -> run line
+      Orioles vs Yankees Over 8.5         -> full-game total
+    A bare team name remains backward-compatible and means ML.
+    """
+    raw = re.sub(r"\s+", " ", str(raw_text or "").strip())
+    if not raw:
+        return None, "Pick vacío."
+
+    # Full-game total must be checked before team-total syntax.
+    m = re.match(r"^(.+?)\s+vs\.?\s+(.+?)\s+(over|under)\s+([0-9]+(?:\.[0-9]+)?)$", raw, re.I)
+    if m:
+        matchup = _resolve_official_matchup(m.group(1), m.group(2), games)
+        if not matchup:
+            return None, f"No pude identificar el partido de forma única: {raw}"
+        direction = m.group(3).upper()
+        line = float(m.group(4))
+        family = f"FULL_GAME_TOTAL_{direction}"
+        matchup["market_family"] = family
+        matchup["line"] = line
+        matchup["pick_text"] = f"{matchup['away']} vs {matchup['home']} {direction.title()} {_fmt_line(line)}"
+        return matchup, None
+
+    # Team total. The words "Team Total" are optional, so "Orioles Over 3.5" works.
+    m = re.match(r"^(.+?)\s+(?:team\s+total\s+)?(over|under)\s+([0-9]+(?:\.[0-9]+)?)$", raw, re.I)
+    if m:
+        team = _resolve_official_team(m.group(1), games)
+        if not team:
+            return None, f"No pude identificar de forma única el equipo: {m.group(1)}"
+        direction = m.group(2).upper()
+        line = float(m.group(3))
+        team["market_family"] = f"TEAM_TOTAL_{direction}"
+        team["line"] = line
+        team["pick_text"] = f"{team['selection']} Team Total {direction.title()} {_fmt_line(line)}"
+        return team, None
+
+    # Run line / spread.
+    m = re.match(r"^(.+?)\s+([+-][0-9]+(?:\.[0-9]+)?)$", raw, re.I)
+    if m:
+        team = _resolve_official_team(m.group(1), games)
+        if not team:
+            return None, f"No pude identificar de forma única el equipo: {m.group(1)}"
+        line = float(m.group(2))
+        team["market_family"] = "RUN_LINE"
+        team["line"] = line
+        sign = "+" if line > 0 else ""
+        team["pick_text"] = f"{team['selection']} {sign}{_fmt_line(line)}"
+        return team, None
+
+    # Explicit ML or Moneyline.
+    m = re.match(r"^(.+?)\s+(?:ml|moneyline)$", raw, re.I)
+    if m:
+        team = _resolve_official_team(m.group(1), games)
+        if not team:
+            return None, f"No pude identificar de forma única el equipo: {m.group(1)}"
+        team["market_family"] = "FULL_GAME_ML"
+        team["line"] = None
+        team["pick_text"] = f"{team['selection']} ML"
+        return team, None
+
+    # Helpful validation for an incomplete over/under such as "Orioles Over".
+    if re.search(r"\b(over|under)\s*$", raw, re.I):
+        return None, f"Falta la línea del mercado en: {raw}. Ejemplo: Orioles Over 3.5"
+
+    # Backward compatibility: a bare team is still interpreted as ML.
+    team = _resolve_official_team(raw, games)
+    if not team:
+        return None, f"No pude identificar de forma única el pick: {raw}"
+    team["market_family"] = "FULL_GAME_ML"
+    team["line"] = None
+    team["pick_text"] = f"{team['selection']} ML"
+    return team, None
+
+
+def _save_official_market_picks(pick_date, pick_lines, admin_user_id):
+    """Parse three complete channel picks and persist one canonical bot/channel slate."""
+    clean = [str(x).strip() for x in pick_lines if str(x).strip()]
     if len(clean) != 3:
-        return False, "Debes enviar exactamente 3 equipos.", []
+        return False, "Debes enviar exactamente 3 picks.", []
 
     games = _today_schedule_games(pick_date)
     if not games:
@@ -3538,10 +3718,10 @@ def _save_official_team_picks(pick_date, team_names, admin_user_id):
 
     resolved = []
     used_games = set()
-    for team in clean:
-        item = _resolve_official_team(team, games)
+    for pick_text in clean:
+        item, error = _parse_official_pick(pick_text, games)
         if item is None:
-            return False, f"No pude identificar de forma única el equipo: {team}", []
+            return False, error or f"No pude interpretar: {pick_text}", []
         if item["game_pk"] in used_games:
             return False, f"Hay dos selecciones del mismo partido: {item['away']} vs {item['home']}", []
         used_games.add(item["game_pk"])
@@ -3549,7 +3729,6 @@ def _save_official_team_picks(pick_date, team_names, admin_user_id):
 
     now_iso = local_now().isoformat()
     with _tracking_connection() as conn:
-        # The channel-confirmed slate becomes the only official slate for today's performance sample.
         conn.execute(
             "UPDATE tracked_picks SET official=0 WHERE pick_date=? AND source IN ('TRIPLE_PICK','TRIPLE_PICK_FALLBACK')",
             (pick_date,),
@@ -3565,12 +3744,13 @@ def _save_official_team_picks(pick_date, team_names, admin_user_id):
                 """
                 INSERT INTO official_daily_picks (
                     pick_date, slot, game_pk, game_date, away, home, selection, pitcher,
-                    created_by, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    pick_text, market_family, line, created_by, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     pick_date, slot, item["game_pk"], item["game_date"], item["away"], item["home"],
-                    item["selection"], item["pitcher"], int(admin_user_id), now_iso, now_iso,
+                    item["selection"], item["pitcher"], item["pick_text"], item["market_family"],
+                    item["line"], int(admin_user_id), now_iso, now_iso,
                 ),
             )
             conn.execute(
@@ -3580,15 +3760,20 @@ def _save_official_team_picks(pick_date, team_names, admin_user_id):
                     product, source, official, market_family, line, odds, book,
                     model_version, bot_version, result, units_risked, notes
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, 'OFFICIAL', 'CHANNEL_OFFICIAL', 1,
-                          'FULL_GAME_ML', NULL, NULL, NULL, 'CHANNEL_OFFICIAL', ?,
+                          ?, ?, NULL, NULL, 'CHANNEL_OFFICIAL', ?,
                           'PENDING', 1.0, 'Confirmed by admin for channel/bot sync')
                 """,
                 (
                     now_iso, pick_date, item["game_pk"], item["game_date"], item["away"], item["home"],
-                    item["selection"], BOT_VERSION,
+                    item["selection"], item["market_family"], item["line"], BOT_VERSION,
                 ),
             )
     return True, "OK", resolved
+
+
+def _save_official_team_picks(pick_date, team_names, admin_user_id):
+    """Backward-compatible wrapper: bare team names are treated as moneylines."""
+    return _save_official_market_picks(pick_date, team_names, admin_user_id)
 
 
 def _format_official_picks_text(rows, title="🎯 PICKS OFICIALES TRIPLE PICK"):
@@ -3598,10 +3783,13 @@ def _format_official_picks_text(rows, title="🎯 PICKS OFICIALES TRIPLE PICK"):
     lines = [title, ""]
     for i, row in enumerate(rows):
         time_text = format_game_time_local(row["game_date"]) if row["game_date"] else "N/D"
+        pick_text = row["pick_text"] if "pick_text" in row.keys() and row["pick_text"] else None
+        if not pick_text:
+            pick_text = _tracked_pick_display(row)
         lines.extend([
             f"{medals[i] if i < 3 else '•'} PICK #{row['slot']}",
             f"🏟️ {row['away']} vs {row['home']}",
-            f"🎯 {row['selection']} ML",
+            f"🎯 {pick_text}",
             f"⚾ Pitcher: {row['pitcher'] or 'Por confirmar'}",
             f"🕐 {time_text}",
             "",
@@ -3631,7 +3819,8 @@ async def admin_official_picks_panel(update: Update, context: ContextTypes.DEFAU
     rows = await asyncio.to_thread(_official_pick_rows, fecha)
     await update.effective_message.reply_text(
         _format_official_picks_text(rows) +
-        "\n\n📝 Cargar 3 picks: pega los tres equipos, uno por línea.\n"
+        "\n\n📝 Cargar 3 picks: pega los tres picks completos, uno por línea.\n"
+        "Formatos: Orioles ML · Orioles Over 3.5 · Orioles +1.5 · Orioles vs Yankees Over 8.5.\n"
         "🤖 Usar picks del modelo: toma el Triple Pick calculado por el bot y lo fija como oficial.",
         reply_markup=OFFICIAL_PICKS_ADMIN_KEYBOARD,
     )
@@ -3645,11 +3834,12 @@ async def admin_official_start_input(update: Update, context: ContextTypes.DEFAU
     context.user_data["awaiting_official_picks"] = True
     await update.effective_message.reply_text(
         "📝 CARGAR PICKS OFICIALES\n\n"
-        "Envía exactamente 3 equipos MLB, uno por línea, tal como quieres que aparezcan en el canal.\n\n"
-        "Ejemplo:\n"
-        "Minnesota Twins\n"
-        "New York Yankees\n"
-        "Los Angeles Dodgers\n\n"
+        "Envía exactamente 3 picks MLB completos, uno por línea, tal como quieres que aparezcan en el canal.\n\n"
+        "Ejemplos válidos:\n"
+        "Baltimore Orioles ML\n"
+        "Orioles Over 3.5\n"
+        "Dodgers vs Padres Over 8.5\n\n"
+        "También acepta Team Total Over/Under y run line (+1.5/-1.5).\n"
         "El bot identificará automáticamente rival, pitcher, horario y partido.\n"
         "Pulsa ❌ Cancelar carga para salir.",
         reply_markup=ReplyKeyboardMarkup([["❌ Cancelar carga"]], resize_keyboard=True, is_persistent=True),
@@ -3668,16 +3858,16 @@ async def _handle_official_picks_input(update: Update, context: ContextTypes.DEF
         context.user_data.pop("awaiting_official_picks", None)
         await update.effective_message.reply_text("Carga cancelada.", reply_markup=OFFICIAL_PICKS_ADMIN_KEYBOARD)
         return True
-    teams = [line.strip().lstrip("123.-) ") for line in text.splitlines() if line.strip()]
-    if len(teams) != 3:
+    picks_input = [line.strip().lstrip("123.-) ") for line in text.splitlines() if line.strip()]
+    if len(picks_input) != 3:
         await update.effective_message.reply_text(
-            "⚠️ Necesito exactamente 3 líneas, una por equipo. Inténtalo nuevamente o pulsa ❌ Cancelar carga."
+            "⚠️ Necesito exactamente 3 líneas, una por pick. Inténtalo nuevamente o pulsa ❌ Cancelar carga."
         )
         return True
     fecha = local_now().strftime("%Y-%m-%d")
-    ok, msg, _resolved = await asyncio.to_thread(_save_official_team_picks, fecha, teams, user.id)
+    ok, msg, _resolved = await asyncio.to_thread(_save_official_market_picks, fecha, picks_input, user.id)
     if not ok:
-        await update.effective_message.reply_text(f"❌ {msg}\n\nCorrige los nombres y vuelve a enviarlos.")
+        await update.effective_message.reply_text(f"❌ {msg}\n\nCorrige el pick y vuelve a enviar las 3 líneas.")
         return True
     context.user_data.pop("awaiting_official_picks", None)
     rows = await asyncio.to_thread(_official_pick_rows, fecha)

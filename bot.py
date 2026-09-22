@@ -2967,6 +2967,32 @@ def init_membership_db():
         )
 
 
+def migrate_legacy_free_trials_to_30_days():
+    """Upgrade legacy 7-day FREE trials to 30 days from their original start.
+
+    Idempotent: only rows whose stored trial duration is approximately 7 days
+    are changed, so current 30-day trials are never extended again.
+    """
+    legacy_max_seconds = 8 * 24 * 60 * 60
+    new_period_seconds = FREE_TRIAL_PERIOD
+    now_ts = _subscription_now_ts()
+    with _tracking_connection() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE membership_users
+            SET trial_expires_at = trial_started_at + ?,
+                updated_at = ?
+            WHERE (trial_expires_at - trial_started_at) > 0
+              AND (trial_expires_at - trial_started_at) <= ?
+            """,
+            (new_period_seconds, now_ts, legacy_max_seconds),
+        )
+        migrated = int(cursor.rowcount or 0)
+    if migrated:
+        print(f"✅ Migración FREE: {migrated} prueba(s) antigua(s) ampliada(s) a 30 días.")
+    return migrated
+
+
 def _subscription_now_ts():
     return int(datetime.now(timezone.utc).timestamp())
 
@@ -4028,6 +4054,7 @@ def main():
 
     init_tracking_db()
     init_membership_db()
+    migrate_legacy_free_trials_to_30_days()
     app = ApplicationBuilder().token(TOKEN).post_init(post_init_schedule_alerts).build()
 
     app.add_handler(CommandHandler("start", start))

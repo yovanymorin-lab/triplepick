@@ -76,7 +76,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.4.2"
+BOT_VERSION = "3.5.0"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -4537,6 +4537,7 @@ SOCCER_MENU_KEYBOARD = ReplyKeyboardMarkup(
         ["🔥 Picks Fútbol", "📊 Resultados Fútbol"],
         ["🛡️ Survival Fútbol", "⭐ Top Picks Fútbol"],
         ["🎯 Player Props Fútbol", "🏆 Ligas Fútbol"],
+        ["📡 Picks en vivo"],
         ["⬅️ Menú principal"],
     ],
     resize_keyboard=True,
@@ -4550,6 +4551,7 @@ MLB_MENU_KEYBOARD = ReplyKeyboardMarkup(
         ["🔥 Picks MLB", "📊 Resultados MLB"],
         ["🧮 Mercado MLB", "📈 Rendimiento MLB"],
         ["📋 Historial MLB", "🧪 Más opciones"],
+        ["📡 Picks en vivo"],
         ["⬅️ Menú principal"],
     ],
     resize_keyboard=True,
@@ -5255,12 +5257,361 @@ async def live_refresh_callback(update: Update, context: ContextTypes.DEFAULT_TY
         print(f"Live refresh edit skipped ({sport}): {exc}")
 
 
+
+# ---------------------------------------------------------------------------
+# v3.5 LIVE PICK MONITOR — MLB + SOCCER + NBA
+# ---------------------------------------------------------------------------
+
+
+def _simple_team_key(name):
+    value = (name or "").lower().replace("&", "and")
+    value = re.sub(r"[^a-z0-9 ]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _team_name_matches(a, b):
+    ka, kb = _simple_team_key(a), _simple_team_key(b)
+    if not ka or not kb:
+        return False
+    if ka == kb or ka in kb or kb in ka:
+        return True
+    # Last-word nickname match helps bridge feeds such as "LA Lakers" vs
+    # "Los Angeles Lakers" without accepting very short tokens.
+    ta, tb = ka.split(), kb.split()
+    return bool(ta and tb and len(ta[-1]) >= 4 and ta[-1] == tb[-1])
+
+
+def _event_score_state(event):
+    comp, away, home = _espn_competitors(event)
+    status = event.get("status", {}) or {}
+    typ = status.get("type", {}) or {}
+    state = typ.get("state") or "pre"
+    detail = typ.get("shortDetail") or typ.get("detail") or status.get("displayClock") or ""
+    try:
+        away_score = float(away.get("score") or 0)
+        home_score = float(home.get("score") or 0)
+    except (TypeError, ValueError):
+        away_score = home_score = 0.0
+    return {
+        "state": state,
+        "detail": detail,
+        "away": away.get("team", {}).get("displayName", "Visitante"),
+        "home": home.get("team", {}).get("displayName", "Local"),
+        "away_score": away_score,
+        "home_score": home_score,
+    }
+
+
+def _find_espn_event(events, away_name, home_name):
+    for event in events or []:
+        _comp, away, home = _espn_competitors(event)
+        a = away.get("team", {}).get("displayName", "")
+        h = home.get("team", {}).get("displayName", "")
+        if _team_name_matches(a, away_name) and _team_name_matches(h, home_name):
+            return event
+    return None
+
+
+def _selection_live_state(selection, away, home, away_score, home_score, state, product=None,
+                          market_family=None, line=None):
+    """Return a conservative live status. Never invent unsupported player statistics."""
+    selection = (selection or "").strip()
+    upper = selection.upper()
+    final = state == "post"
+    if state == "pre":
+        return "⏳ PRÓXIMO"
+
+    if (product or "").upper() == "PLAYER":
+        return "📊 PROP: partido en curso · estadística individual pendiente"
+
+    # MLB canonical market metadata is preferred when available.
+    mf = (market_family or "").upper()
+    numeric_line = None
+    try:
+        numeric_line = float(line) if line is not None else None
+    except (TypeError, ValueError):
+        numeric_line = None
+
+    total = away_score + home_score
+    if mf in {"FULL_GAME_TOTAL_OVER", "FULL_GAME_TOTAL_UNDER", "GAME_TOTAL_OVER", "GAME_TOTAL_UNDER"} and numeric_line is not None:
+        is_over = mf.endswith("OVER")
+        if final:
+            won = total > numeric_line if is_over else total < numeric_line
+            if total == numeric_line:
+                return "➖ PUSH · FINAL"
+            return ("✅ WIN · FINAL" if won else "❌ LOSS · FINAL")
+        if is_over:
+            return f"✅ OVER SUPERADO ({total:g}/{numeric_line:g})" if total > numeric_line else f"🟡 FALTAN {max(0, numeric_line-total):g}"
+        return f"🟢 UNDER ACTIVO ({total:g}/{numeric_line:g})" if total < numeric_line else f"🔴 UNDER SUPERADO ({total:g}/{numeric_line:g})"
+
+    if mf in {"TEAM_TOTAL_OVER", "TEAM_TOTAL_UNDER"} and numeric_line is not None:
+        selected_home = _team_name_matches(selection, home)
+        selected_away = _team_name_matches(selection, away)
+        team_score = home_score if selected_home else away_score if selected_away else None
+        if team_score is not None:
+            is_over = mf.endswith("OVER")
+            if final:
+                if team_score == numeric_line:
+                    return "➖ PUSH · FINAL"
+                won = team_score > numeric_line if is_over else team_score < numeric_line
+                return "✅ WIN · FINAL" if won else "❌ LOSS · FINAL"
+            if is_over:
+                return f"✅ TEAM OVER SUPERADO ({team_score:g}/{numeric_line:g})" if team_score > numeric_line else f"🟡 TEAM TOTAL {team_score:g}/{numeric_line:g}"
+            return f"🟢 TEAM UNDER ACTIVO ({team_score:g}/{numeric_line:g})" if team_score < numeric_line else f"🔴 TEAM UNDER SUPERADO ({team_score:g}/{numeric_line:g})"
+
+    if mf == "RUN_LINE" and numeric_line is not None:
+        selected_home = _team_name_matches(selection, home)
+        selected_away = _team_name_matches(selection, away)
+        selected_score = home_score if selected_home else away_score if selected_away else None
+        opponent_score = away_score if selected_home else home_score if selected_away else None
+        if selected_score is not None:
+            adjusted = selected_score + numeric_line - opponent_score
+            if final:
+                if abs(adjusted) < 1e-9:
+                    return "➖ PUSH · FINAL"
+                return "✅ WIN · FINAL" if adjusted > 0 else "❌ LOSS · FINAL"
+            if adjusted > 0:
+                return f"✅ CUBRIENDO ({adjusted:+g})"
+            if abs(adjusted) < 1e-9:
+                return "🟡 EN PUSH"
+            return f"🔴 NO CUBRIENDO ({adjusted:+g})"
+
+    # Generic team total such as "Celtics Over 112.5" or "Real Madrid Team Total Over 1.5".
+    tm = re.match(r"^(.+?)\s+(?:TEAM\s+TOTAL\s+)?(OVER|UNDER)\s+([0-9]+(?:\.[0-9]+)?)", upper)
+    if tm:
+        team_text = tm.group(1).strip()
+        selected_home = _team_name_matches(team_text, home)
+        selected_away = _team_name_matches(team_text, away)
+        if selected_home or selected_away:
+            team_score = home_score if selected_home else away_score
+            over = tm.group(2) == "OVER"
+            target = float(tm.group(3))
+            if final:
+                if team_score == target:
+                    return "➖ PUSH · FINAL"
+                won = team_score > target if over else team_score < target
+                return "✅ WIN · FINAL" if won else "❌ LOSS · FINAL"
+            if over:
+                return f"✅ TEAM OVER SUPERADO ({team_score:g}/{target:g})" if team_score > target else f"🟡 TEAM TOTAL {team_score:g}/{target:g}"
+            return f"🟢 TEAM UNDER ACTIVO ({team_score:g}/{target:g})" if team_score < target else f"🔴 TEAM UNDER SUPERADO ({team_score:g}/{target:g})"
+
+    # Generic full-game total in soccer/NBA text.
+    m = re.search(r"\b(OVER|UNDER|O|U)\s*([0-9]+(?:\.[0-9]+)?)", upper)
+    if m and not re.search(r"[A-Z]+\s+[A-Z]+\s+(OVER|UNDER)", upper):
+        over = m.group(1) in {"OVER", "O"}
+        target = float(m.group(2))
+        if final:
+            if total == target:
+                return "➖ PUSH · FINAL"
+            won = total > target if over else total < target
+            return "✅ WIN · FINAL" if won else "❌ LOSS · FINAL"
+        if over:
+            return f"✅ OVER SUPERADO ({total:g}/{target:g})" if total > target else f"🟡 TOTAL {total:g}/{target:g}"
+        return f"🟢 UNDER ACTIVO ({total:g}/{target:g})" if total < target else f"🔴 UNDER SUPERADO ({total:g}/{target:g})"
+
+    # Team selection / ML / spread.
+    selected_home = _team_name_matches(selection, home) or _team_name_matches(re.sub(r"\b(ML|MONEYLINE)\b", "", selection, flags=re.I), home)
+    selected_away = _team_name_matches(selection, away) or _team_name_matches(re.sub(r"\b(ML|MONEYLINE)\b", "", selection, flags=re.I), away)
+    selected_score = home_score if selected_home else away_score if selected_away else None
+    opponent_score = away_score if selected_home else home_score if selected_away else None
+
+    # For spreads, strip common total tokens and take a signed number.
+    spread_match = re.search(r"(^|\s)([+-]\d+(?:\.\d+)?)\b", selection)
+    if selected_score is not None and spread_match:
+        spread = float(spread_match.group(2))
+        adjusted = selected_score + spread - opponent_score
+        if final:
+            if abs(adjusted) < 1e-9:
+                return "➖ PUSH · FINAL"
+            return "✅ WIN · FINAL" if adjusted > 0 else "❌ LOSS · FINAL"
+        if adjusted > 0:
+            return f"✅ CUBRIENDO ({adjusted:+g})"
+        if abs(adjusted) < 1e-9:
+            return "🟡 EN PUSH"
+        return f"🔴 NO CUBRIENDO ({adjusted:+g})"
+
+    if mf == "FULL_GAME_ML" or selected_score is not None or " ML" in f" {upper}":
+        if selected_score is None:
+            # MLB official pick selection may be the exact team with no ML suffix.
+            if _team_name_matches(selection, home):
+                selected_score, opponent_score = home_score, away_score
+            elif _team_name_matches(selection, away):
+                selected_score, opponent_score = away_score, home_score
+        if selected_score is not None:
+            if final:
+                if selected_score == opponent_score:
+                    return "➖ EMPATE · FINAL"
+                return "✅ WIN · FINAL" if selected_score > opponent_score else "❌ LOSS · FINAL"
+            if selected_score > opponent_score:
+                return "✅ GANANDO"
+            if selected_score < opponent_score:
+                return "🔴 PERDIENDO"
+            return "🟡 EMPATADO"
+
+    return "ℹ️ Marcador en vivo · mercado no calculable automáticamente"
+
+
+def _mlb_pick_monitor_rows(pick_date):
+    picks = _official_pick_rows(pick_date)
+    if not picks:
+        return []
+    data = safe_get_json(
+        f"{MLB_API}/schedule",
+        {"sportId": 1, "date": pick_date, "hydrate": "linescore"},
+        cache_ttl=0,
+    ) or {}
+    games = {}
+    for block in data.get("dates", []):
+        for game in block.get("games", []):
+            games[int(game.get("gamePk") or 0)] = game
+    out = []
+    for row in picks:
+        game = games.get(int(row["game_pk"] or 0))
+        if not game:
+            out.append(("MLB", row, None, "⏳ Sin marcador disponible"))
+            continue
+        status = game.get("status", {}) or {}
+        abstract = status.get("abstractGameState")
+        state = "pre" if abstract == "Preview" else "post" if abstract == "Final" else "in"
+        away = game.get("teams", {}).get("away", {})
+        home = game.get("teams", {}).get("home", {})
+        a_score, h_score = float(away.get("score") or 0), float(home.get("score") or 0)
+        lineinfo = game.get("linescore", {}) or {}
+        detail = status.get("detailedState") or ""
+        if state == "in":
+            inning = lineinfo.get("currentInningOrdinal") or lineinfo.get("currentInning") or ""
+            half = lineinfo.get("inningHalf") or ""
+            outs = lineinfo.get("outs")
+            detail = " ".join(x for x in [str(half), str(inning)] if x).strip() or detail
+            if outs is not None:
+                detail += f" · {outs} out{'s' if outs != 1 else ''}"
+        pick_state = _selection_live_state(
+            row["selection"], row["away"], row["home"], a_score, h_score, state,
+            market_family=row["market_family"], line=row["line"],
+        )
+        payload = {"state": state, "detail": detail, "away_score": a_score, "home_score": h_score}
+        out.append(("MLB", row, payload, pick_state))
+    return out
+
+
+def _soccer_pick_monitor_rows(user_id, pick_date):
+    rows = _soccer_visible_rows(user_id, pick_date)
+    if not rows:
+        return []
+    events = []
+    for league, _name in SOCCER_LIVE_LEAGUES:
+        data = _espn_get_json(f"soccer/{league}/scoreboard", {"dates": pick_date.replace("-", "")}) or {}
+        events.extend(data.get("events", []))
+    out = []
+    for row in rows:
+        event = _find_espn_event(events, row["away"], row["home"])
+        if not event:
+            out.append(("SOCCER", row, None, "⏳ Sin marcador disponible"))
+            continue
+        p = _event_score_state(event)
+        pick_state = _selection_live_state(
+            row["selection"], row["away"], row["home"], p["away_score"], p["home_score"], p["state"],
+            product=row["product"], line=row["line"],
+        )
+        out.append(("SOCCER", row, p, pick_state))
+    return out
+
+
+def _nba_pick_monitor_rows(user_id, pick_date):
+    rows = _nba_visible_rows(user_id, pick_date)
+    if not rows:
+        return []
+    data = _nba_scoreboard(pick_date) or {}
+    events = data.get("events", [])
+    out = []
+    for row in rows:
+        event = _find_espn_event(events, row["away"], row["home"])
+        if not event:
+            out.append(("NBA", row, None, "⏳ Sin marcador disponible"))
+            continue
+        p = _event_score_state(event)
+        pick_state = _selection_live_state(
+            row["selection"], row["away"], row["home"], p["away_score"], p["home_score"], p["state"],
+            product=row["product"], line=row["line"],
+        )
+        out.append(("NBA", row, p, pick_state))
+    return out
+
+
+def _format_score(v):
+    try:
+        f = float(v)
+        return str(int(f)) if f.is_integer() else f"{f:g}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def _live_pick_monitor_text(user_id):
+    pick_date = local_now().strftime("%Y-%m-%d")
+    groups = [
+        ("⚾ MLB", _mlb_pick_monitor_rows(pick_date)),
+        ("⚽ FÚTBOL", _soccer_pick_monitor_rows(user_id, pick_date)),
+        ("🏀 NBA", _nba_pick_monitor_rows(user_id, pick_date)),
+    ]
+    lines = ["📡 TRIPLE PICK — MONITOR EN VIVO", f"📅 {pick_date}", ""]
+    any_rows = False
+    for title, rows in groups:
+        if not rows:
+            continue
+        any_rows = True
+        lines.extend([title, ""])
+        for _sport, row, payload, pick_state in rows:
+            lines.append(f"🎯 {row['selection']}")
+            lines.append(f"🏟️ {row['away']} vs {row['home']}")
+            if payload:
+                lines.append(
+                    f"📊 {_format_score(payload['away_score'])}–{_format_score(payload['home_score'])} · {payload.get('detail') or 'En curso'}"
+                )
+            lines.append(f"{pick_state}")
+            lines.append("")
+            if sum(len(x) + 1 for x in lines) > 3650:
+                lines.append("… Hay más picks. Usa 🔄 Actualizar todos para volver a consultar.")
+                break
+        if sum(len(x) + 1 for x in lines) > 3650:
+            break
+    if not any_rows:
+        lines.append("ℹ️ No hay picks publicados para hoy.")
+    lines.extend(["", f"🔄 Actualizado: {_format_live_stamp()}"])
+    return "\n".join(lines)
+
+
+def _live_pick_monitor_markup():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Actualizar todos", callback_data="live_picks_refresh")],
+    ])
+
+
+async def live_pick_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _premium_gate(update, "FREE"):
+        return
+    user_id = update.effective_user.id if update.effective_user else 0
+    text = await asyncio.to_thread(_live_pick_monitor_text, user_id)
+    await update.effective_message.reply_text(text, reply_markup=_live_pick_monitor_markup())
+
+
+async def live_pick_monitor_refresh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id if query.from_user else 0
+    text = await asyncio.to_thread(_live_pick_monitor_text, user_id)
+    try:
+        await query.edit_message_text(text, reply_markup=_live_pick_monitor_markup())
+    except Exception as exc:
+        print(f"Live pick monitor refresh skipped: {exc}")
+
+
 NBA_MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["🏀 Juegos NBA", "🔴 En vivo NBA"],
         ["🔥 Picks NBA", "📊 Resultados NBA"],
         ["🛡️ Survival NBA", "⭐ Top Picks NBA"],
         ["🎯 Player Props NBA"],
+        ["📡 Picks en vivo"],
         ["⬅️ Menú principal"],
     ],
     resize_keyboard=True,
@@ -5626,7 +5977,7 @@ MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["⚾ MLB", "⚽ Fútbol", "🏀 NBA"],
         ["🔔 Alertas", "👤 Mi cuenta"],
-        ["⭐ Suscripción"],
+        ["📡 Picks en vivo", "⭐ Suscripción"],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -5638,7 +5989,7 @@ def _main_menu_keyboard_for(user_id=None):
     rows = [
         ["⚾ MLB", "⚽ Fútbol", "🏀 NBA"],
         ["🔔 Alertas", "👤 Mi cuenta"],
-        ["⭐ Suscripción"],
+        ["📡 Picks en vivo", "⭐ Suscripción"],
     ]
     if user_id is not None and int(user_id) in SUBSCRIPTION_ADMIN_IDS:
         rows.append(["🛡️ Panel Admin"])
@@ -5671,6 +6022,7 @@ def _menu_text():
         "🏀 NBA — juegos, picks, props y marcadores en vivo\n"
         "🔔 Alertas — avisos pregame\n"
         "👤 Mi cuenta — membresía y estado de alertas\n"
+        "📡 Picks en vivo — seguimiento de todos los picks publicados\n"
         "⭐ Suscripción — FREE, PREMIUM y PRO"
     )
 
@@ -5715,6 +6067,7 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "⭐ Top Picks NBA": nba_top,
         "🎯 Player Props NBA": nba_player_props,
         "📊 Resultados NBA": nba_results,
+        "📡 Picks en vivo": live_pick_monitor,
         "⚽ Partidos Fútbol": soccer_games,
         "🔥 Picks Fútbol": soccer_picks,
         "🛡️ Survival Fútbol": soccer_survival,
@@ -6293,6 +6646,7 @@ def main():
     app.add_handler(CommandHandler("smsoff", sms_disable))
     app.add_handler(CallbackQueryHandler(alert_game_callback, pattern=r"^alertgame\|"))
     app.add_handler(CallbackQueryHandler(live_refresh_callback, pattern=r"^live_refresh\|"))
+    app.add_handler(CallbackQueryHandler(live_pick_monitor_refresh_callback, pattern=r"^live_picks_refresh$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, visual_menu_router))
 
     if app.job_queue is not None:

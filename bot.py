@@ -76,7 +76,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.5.1"
+BOT_VERSION = "3.5.2"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -5546,6 +5546,23 @@ def _format_score(v):
         return str(v)
 
 
+def _pick_start_local(sport, row):
+    """Return a pick start datetime in LOCAL_TZ when the source row provides one."""
+    field = {
+        "MLB": "game_date",
+        "SOCCER": "kickoff_utc",
+        "NBA": "tipoff_utc",
+    }.get(sport)
+    if not field:
+        return None
+    try:
+        value = row[field]
+    except (KeyError, IndexError, TypeError):
+        return None
+    dt = _parse_iso_utc(value)
+    return dt.astimezone(LOCAL_TZ) if dt else None
+
+
 def _live_pick_monitor_text(user_id):
     pick_date = local_now().strftime("%Y-%m-%d")
     groups = [
@@ -5554,11 +5571,54 @@ def _live_pick_monitor_text(user_id):
         ("🏀 NBA", _nba_pick_monitor_rows(user_id, pick_date)),
     ]
     lines = ["📡 TRIPLE PICK — MONITOR EN VIVO", f"📅 {pick_date}", ""]
-    any_rows = False
+
+    all_rows = [item for _title, rows in groups for item in rows]
+    live_rows = [
+        item for item in all_rows
+        if item[2] and item[2].get("state") == "in"
+    ]
+
+    if not all_rows:
+        lines.extend([
+            "ℹ️ No hay picks publicados para hoy.",
+            "",
+            "Cuando Triple Pick publique una selección aparecerá aquí automáticamente.",
+        ])
+        lines.extend(["", f"🔄 Actualizado: {_format_live_stamp()}"])
+        return "\n".join(lines)
+
+    if not live_rows:
+        upcoming = []
+        now = local_now()
+        for sport, row, payload, _pick_state in all_rows:
+            if payload and payload.get("state") == "post":
+                continue
+            start_dt = _pick_start_local(sport, row)
+            if start_dt and start_dt >= now - timedelta(minutes=5):
+                upcoming.append((start_dt, sport, row))
+        upcoming.sort(key=lambda x: x[0])
+
+        lines.append("ℹ️ En este momento no hay picks de Triple Pick en juego.")
+        lines.append(f"🎯 Picks programados/pendientes hoy: {len(upcoming) if upcoming else len(all_rows)}")
+        if upcoming:
+            next_dt, next_sport, next_row = upcoming[0]
+            sport_icon = {"MLB": "⚾", "SOCCER": "⚽", "NBA": "🏀"}.get(next_sport, "🎯")
+            lines.append(f"🕐 Próximo: {next_dt.strftime('%I:%M %p').lstrip('0')} — {sport_icon} {next_row['away']} vs {next_row['home']}")
+            lines.append(f"🎯 Pick: {next_row['selection']}")
+        lines.extend([
+            "",
+            "🔔 Si tienes las alertas activadas, recibirás el aviso previo al inicio.",
+            "Pulsa 🔄 Actualizar todos cuando quieras volver a comprobar el estado.",
+            "",
+            f"🔄 Actualizado: {_format_live_stamp()}",
+        ])
+        return "\n".join(lines)
+
+    # At least one official pick is currently live. Show every published pick so
+    # the user can monitor live, upcoming and completed selections in one place.
     for title, rows in groups:
         if not rows:
             continue
-        any_rows = True
         lines.extend([title, ""])
         for _sport, row, payload, pick_state in rows:
             lines.append(f"🎯 {row['selection']}")
@@ -5574,8 +5634,7 @@ def _live_pick_monitor_text(user_id):
                 break
         if sum(len(x) + 1 for x in lines) > 3650:
             break
-    if not any_rows:
-        lines.append("ℹ️ No hay picks publicados para hoy.")
+
     lines.extend(["", f"🔄 Actualizado: {_format_live_stamp()}"])
     return "\n".join(lines)
 

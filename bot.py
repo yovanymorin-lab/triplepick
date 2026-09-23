@@ -69,7 +69,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.0.0"
+BOT_VERSION = "3.1.0"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -1686,6 +1686,46 @@ def init_tracking_db():
 
             CREATE INDEX IF NOT EXISTS idx_official_daily_picks_date
             ON official_daily_picks(pick_date, slot);
+
+            -- Triple Pick v3.1 Multi-Sport: soccer is intentionally isolated from MLB tables.
+            CREATE TABLE IF NOT EXISTS soccer_picks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pick_date TEXT NOT NULL,
+                slot INTEGER NOT NULL,
+                league TEXT NOT NULL,
+                away TEXT NOT NULL,
+                home TEXT NOT NULL,
+                selection TEXT NOT NULL,
+                product TEXT NOT NULL DEFAULT 'TOP PICK',
+                plan_required TEXT NOT NULL DEFAULT 'PREMIUM',
+                kickoff_utc TEXT,
+                player TEXT,
+                line REAL,
+                odds REAL,
+                book TEXT,
+                source TEXT NOT NULL DEFAULT 'SOCCER_GLOBAL_OPTIMIZER_2.0',
+                result TEXT NOT NULL DEFAULT 'PENDING',
+                created_by INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(pick_date, slot)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_soccer_picks_date
+            ON soccer_picks(pick_date, slot);
+
+            CREATE INDEX IF NOT EXISTS idx_soccer_picks_product
+            ON soccer_picks(product, result);
+
+            CREATE TABLE IF NOT EXISTS soccer_alert_deliveries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                soccer_pick_id INTEGER NOT NULL,
+                scheduled_for TEXT NOT NULL,
+                sent_at TEXT NOT NULL,
+                UNIQUE(chat_id, soccer_pick_id),
+                FOREIGN KEY(soccer_pick_id) REFERENCES soccer_picks(id) ON DELETE CASCADE
+            );
 
             CREATE TABLE IF NOT EXISTS alert_subscriptions (
                 chat_id INTEGER PRIMARY KEY,
@@ -3937,8 +3977,8 @@ def _admin_identity(row):
 ADMIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["📊 Estadísticas", "👥 Usuarios"],
-        ["🎯 Picks oficiales", "⏳ Vencen pronto"],
-        ["💳 Suscripciones"],
+        ["🎯 Picks oficiales", "⚽ Admin Fútbol"],
+        ["⏳ Vencen pronto", "💳 Suscripciones"],
         ["⬅️ Menú principal"],
     ],
     resize_keyboard=True,
@@ -4249,30 +4289,415 @@ async def _premium_gate(update, required="PREMIUM"):
 
 
 # ---------------------------------------------------------------------------
+# v3.1 MULTI-SPORT FOUNDATION — SOCCER
+# ---------------------------------------------------------------------------
+
+SOCCER_MENU_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["🔥 Picks Fútbol", "🛡️ Survival Fútbol"],
+        ["⭐ Top Picks Fútbol", "🎯 Player Props Fútbol"],
+        ["🏆 Ligas Fútbol", "📊 Resultados Fútbol"],
+        ["⬅️ Menú principal"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+    input_field_placeholder="Triple Pick Fútbol",
+)
+
+MLB_MENU_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["⚾ Picks de hoy", "⚾ Juegos MLB"],
+        ["📊 Estado", "📈 Rendimiento"],
+        ["🧮 Mercado", "📋 Historial"],
+        ["🧪 Más opciones", "⬅️ Menú principal"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+    input_field_placeholder="Triple Pick MLB",
+)
+
+SOCCER_ADMIN_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        ["📋 Ver picks fútbol", "📝 Cargar picks fútbol"],
+        ["🗑️ Borrar picks fútbol", "📊 Resultados Fútbol"],
+        ["⬅️ Panel Admin"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+    input_field_placeholder="Admin Fútbol Triple Pick",
+)
+
+
+def _soccer_plan_rank(plan):
+    return PLAN_RANK.get((plan or "FREE").upper(), 0)
+
+
+def _soccer_pick_rows(pick_date=None, product=None):
+    pick_date = pick_date or local_now().strftime("%Y-%m-%d")
+    sql = "SELECT * FROM soccer_picks WHERE pick_date=?"
+    params = [pick_date]
+    if product:
+        sql += " AND UPPER(product)=?"
+        params.append(product.upper())
+    sql += " ORDER BY slot, id"
+    with _tracking_connection() as conn:
+        return conn.execute(sql, params).fetchall()
+
+
+def _soccer_visible_rows(user_id, pick_date=None, product=None):
+    rows = _soccer_pick_rows(pick_date, product)
+    if not SUBSCRIPTION_ENFORCE:
+        return rows
+    plan, _row = _best_active_plan(user_id)
+    if plan in {"NONE", "EXPIRED"}:
+        return []
+    rank = _soccer_plan_rank(plan)
+    return [r for r in rows if _soccer_plan_rank(r["plan_required"]) <= rank]
+
+
+def _format_soccer_rows(rows, title="⚽ TRIPLE PICK — FÚTBOL"):
+    if not rows:
+        return title + "\n\nNo hay picks publicados para esta sección."
+    lines = [title, ""]
+    for row in rows:
+        kickoff = "N/D"
+        dt = _parse_iso_utc(row["kickoff_utc"])
+        if dt:
+            kickoff = dt.astimezone(LOCAL_TZ).strftime("%I:%M %p").lstrip("0")
+        lines.extend([
+            f"{row['slot']}️⃣ {row['away']} vs {row['home']}",
+            f"🏆 {row['league']}",
+            f"🎯 {row['selection']}",
+            f"🛡️ {row['product']} | 🔐 {row['plan_required']}",
+            f"🕐 {kickoff} ({AUTO_TZ})",
+            "",
+        ])
+    return "\n".join(lines).rstrip()
+
+
+async def mlb_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "⚾ TRIPLE PICK — MLB\n\nSelecciona una opción.",
+        reply_markup=MLB_MENU_KEYBOARD,
+    )
+
+
+async def soccer_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "⚽ TRIPLE PICK — FÚTBOL\n\n"
+        "Los picks publicados aquí provienen de la selección final aprobada para fútbol.",
+        reply_markup=SOCCER_MENU_KEYBOARD,
+    )
+
+
+async def soccer_picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _premium_gate(update, "FREE"):
+        return
+    user_id = update.effective_user.id if update.effective_user else 0
+    rows = await asyncio.to_thread(_soccer_visible_rows, user_id)
+    await update.effective_message.reply_text(
+        _format_soccer_rows(rows, "🔥 PICKS DE HOY — FÚTBOL"),
+        reply_markup=SOCCER_MENU_KEYBOARD,
+    )
+
+
+async def soccer_survival(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _premium_gate(update, "PREMIUM"):
+        return
+    user_id = update.effective_user.id if update.effective_user else 0
+    rows = await asyncio.to_thread(_soccer_visible_rows, user_id, None, "SURVIVAL")
+    await update.effective_message.reply_text(
+        _format_soccer_rows(rows, "🛡️ SURVIVAL — FÚTBOL"),
+        reply_markup=SOCCER_MENU_KEYBOARD,
+    )
+
+
+async def soccer_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _premium_gate(update, "PREMIUM"):
+        return
+    user_id = update.effective_user.id if update.effective_user else 0
+    rows = await asyncio.to_thread(_soccer_visible_rows, user_id)
+    rows = [r for r in rows if r["product"].upper() in {"TOP PICK", "CORE", "VALUE", "HYBRID"}]
+    await update.effective_message.reply_text(
+        _format_soccer_rows(rows, "⭐ TOP PICKS — FÚTBOL"),
+        reply_markup=SOCCER_MENU_KEYBOARD,
+    )
+
+
+async def soccer_player_props(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _premium_gate(update, "PRO"):
+        return
+    user_id = update.effective_user.id if update.effective_user else 0
+    rows = await asyncio.to_thread(_soccer_visible_rows, user_id, None, "PLAYER")
+    await update.effective_message.reply_text(
+        _format_soccer_rows(rows, "🎯 PLAYER PROPS — FÚTBOL"),
+        reply_markup=SOCCER_MENU_KEYBOARD,
+    )
+
+
+async def soccer_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = await asyncio.to_thread(_soccer_pick_rows)
+    leagues = sorted({r["league"] for r in rows})
+    text = "🏆 LIGAS — FÚTBOL\n\n" + ("\n".join(f"• {x}" for x in leagues) if leagues else "No hay ligas con picks publicados hoy.")
+    await update.effective_message.reply_text(text, reply_markup=SOCCER_MENU_KEYBOARD)
+
+
+async def soccer_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with _tracking_connection() as conn:
+        rows = conn.execute(
+            "SELECT pick_date, away, home, selection, product, result FROM soccer_picks "
+            "WHERE result <> 'PENDING' ORDER BY pick_date DESC, slot LIMIT 30"
+        ).fetchall()
+    if not rows:
+        text = "📊 RESULTADOS — FÚTBOL\n\nAún no hay resultados liquidados."
+    else:
+        lines = ["📊 RESULTADOS — FÚTBOL", ""]
+        for r in rows:
+            icon = "✅" if r["result"] == "WIN" else ("❌" if r["result"] == "LOSS" else "➖")
+            lines.append(f"{icon} {r['pick_date']} | {r['selection']} | {r['away']} vs {r['home']}")
+        text = "\n".join(lines)
+    await update.effective_message.reply_text(text, reply_markup=SOCCER_MENU_KEYBOARD)
+
+
+def _parse_soccer_kickoff(value):
+    value = (value or "").strip()
+    if not value or value.upper() in {"N/D", "ND", "TBD"}:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %I:%M %p"):
+        try:
+            local_dt = datetime.strptime(value, fmt).replace(tzinfo=LOCAL_TZ)
+            return local_dt.astimezone(timezone.utc).isoformat()
+        except ValueError:
+            pass
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=LOCAL_TZ)
+        return dt.astimezone(timezone.utc).isoformat()
+    except ValueError:
+        raise ValueError("hora inválida")
+
+
+def _save_soccer_picks(rows, created_by):
+    now = local_now().isoformat()
+    today = local_now().strftime("%Y-%m-%d")
+    with _tracking_connection() as conn:
+        conn.execute("DELETE FROM soccer_picks WHERE pick_date=?", (today,))
+        for slot, item in enumerate(rows, start=1):
+            conn.execute(
+                """INSERT INTO soccer_picks
+                (pick_date, slot, league, away, home, selection, product, plan_required,
+                 kickoff_utc, created_by, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (today, slot, item["league"], item["away"], item["home"], item["selection"],
+                 item["product"], item["plan_required"], item["kickoff_utc"], created_by, now, now),
+            )
+
+
+async def admin_soccer_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user is None or int(user.id) not in SUBSCRIPTION_ADMIN_IDS:
+        await update.effective_message.reply_text("⛔ Acceso exclusivo para administradores.")
+        return
+    rows = await asyncio.to_thread(_soccer_pick_rows)
+    await update.effective_message.reply_text(
+        _format_soccer_rows(rows, "⚽ ADMIN — PICKS FÚTBOL"),
+        reply_markup=SOCCER_ADMIN_KEYBOARD,
+    )
+
+
+async def admin_soccer_start_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user is None or int(user.id) not in SUBSCRIPTION_ADMIN_IDS:
+        await update.effective_message.reply_text("⛔ Acceso exclusivo para administradores.")
+        return
+    context.user_data["awaiting_soccer_picks"] = True
+    await update.effective_message.reply_text(
+        "📝 CARGAR PICKS DE FÚTBOL\n\n"
+        "Pega de 1 a 20 picks, uno por línea, usando:\n\n"
+        "LIGA | VISITANTE vs LOCAL | SELECCIÓN | PRODUCTO | PLAN | HORA\n\n"
+        "Ejemplo:\n"
+        "LaLiga | Villarreal vs Real Madrid | Under 4.5 Goals | SURVIVAL | PREMIUM | 2026-09-24 15:00\n"
+        "Premier League | Arsenal vs Everton | Over 7.5 Corners | CORE | PREMIUM | 2026-09-24 14:45\n"
+        "LaLiga | Barcelona vs Sevilla | Lamine Yamal Over 1.5 SOT | PLAYER | PRO | 2026-09-24 16:00\n\n"
+        "Productos: SURVIVAL, TOP PICK, CORE, VALUE, HYBRID, PLAYER.\n"
+        "Planes: FREE, PREMIUM, PRO. Hora local del bot. Usa N/D si no está confirmada.",
+        reply_markup=ReplyKeyboardMarkup([["❌ Cancelar carga fútbol"]], resize_keyboard=True, is_persistent=True),
+    )
+
+
+async def _handle_soccer_picks_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("awaiting_soccer_picks"):
+        return False
+    user = update.effective_user
+    if user is None or int(user.id) not in SUBSCRIPTION_ADMIN_IDS:
+        context.user_data.pop("awaiting_soccer_picks", None)
+        return False
+    text = (update.message.text or "").strip()
+    if text == "❌ Cancelar carga fútbol":
+        context.user_data.pop("awaiting_soccer_picks", None)
+        await update.effective_message.reply_text("Carga cancelada.", reply_markup=SOCCER_ADMIN_KEYBOARD)
+        return True
+    raw_lines = [x.strip() for x in text.splitlines() if x.strip()]
+    if not (1 <= len(raw_lines) <= 20):
+        await update.effective_message.reply_text("⚠️ Pega entre 1 y 20 picks, uno por línea.")
+        return True
+    parsed = []
+    products = {"SURVIVAL", "TOP PICK", "CORE", "VALUE", "HYBRID", "PLAYER"}
+    plans = {"FREE", "PREMIUM", "PRO"}
+    try:
+        for raw in raw_lines:
+            parts = [x.strip() for x in raw.split("|")]
+            if len(parts) != 6:
+                raise ValueError("cada línea necesita 6 campos separados por |")
+            league, matchup, selection, product, plan, kickoff = parts
+            if " vs " not in matchup.lower():
+                raise ValueError("el partido debe usar VISITANTE vs LOCAL")
+            m = re.split(r"\s+vs\s+", matchup, maxsplit=1, flags=re.I)
+            if len(m) != 2 or not m[0].strip() or not m[1].strip():
+                raise ValueError("partido inválido")
+            product = product.upper()
+            plan = plan.upper()
+            if product not in products:
+                raise ValueError(f"producto no válido: {product}")
+            if plan not in plans:
+                raise ValueError(f"plan no válido: {plan}")
+            parsed.append({
+                "league": league,
+                "away": m[0].strip(),
+                "home": m[1].strip(),
+                "selection": selection,
+                "product": product,
+                "plan_required": plan,
+                "kickoff_utc": _parse_soccer_kickoff(kickoff),
+            })
+    except ValueError as exc:
+        await update.effective_message.reply_text(f"⚠️ No pude cargar los picks: {exc}")
+        return True
+    await asyncio.to_thread(_save_soccer_picks, parsed, int(user.id))
+    context.user_data.pop("awaiting_soccer_picks", None)
+    await schedule_soccer_alert_jobs(context.application)
+    rows = await asyncio.to_thread(_soccer_pick_rows)
+    await update.effective_message.reply_text(
+        "✅ Picks de fútbol publicados.\n\n" + _format_soccer_rows(rows, "⚽ PICKS ACTIVOS"),
+        reply_markup=SOCCER_ADMIN_KEYBOARD,
+    )
+    return True
+
+
+async def admin_soccer_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user is None or int(user.id) not in SUBSCRIPTION_ADMIN_IDS:
+        await update.effective_message.reply_text("⛔ Acceso exclusivo para administradores.")
+        return
+    today = local_now().strftime("%Y-%m-%d")
+    with _tracking_connection() as conn:
+        conn.execute("DELETE FROM soccer_picks WHERE pick_date=?", (today,))
+    await update.effective_message.reply_text("🗑️ Picks de fútbol de hoy eliminados.", reply_markup=SOCCER_ADMIN_KEYBOARD)
+
+
+def _soccer_alert_was_sent(chat_id, soccer_pick_id):
+    with _tracking_connection() as conn:
+        return conn.execute(
+            "SELECT 1 FROM soccer_alert_deliveries WHERE chat_id=? AND soccer_pick_id=?",
+            (chat_id, soccer_pick_id),
+        ).fetchone() is not None
+
+
+def _record_soccer_alert_delivery(chat_id, soccer_pick_id, scheduled_for):
+    with _tracking_connection() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO soccer_alert_deliveries(chat_id, soccer_pick_id, scheduled_for, sent_at) VALUES (?, ?, ?, ?)",
+            (chat_id, soccer_pick_id, scheduled_for, local_now().isoformat()),
+        )
+
+
+async def _send_soccer_alert_job(context: ContextTypes.DEFAULT_TYPE):
+    payload = context.job.data or {}
+    row = payload.get("pick") or {}
+    chat_id = int(payload.get("chat_id"))
+    sub = await asyncio.to_thread(_get_alert_subscription, chat_id)
+    if not sub.get("enabled"):
+        return
+    user_plan, _ = await asyncio.to_thread(_best_active_plan, chat_id)
+    if SUBSCRIPTION_ENFORCE and _soccer_plan_rank(user_plan) < _soccer_plan_rank(row.get("plan_required")):
+        return
+    if await asyncio.to_thread(_soccer_alert_was_sent, chat_id, row.get("id")):
+        return
+    dt = _parse_iso_utc(row.get("kickoff_utc"))
+    game_time = dt.astimezone(LOCAL_TZ).strftime("%I:%M %p").lstrip("0") if dt else "N/D"
+    text = (
+        f"⚽ TRIPLE PICK — FALTAN {sub['lead_minutes']} MIN\n\n"
+        f"🏆 {row.get('league')}\n"
+        f"🏟️ {row.get('away')} vs {row.get('home')}\n"
+        f"🎯 {row.get('selection')}\n"
+        f"🛡️ {row.get('product')} | 🔐 {row.get('plan_required')}\n"
+        f"🕐 Inicio: {game_time} ({AUTO_TZ})\n\n"
+        "Revisa alineaciones y cualquier cambio de última hora antes del inicio."
+    )
+    await context.bot.send_message(chat_id=chat_id, text=text)
+    await asyncio.to_thread(_record_soccer_alert_delivery, chat_id, row.get("id"), payload.get("scheduled_for") or local_now().isoformat())
+
+
+async def schedule_soccer_alert_jobs(application, pick_date=None):
+    if application.job_queue is None:
+        return {"scheduled": 0, "skipped": 0}
+    rows = await asyncio.to_thread(_soccer_pick_rows, pick_date)
+    chats = await asyncio.to_thread(_enabled_alert_chats)
+    now_utc = datetime.now(timezone.utc)
+    scheduled = skipped = 0
+    for chat in chats:
+        chat_id = int(chat["chat_id"])
+        lead = int(chat["lead_minutes"] or ALERT_LEAD_MINUTES)
+        user_plan, _ = await asyncio.to_thread(_best_active_plan, chat_id)
+        for dbrow in rows:
+            row = {k: dbrow[k] for k in dbrow.keys()}
+            if SUBSCRIPTION_ENFORCE and _soccer_plan_rank(user_plan) < _soccer_plan_rank(row.get("plan_required")):
+                skipped += 1
+                continue
+            dt = _parse_iso_utc(row.get("kickoff_utc"))
+            if dt is None:
+                skipped += 1
+                continue
+            alert_dt = dt - timedelta(minutes=lead)
+            if alert_dt <= now_utc or await asyncio.to_thread(_soccer_alert_was_sent, chat_id, row["id"]):
+                skipped += 1
+                continue
+            name = f"soccer_alert:{chat_id}:{row['id']}"
+            for existing in application.job_queue.get_jobs_by_name(name):
+                existing.schedule_removal()
+            application.job_queue.run_once(
+                _send_soccer_alert_job,
+                when=alert_dt,
+                data={"chat_id": chat_id, "pick": row, "scheduled_for": alert_dt.astimezone(LOCAL_TZ).isoformat()},
+                name=name,
+                chat_id=chat_id,
+            )
+            scheduled += 1
+    return {"scheduled": scheduled, "skipped": skipped}
+
+
+# ---------------------------------------------------------------------------
 # v2.9.4 VISUAL MENU
 # ---------------------------------------------------------------------------
 
 MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
-        ["⚾ Picks de hoy", "📊 Estado"],
-        ["📈 Rendimiento", "🧮 Mercado"],
-        ["📋 Historial", "🔔 Alertas"],
-        ["👤 Mi cuenta", "⭐ Suscripción"],
-        ["⚾ Juegos MLB", "🧪 Más opciones"],
+        ["⚾ MLB", "⚽ Fútbol"],
+        ["🔔 Alertas", "👤 Mi cuenta"],
+        ["⭐ Suscripción"],
     ],
     resize_keyboard=True,
     is_persistent=True,
-    input_field_placeholder="Selecciona una opción de Triple Pick",
+    input_field_placeholder="Selecciona un deporte o una opción",
 )
 
 
 def _main_menu_keyboard_for(user_id=None):
     rows = [
-        ["⚾ Picks de hoy", "📊 Estado"],
-        ["📈 Rendimiento", "🧮 Mercado"],
-        ["📋 Historial", "🔔 Alertas"],
-        ["👤 Mi cuenta", "⭐ Suscripción"],
-        ["⚾ Juegos MLB", "🧪 Más opciones"],
+        ["⚾ MLB", "⚽ Fútbol"],
+        ["🔔 Alertas", "👤 Mi cuenta"],
+        ["⭐ Suscripción"],
     ]
     if user_id is not None and int(user_id) in SUBSCRIPTION_ADMIN_IDS:
         rows.append(["🛡️ Panel Admin"])
@@ -4280,7 +4705,7 @@ def _main_menu_keyboard_for(user_id=None):
         rows,
         resize_keyboard=True,
         is_persistent=True,
-        input_field_placeholder="Selecciona una opción de Triple Pick",
+        input_field_placeholder="Selecciona un deporte o una opción",
     )
 
 MORE_MENU_KEYBOARD = ReplyKeyboardMarkup(
@@ -4298,20 +4723,14 @@ MORE_MENU_KEYBOARD = ReplyKeyboardMarkup(
 
 def _menu_text():
     return (
-        f"⚾ MLB TRIPLE PICK v{BOT_VERSION}\n\n"
-        "Selecciona una opción del menú. No necesitas escribir comandos.\n\n"
-        "⚾ Picks de hoy — Triple Pick final\n"
-        "📊 Estado — Tracking Engine\n"
-        "📈 Rendimiento — Hit rate, ROI y Brier\n"
-        "🧮 Mercado — MODEL vs MARKET\n"
-        "📋 Historial — Picks registrados\n"
-        "🔔 Alertas — Telegram + SMS opcional 45 min antes\n"
-        "👤 Mi cuenta — Estado de tu membresía\n"
-        "⭐ Suscripción — FREE, PREMIUM y PRO\n"
-        "⚾ Juegos MLB — Cartelera de hoy\n"
-        "🧪 Más opciones — Herramientas avanzadas"
+        f"🏆 TRIPLE PICK v{BOT_VERSION} — MULTI-SPORT\n\n"
+        "Selecciona tu deporte. No necesitas escribir comandos.\n\n"
+        "⚾ MLB — motor, mercado, tracking y picks MLB\n"
+        "⚽ Fútbol — picks aprobados, Survival, Top Picks y Player Props\n"
+        "🔔 Alertas — avisos pregame\n"
+        "👤 Mi cuenta — estado de membresía\n"
+        "⭐ Suscripción — FREE, PREMIUM y PRO"
     )
-
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(_menu_text(), reply_markup=_main_menu_keyboard_for(update.effective_user.id if update.effective_user else None))
@@ -4336,8 +4755,18 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """Route visual keyboard labels to the existing command functions."""
     if await _handle_official_picks_input(update, context):
         return
+    if await _handle_soccer_picks_input(update, context):
+        return
     text = (update.message.text or "").strip()
     routes = {
+        "⚾ MLB": mlb_menu,
+        "⚽ Fútbol": soccer_menu,
+        "🔥 Picks Fútbol": soccer_picks,
+        "🛡️ Survival Fútbol": soccer_survival,
+        "⭐ Top Picks Fútbol": soccer_top,
+        "🎯 Player Props Fútbol": soccer_player_props,
+        "🏆 Ligas Fútbol": soccer_leagues,
+        "📊 Resultados Fútbol": soccer_results,
         "⚾ Picks de hoy": picks,
         "📊 Estado": trackstatus,
         "📈 Rendimiento": performance,
@@ -4366,6 +4795,10 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "🆔 Mi ID": myid,
         "🛡️ Panel Admin": admin_panel,
         "🎯 Picks oficiales": admin_official_picks_panel,
+        "⚽ Admin Fútbol": admin_soccer_panel,
+        "📋 Ver picks fútbol": admin_soccer_panel,
+        "📝 Cargar picks fútbol": admin_soccer_start_input,
+        "🗑️ Borrar picks fútbol": admin_soccer_clear,
         "📋 Ver picks oficiales": admin_official_picks_panel,
         "📝 Cargar 3 picks": admin_official_start_input,
         "🤖 Usar picks del modelo": admin_official_use_model,
@@ -4827,7 +5260,9 @@ async def post_init_schedule_alerts(application):
     """Rebuild future alert jobs after a Railway restart/deploy."""
     try:
         info = await schedule_alert_jobs(application)
-        print(f"🔔 Alertas restauradas al iniciar: {info['scheduled']} programada(s).")
+        soccer_info = await schedule_soccer_alert_jobs(application)
+        print(f"🔔 Alertas MLB restauradas al iniciar: {info['scheduled']} programada(s).")
+        print(f"⚽ Alertas fútbol restauradas al iniciar: {soccer_info['scheduled']} programada(s).")
     except Exception as exc:
         print(f"⚠️ No pude restaurar alertas al iniciar: {exc}")
 
@@ -4858,6 +5293,9 @@ def main():
     app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
     app.add_handler(CommandHandler("mlb", mlb))
+    app.add_handler(CommandHandler("soccer", soccer_menu))
+    app.add_handler(CommandHandler("soccerpicks", soccer_picks))
+    app.add_handler(CommandHandler("socceradmin", admin_soccer_panel))
     app.add_handler(CommandHandler("picks", picks))
     app.add_handler(CommandHandler("pool", pool))
     app.add_handler(CommandHandler("market", market))
@@ -4922,7 +5360,7 @@ def main():
     print(
         "📱 Twilio SMS: " + ("CONFIGURADO" if _twilio_configured() else "NO CONFIGURADO")
     )
-    print(f"🤖 Bot MLB Triple Pick v{BOT_VERSION} iniciado...")
+    print(f"🤖 Triple Pick Multi-Sport v{BOT_VERSION} iniciado...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

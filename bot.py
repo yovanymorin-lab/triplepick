@@ -76,7 +76,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.5.2"
+BOT_VERSION = "3.5.3"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -5646,10 +5646,19 @@ def _live_pick_monitor_markup():
 
 
 async def live_pick_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Always answer the live-picks button, even if one live feed is unavailable."""
     if not await _premium_gate(update, "FREE"):
         return
     user_id = update.effective_user.id if update.effective_user else 0
-    text = await asyncio.to_thread(_live_pick_monitor_text, user_id)
+    try:
+        text = await asyncio.to_thread(_live_pick_monitor_text, user_id)
+    except Exception as exc:
+        print(f"Live pick monitor error: {exc}")
+        text = (
+            "📡 TRIPLE PICK — MONITOR EN VIVO\n\n"
+            "⚠️ No pude actualizar los marcadores en este momento.\n"
+            "El monitor sí está activo; pulsa 🔄 Actualizar todos para intentarlo nuevamente."
+        )
     await update.effective_message.reply_text(text, reply_markup=_live_pick_monitor_markup())
 
 
@@ -6148,7 +6157,39 @@ async def daily_picks_hub(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Route visual keyboard labels to the existing command functions."""
+    """Route visual keyboard labels to the existing command functions.
+
+    Navigation buttons have priority over pending admin-input states so an old
+    import session can never make the visual menu appear unresponsive.
+    """
+    text = (update.message.text or "").strip()
+
+    # High-priority navigation. These must always work even when an admin has a
+    # stale awaiting_* flag in context.user_data.
+    priority_routes = {
+        "📡 Picks en vivo": live_pick_monitor,
+        "🎯 Picks del día": daily_picks_hub,
+        "🔥 Picks del día": daily_picks_hub,
+        "📅 Picks del día": daily_picks_hub,
+        "Picks del día": daily_picks_hub,
+        "Picks del dia": daily_picks_hub,
+        "⬅️ Menú principal": menu,
+        "⚾ MLB": mlb_menu,
+        "⚽ Fútbol": soccer_menu,
+        "🏀 NBA": nba_menu,
+    }
+    priority_handler = priority_routes.get(text)
+    if priority_handler is not None:
+        # Leaving a data-entry screen by navigation also clears stale input modes.
+        for key in (
+            "awaiting_mlb_master_import",
+            "awaiting_official_picks",
+            "awaiting_soccer_picks",
+            "awaiting_nba_picks",
+        ):
+            context.user_data.pop(key, None)
+        await priority_handler(update, context)
+        return
     if await _handle_mlb_master_import(update, context):
         return
     if await _handle_official_picks_input(update, context):
@@ -6157,7 +6198,6 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     if await _handle_nba_picks_input(update, context):
         return
-    text = (update.message.text or "").strip()
     routes = {
         "⚾ MLB": mlb_menu,
         "⚽ Fútbol": soccer_menu,

@@ -76,7 +76,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.5.4"
+BOT_VERSION = "3.5.5"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -6831,6 +6831,49 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def adminnotifytest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Prueba el canal privado de notificaciones de membresía para administradores."""
+    user_id = int(update.effective_user.id)
+    chat_id = int(update.effective_chat.id)
+
+    if not SUBSCRIPTION_ADMIN_IDS:
+        await update.message.reply_text(
+            "❌ SUBSCRIPTION_ADMIN_IDS no está configurado en Railway.\n\n"
+            f"Tu Telegram ID es: {user_id}\n"
+            "Configura en Railway:\n"
+            f"SUBSCRIPTION_ADMIN_IDS={user_id}"
+        )
+        return
+
+    if user_id not in SUBSCRIPTION_ADMIN_IDS:
+        configured = ", ".join(str(x) for x in sorted(SUBSCRIPTION_ADMIN_IDS))
+        await update.message.reply_text(
+            "❌ Tu usuario no figura como administrador de suscripciones.\n\n"
+            f"Tu Telegram ID: {user_id}\n"
+            f"Configurados: {configured}\n\n"
+            "Corrige SUBSCRIPTION_ADMIN_IDS en Railway y vuelve a desplegar."
+        )
+        return
+
+    test_text = (
+        "🧪 PRUEBA DE NOTIFICACIÓN ADMIN\n\n"
+        "✅ El canal de notificaciones de suscripciones está funcionando.\n"
+        f"🆔 Admin ID: {user_id}\n"
+        f"💬 Chat ID: {chat_id}"
+    )
+    try:
+        await context.bot.send_message(chat_id=user_id, text=test_text)
+        await update.message.reply_text(
+            "✅ Prueba enviada. Debes haber recibido el mensaje privado de administrador."
+        )
+    except Exception as exc:
+        print(f"Admin notify test error ({user_id}): {exc}")
+        await update.message.reply_text(
+            "❌ No pude enviarte la notificación de prueba.\n"
+            f"Error: {exc}"
+        )
+
+
 async def autostatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     estado = "ACTIVO" if AUTO_CHAT_ID else "PENDIENTE DE CONFIGURACIÓN"
     await update.message.reply_text(
@@ -6921,6 +6964,7 @@ def main():
     app.add_handler(CommandHandler("calibration", calibration))
     app.add_handler(CommandHandler("history", history))
     app.add_handler(CommandHandler("myid", myid))
+    app.add_handler(CommandHandler("adminnotifytest", adminnotifytest))
     app.add_handler(CommandHandler("autostatus", autostatus))
     app.add_handler(CommandHandler("alerts", alerts_menu))
     app.add_handler(CommandHandler("alertson", alerts_enable))

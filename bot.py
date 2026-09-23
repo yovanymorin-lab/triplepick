@@ -76,7 +76,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.5.5"
+BOT_VERSION = "3.5.6"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -3356,21 +3356,71 @@ def _display_telegram_user(user):
     return first_name, handle
 
 
+def _admin_membership_notification_exists(event_key):
+    """Return True when an admin membership event was already delivered."""
+    if not event_key:
+        return False
+    with _tracking_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM admin_membership_notifications WHERE event_key=? LIMIT 1",
+            (str(event_key),),
+        ).fetchone()
+        return row is not None
+
+
+def _record_admin_membership_notification(event_key):
+    """Persist an admin membership event only after at least one successful delivery."""
+    if not event_key:
+        return False
+    with _tracking_connection() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO admin_membership_notifications(event_key, created_at) VALUES (?, ?)",
+            (str(event_key), _subscription_now_ts()),
+        )
+        return int(cur.rowcount or 0) > 0
+
+
 async def _notify_subscription_admins(context, text, event_key=None):
-    """Send a private membership event to every configured Triple Pick admin."""
+    """Send a private membership event to every configured Triple Pick admin.
+
+    Delivery is considered complete only after at least one administrator
+    successfully receives the Telegram message. Failed sends are therefore
+    eligible for retry instead of being permanently suppressed.
+    """
     if not SUBSCRIPTION_ADMIN_IDS:
+        print("Admin membership notification skipped: SUBSCRIPTION_ADMIN_IDS is empty")
         return 0
+
     if event_key:
-        claimed = await asyncio.to_thread(_claim_admin_membership_notification, event_key)
-        if not claimed:
+        already_sent = await asyncio.to_thread(
+            _admin_membership_notification_exists, event_key
+        )
+        if already_sent:
             return 0
+
     sent = 0
     for admin_id in sorted(SUBSCRIPTION_ADMIN_IDS):
         try:
             await context.bot.send_message(chat_id=int(admin_id), text=text)
             sent += 1
+            print(
+                f"Admin membership notification delivered "
+                f"(admin={admin_id}, event={event_key or 'no-key'})"
+            )
         except Exception as exc:
-            print(f"Admin membership notification error ({admin_id}): {exc}")
+            print(
+                f"Admin membership notification error "
+                f"(admin={admin_id}, event={event_key or 'no-key'}): {exc}"
+            )
+
+    if sent > 0 and event_key:
+        await asyncio.to_thread(_record_admin_membership_notification, event_key)
+    elif sent == 0:
+        print(
+            f"Admin membership notification NOT delivered "
+            f"(event={event_key or 'no-key'}); it will remain retryable."
+        )
+
     return sent
 
 

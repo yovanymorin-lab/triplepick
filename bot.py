@@ -76,7 +76,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.5.3"
+BOT_VERSION = "3.5.4"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -3138,6 +3138,11 @@ def init_membership_db():
 
             CREATE INDEX IF NOT EXISTS idx_membership_trial_expiry
             ON membership_users(trial_expires_at);
+
+            CREATE TABLE IF NOT EXISTS admin_membership_notifications (
+                event_key TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL
+            );
             """
         )
 
@@ -3330,6 +3335,107 @@ def _format_expiry(expires_at):
     if not expires_at:
         return "N/D"
     return datetime.fromtimestamp(int(expires_at), tz=LOCAL_TZ).strftime("%d %b %Y, %I:%M %p")
+
+
+def _claim_admin_membership_notification(event_key):
+    """Return True exactly once for each membership admin-notification event."""
+    if not event_key:
+        return False
+    with _tracking_connection() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO admin_membership_notifications(event_key, created_at) VALUES (?, ?)",
+            (str(event_key), _subscription_now_ts()),
+        )
+        return int(cur.rowcount or 0) > 0
+
+
+def _display_telegram_user(user):
+    username = getattr(user, "username", None)
+    first_name = getattr(user, "first_name", None) or "Sin nombre"
+    handle = f"@{username}" if username else "sin @usuario"
+    return first_name, handle
+
+
+async def _notify_subscription_admins(context, text, event_key=None):
+    """Send a private membership event to every configured Triple Pick admin."""
+    if not SUBSCRIPTION_ADMIN_IDS:
+        return 0
+    if event_key:
+        claimed = await asyncio.to_thread(_claim_admin_membership_notification, event_key)
+        if not claimed:
+            return 0
+    sent = 0
+    for admin_id in sorted(SUBSCRIPTION_ADMIN_IDS):
+        try:
+            await context.bot.send_message(chat_id=int(admin_id), text=text)
+            sent += 1
+        except Exception as exc:
+            print(f"Admin membership notification error ({admin_id}): {exc}")
+    return sent
+
+
+def _recent_expired_memberships(window_seconds=7200):
+    """Return membership expirations from a recent window for one-time admin alerts."""
+    now_ts = _subscription_now_ts()
+    start_ts = now_ts - max(3600, int(window_seconds))
+    events = []
+    with _tracking_connection() as conn:
+        free_rows = conn.execute(
+            """
+            SELECT user_id, username, first_name, trial_expires_at AS expires_at
+            FROM membership_users
+            WHERE trial_expires_at > ? AND trial_expires_at <= ?
+            """,
+            (start_ts, now_ts),
+        ).fetchall()
+        paid_rows = conn.execute(
+            """
+            SELECT user_id, username, first_name, plan, expires_at
+            FROM subscriptions
+            WHERE expires_at > ? AND expires_at <= ?
+              AND plan IN ('PREMIUM','PRO')
+            """,
+            (start_ts, now_ts),
+        ).fetchall()
+
+    for row in free_rows:
+        events.append({
+            "key": f"expired:FREE:{int(row['user_id'])}:{int(row['expires_at'])}",
+            "user_id": int(row["user_id"]),
+            "username": row["username"],
+            "first_name": row["first_name"],
+            "plan": "FREE",
+            "expires_at": int(row["expires_at"]),
+        })
+    for row in paid_rows:
+        events.append({
+            "key": f"expired:{row['plan']}:{int(row['user_id'])}:{int(row['expires_at'])}",
+            "user_id": int(row["user_id"]),
+            "username": row["username"],
+            "first_name": row["first_name"],
+            "plan": row["plan"],
+            "expires_at": int(row["expires_at"]),
+        })
+    return events
+
+
+async def admin_membership_expiry_watch(context: ContextTypes.DEFAULT_TYPE):
+    """Notify admins once when FREE/PREMIUM/PRO memberships expire."""
+    try:
+        events = await asyncio.to_thread(_recent_expired_memberships)
+        for event in events:
+            handle = f"@{event['username']}" if event.get("username") else "sin @usuario"
+            name = event.get("first_name") or "Sin nombre"
+            text = (
+                "⛔ MEMBRESÍA VENCIDA\n\n"
+                f"👤 Usuario: {name} ({handle})\n"
+                f"🆔 Telegram ID: {event['user_id']}\n"
+                f"📦 Plan: {event['plan']}\n"
+                f"📅 Venció: {_format_expiry(event['expires_at'])}"
+            )
+            await _notify_subscription_admins(context, text, event_key=event["key"])
+    except Exception as exc:
+        print(f"Membership expiry watch error: {exc}")
 
 
 
@@ -4408,6 +4514,19 @@ async def membership_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"Finaliza: {_format_expiry(row['trial_expires_at'])}\n\n"
                 "Ahora puedes entrar a 👤 Mi cuenta para comprobar tu suscripción."
             )
+            name, handle = _display_telegram_user(query.from_user)
+            admin_text = (
+                "🆕 NUEVA SUSCRIPCIÓN FREE\n\n"
+                f"👤 Usuario: {name} ({handle})\n"
+                f"🆔 Telegram ID: {query.from_user.id}\n"
+                "📦 Plan: FREE — 30 DÍAS\n"
+                f"📅 Finaliza: {_format_expiry(row['trial_expires_at'])}"
+            )
+            await _notify_subscription_admins(
+                context,
+                admin_text,
+                event_key=f"activated:FREE:{query.from_user.id}:{int(row['trial_started_at'])}",
+            )
         await context.bot.send_message(
             chat_id=query.message.chat_id,
             text=text,
@@ -4504,6 +4623,25 @@ async def successful_payment_handler(update: Update, context: ContextTypes.DEFAU
         await update.effective_message.reply_text("⚠️ Pago recibido, pero no pude asociarlo a un plan válido.")
         return
     plan, expires_at = saved
+    user = update.effective_user
+    name, handle = _display_telegram_user(user)
+    recurring = bool(getattr(payment, "is_recurring", False))
+    first_recurring = bool(getattr(payment, "is_first_recurring", False))
+    event_title = "🔄 RENOVACIÓN DE SUSCRIPCIÓN" if recurring and not first_recurring else "💳 NUEVA SUSCRIPCIÓN"
+    admin_text = (
+        f"{event_title}\n\n"
+        f"👤 Usuario: {name} ({handle})\n"
+        f"🆔 Telegram ID: {user.id}\n"
+        f"📦 Plan: {plan}\n"
+        f"⭐ Pago: {int(payment.total_amount)} Stars\n"
+        f"📅 Válido hasta: {_format_expiry(expires_at)}"
+    )
+    charge_id = getattr(payment, "telegram_payment_charge_id", "") or f"{user.id}:{plan}:{expires_at}"
+    await _notify_subscription_admins(
+        context,
+        admin_text,
+        event_key=f"payment:{charge_id}",
+    )
     await update.effective_message.reply_text(
         "✅ SUSCRIPCIÓN ACTIVADA\n\n"
         f"Plan: {plan}\n"
@@ -6828,6 +6966,14 @@ def main():
                 f"🧾 Auto-settle programado diariamente a "
                 f"{TRACK_SETTLE_HOUR:02d}:{TRACK_SETTLE_MINUTE:02d} ({AUTO_TZ})"
             )
+
+        app.job_queue.run_repeating(
+            admin_membership_expiry_watch,
+            interval=3600,
+            first=90,
+            name="triple_pick_membership_expiry_watch",
+        )
+        print("💳 Monitor de vencimientos de membresía: ACTIVO (cada 60 min)")
     else:
         print(
             "⚠️ JobQueue no disponible. Usa "

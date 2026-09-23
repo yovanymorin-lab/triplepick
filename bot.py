@@ -76,7 +76,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.4.1"
+BOT_VERSION = "3.4.2"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -4533,10 +4533,11 @@ async def _premium_gate(update, required="PREMIUM"):
 
 SOCCER_MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
-        ["🔥 Picks Fútbol", "🛡️ Survival Fútbol"],
-        ["⭐ Top Picks Fútbol", "🎯 Player Props Fútbol"],
-        ["🏆 Ligas Fútbol", "📊 Resultados Fútbol"],
-        ["🔴 En vivo Fútbol", "⬅️ Menú principal"],
+        ["⚽ Partidos Fútbol", "🔴 En vivo Fútbol"],
+        ["🔥 Picks Fútbol", "📊 Resultados Fútbol"],
+        ["🛡️ Survival Fútbol", "⭐ Top Picks Fútbol"],
+        ["🎯 Player Props Fútbol", "🏆 Ligas Fútbol"],
+        ["⬅️ Menú principal"],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -4545,10 +4546,10 @@ SOCCER_MENU_KEYBOARD = ReplyKeyboardMarkup(
 
 MLB_MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
-        ["⚾ Picks de hoy", "⚾ Juegos MLB"],
-        ["🔴 En vivo MLB", "📊 Estado"],
-        ["📈 Rendimiento", "🧮 Mercado"],
-        ["📋 Historial", "🧪 Más opciones"],
+        ["⚾ Juegos MLB", "🔴 En vivo MLB"],
+        ["🔥 Picks MLB", "📊 Resultados MLB"],
+        ["🧮 Mercado MLB", "📈 Rendimiento MLB"],
+        ["📋 Historial MLB", "🧪 Más opciones"],
         ["⬅️ Menú principal"],
     ],
     resize_keyboard=True,
@@ -4975,6 +4976,37 @@ async def schedule_soccer_alert_jobs(application, pick_date=None):
     return {"scheduled": scheduled, "skipped": skipped}
 
 
+async def mlb_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        init_tracking_db()
+        with _tracking_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT pick_date, away, home, selection, product, result, odds, units_won_lost
+                FROM tracked_picks
+                WHERE official=1 AND result <> 'PENDING'
+                ORDER BY pick_date DESC, id DESC
+                LIMIT 30
+                """
+            ).fetchall()
+    except Exception as exc:
+        await update.effective_message.reply_text(f"❌ Tracking DB error: {exc}", reply_markup=MLB_MENU_KEYBOARD)
+        return
+    if not rows:
+        text = "📊 RESULTADOS — MLB\n\nAún no hay resultados oficiales liquidados."
+    else:
+        lines = ["📊 RESULTADOS — MLB", ""]
+        for r in rows:
+            icon = "✅" if r["result"] == "WIN" else ("❌" if r["result"] == "LOSS" else "➖")
+            odds = _format_american(r["odds"])
+            lines.append(
+                f"{icon} {r['pick_date']} | {r['selection']} ({odds}) | {r['product']}\n"
+                f"   {r['away']} vs {r['home']} | {_format_units(r['units_won_lost'])}"
+            )
+        text = "\n\n".join(lines)
+    await update.effective_message.reply_text(text, reply_markup=MLB_MENU_KEYBOARD)
+
+
 # ---------------------------------------------------------------------------
 # v3.4 LIVE SCORES + NBA MODULE
 # ---------------------------------------------------------------------------
@@ -5101,6 +5133,58 @@ def _nba_live_text():
     return f"🔴 NBA EN VIVO\n📅 {fecha}\n\n{body}\n\n🔄 Actualizado: {_format_live_stamp()}"
 
 
+def _soccer_games_text():
+    fecha = local_now().strftime("%Y-%m-%d")
+    seen = set()
+    games = []
+    errors = 0
+    for league in SOCCER_LIVE_LEAGUES:
+        data = _espn_get_json(f"soccer/{league}/scoreboard", {"dates": fecha.replace("-", "")})
+        if data is None:
+            errors += 1
+            continue
+        league_name = ((data.get("leagues") or [{}])[0].get("name") or league)
+        for event in data.get("events", []):
+            event_id = event.get("id")
+            if event_id and event_id in seen:
+                continue
+            if event_id:
+                seen.add(event_id)
+            comp, away, home = _espn_competitors(event)
+            away_name = away.get("team", {}).get("displayName", "Visitante")
+            home_name = home.get("team", {}).get("displayName", "Local")
+            status = event.get("status", {})
+            stype = status.get("type", {})
+            state = stype.get("state")
+            if state == "pre":
+                dt = _parse_iso_utc(event.get("date"))
+                when = dt.astimezone(LOCAL_TZ).strftime("%I:%M %p").lstrip("0") if dt else (stype.get("shortDetail") or "Programado")
+                score = f"{away_name} vs {home_name}"
+            elif state == "in":
+                when = stype.get("shortDetail") or status.get("displayClock") or "En vivo"
+                score = f"{away_name} {away.get('score', '0')} — {home.get('score', '0')} {home_name}"
+            else:
+                when = stype.get("shortDetail") or stype.get("detail") or "Final"
+                score = f"{away_name} {away.get('score', '0')} — {home.get('score', '0')} {home_name}"
+            games.append((event.get("date") or "", league_name, when, score))
+    if not games:
+        if errors == len(SOCCER_LIVE_LEAGUES):
+            body = "❌ No pude consultar el calendario de fútbol en este momento."
+        else:
+            body = "ℹ️ No hay partidos de las ligas configuradas para hoy."
+        return f"⚽ FÚTBOL — PARTIDOS DE HOY\n📅 {fecha}\n\n{body}"
+    games.sort(key=lambda x: x[0])
+    lines = ["⚽ FÚTBOL — PARTIDOS DE HOY", f"📅 {fecha}", ""]
+    for _date, league_name, when, score in games:
+        lines.append(f"⚽ {score}\n   🕐 {when} · {league_name}")
+    return "\n\n".join(lines)
+
+
+async def soccer_games(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = await asyncio.to_thread(_soccer_games_text)
+    await update.effective_message.reply_text(text, reply_markup=SOCCER_MENU_KEYBOARD)
+
+
 def _soccer_live_text():
     fecha = local_now().strftime("%Y-%m-%d")
     seen = set()
@@ -5174,9 +5258,9 @@ async def live_refresh_callback(update: Update, context: ContextTypes.DEFAULT_TY
 NBA_MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["🏀 Juegos NBA", "🔴 En vivo NBA"],
-        ["🔥 Picks NBA", "🛡️ Survival NBA"],
-        ["⭐ Top Picks NBA", "🎯 Player Props NBA"],
-        ["📊 Resultados NBA"],
+        ["🔥 Picks NBA", "📊 Resultados NBA"],
+        ["🛡️ Survival NBA", "⭐ Top Picks NBA"],
+        ["🎯 Player Props NBA"],
         ["⬅️ Menú principal"],
     ],
     resize_keyboard=True,
@@ -5631,6 +5715,7 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "⭐ Top Picks NBA": nba_top,
         "🎯 Player Props NBA": nba_player_props,
         "📊 Resultados NBA": nba_results,
+        "⚽ Partidos Fútbol": soccer_games,
         "🔥 Picks Fútbol": soccer_picks,
         "🛡️ Survival Fútbol": soccer_survival,
         "⭐ Top Picks Fútbol": soccer_top,
@@ -5638,11 +5723,16 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "🏆 Ligas Fútbol": soccer_leagues,
         "📊 Resultados Fútbol": soccer_results,
         "🔴 En vivo Fútbol": soccer_live,
+        "🔥 Picks MLB": picks,
         "⚾ Picks de hoy": picks,
         "🔴 En vivo MLB": mlb_live,
+        "📊 Resultados MLB": mlb_results,
         "📊 Estado": trackstatus,
+        "📈 Rendimiento MLB": performance,
         "📈 Rendimiento": performance,
+        "🧮 Mercado MLB": market,
         "🧮 Mercado": market,
+        "📋 Historial MLB": history,
         "📋 Historial": history,
         "🔔 Alertas": alerts_menu,
         "👤 Mi cuenta": account_command,

@@ -76,7 +76,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.4.0"
+BOT_VERSION = "3.4.1"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -4320,44 +4320,59 @@ async def subscription_command(update: Update, context: ContextTypes.DEFAULT_TYP
     await _send_plans(update.effective_chat.id, context)
 
 
-async def account_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    user_id = user.id
+async def _build_account_panel_text(user_id, chat_id):
+    """Build one consistent Mi Cuenta panel for commands and inline callbacks."""
     plan, row = await asyncio.to_thread(_best_active_plan, user_id)
+    alerts = await asyncio.to_thread(_get_alert_subscription, chat_id)
+    alerts_on = bool(alerts.get("enabled"))
+    lead = int(alerts.get("lead_minutes") or ALERT_LEAD_MINUTES)
+
     if plan == "NONE":
-        text = (
-            "👤 MI CUENTA\n\n"
+        membership = (
             "Plan: SIN SUSCRIPCIÓN\n"
-            "Estado: ⚪ NO ACTIVADO\n\n"
+            "Estado: ⚪ NO ACTIVADO\n"
             "Pulsa ⭐ Suscripción y después 🆓 SUSCRIBIRME FREE — 30 DÍAS."
         )
     elif plan == "FREE":
-        expiry = _format_expiry(row["trial_expires_at"])
-        remaining = _remaining_trial_text(row["trial_expires_at"])
-        text = (
-            "👤 MI CUENTA\n\n"
+        membership = (
             "Plan: FREE — PRUEBA 30 DÍAS\n"
             "Estado: 🟢 ACTIVO\n"
-            f"Tiempo restante: {remaining}\n"
-            f"Finaliza: {expiry}\n\n"
-            "Después puedes continuar con PREMIUM ($10/mes) o PRO ($20/mes)."
+            f"Tiempo restante: {_remaining_trial_text(row['trial_expires_at'])}\n"
+            f"Finaliza: {_format_expiry(row['trial_expires_at'])}"
         )
     elif plan == "EXPIRED":
-        text = (
-            "👤 MI CUENTA\n\n"
+        membership = (
             "Plan: FREE\n"
-            "Estado: 🔴 PRUEBA FINALIZADA\n\n"
-            "Elige PREMIUM ($10/mes) o PRO ($20/mes) para continuar."
+            "Estado: 🔴 PRUEBA FINALIZADA\n"
+            "PREMIUM: $10/mes | PRO: $20/mes"
         )
     else:
         expiry = _format_expiry(row["expires_at"]) if row is not None else "ADMIN"
-        text = (
-            "👤 MI CUENTA\n\n"
+        membership = (
             f"Plan: {plan}\n"
             "Estado: 🟢 ACTIVO\n"
-            f"Válido hasta: {expiry}\n"
-            "Renovación: automática mientras la suscripción siga activa en Telegram."
+            f"Válido hasta: {expiry}"
         )
+
+    sport_state = "ON" if alerts_on else "OFF"
+    alert_state = "✅ ACTIVADAS" if alerts_on else "⛔ DESACTIVADAS"
+    return (
+        "👤 MI CUENTA\n\n"
+        f"{membership}\n\n"
+        "🔔 ALERTAS\n"
+        f"Estado: {alert_state}\n"
+        f"⚾ MLB: {sport_state}\n"
+        f"⚽ Fútbol: {sport_state}\n"
+        f"🏀 NBA: {sport_state}\n"
+        f"⏰ Aviso: {lead} min antes\n\n"
+        "Una sola activación controla las alertas de los tres deportes."
+    )
+
+
+async def account_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat = update.effective_chat
+    text = await _build_account_panel_text(user.id, chat.id)
     await update.effective_message.reply_text(text, reply_markup=_membership_keyboard())
 
 
@@ -4401,35 +4416,14 @@ async def membership_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if action == "tp_account":
-        user_id = query.from_user.id
-        plan, row = await asyncio.to_thread(_best_active_plan, user_id)
-        if plan == "NONE":
-            text = (
-                "👤 MI CUENTA\n\n"
-                "Plan: SIN SUSCRIPCIÓN\n"
-                "Estado: ⚪ NO ACTIVADO\n\n"
-                "Pulsa ⭐ Ver planes para activar FREE por 30 días."
-            )
-        elif plan == "FREE":
-            text = (
-                "👤 MI CUENTA\n\n"
-                "Plan: FREE — PRUEBA 30 DÍAS\n"
-                "Estado: 🟢 ACTIVO\n"
-                f"Tiempo restante: {_remaining_trial_text(row['trial_expires_at'])}\n"
-                f"Finaliza: {_format_expiry(row['trial_expires_at'])}"
-            )
-        elif plan == "EXPIRED":
-            text = (
-                "👤 MI CUENTA\n\n"
-                "Plan: FREE\n"
-                "Estado: 🔴 PRUEBA FINALIZADA\n\n"
-                "PREMIUM: $10/mes | PRO: $20/mes"
-            )
-        else:
-            expiry = _format_expiry(row["expires_at"]) if row is not None else "ADMIN"
-            text = f"👤 MI CUENTA\n\nPlan: {plan}\nEstado: 🟢 ACTIVO\nVálido hasta: {expiry}"
-        await context.bot.send_message(chat_id=query.message.chat_id, text=text, reply_markup=_membership_keyboard())
+        text = await _build_account_panel_text(query.from_user.id, query.message.chat_id)
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=text,
+            reply_markup=_membership_keyboard(),
+        )
         return
+
 
     plan = None
     stars = None
@@ -5592,7 +5586,7 @@ def _menu_text():
         "⚽ Fútbol — picks aprobados, Survival, Top Picks y Player Props\n"
         "🏀 NBA — juegos, picks, props y marcadores en vivo\n"
         "🔔 Alertas — avisos pregame\n"
-        "👤 Mi cuenta — estado de membresía\n"
+        "👤 Mi cuenta — membresía y estado de alertas\n"
         "⭐ Suscripción — FREE, PREMIUM y PRO"
     )
 

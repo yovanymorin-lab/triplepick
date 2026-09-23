@@ -69,7 +69,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.2.0"
+BOT_VERSION = "3.3.0"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -3840,8 +3840,9 @@ def _format_official_picks_text(rows, title="🎯 PICKS OFICIALES TRIPLE PICK"):
 
 OFFICIAL_PICKS_ADMIN_KEYBOARD = ReplyKeyboardMarkup(
     [
-        ["📋 Ver picks oficiales", "📝 Cargar 3 picks"],
-        ["🤖 Usar picks del modelo", "🗑️ Borrar picks oficiales"],
+        ["📋 Ver picks oficiales", "📥 Importar jornada MLB"],
+        ["📝 Cargar 3 picks", "🤖 Usar picks del modelo"],
+        ["🗑️ Borrar picks oficiales"],
         ["⬅️ Panel Admin"],
     ],
     resize_keyboard=True,
@@ -3864,6 +3865,203 @@ async def admin_official_picks_panel(update: Update, context: ContextTypes.DEFAU
         "🤖 Usar picks del modelo: toma el Triple Pick calculado por el bot y lo fija como oficial.",
         reply_markup=OFFICIAL_PICKS_ADMIN_KEYBOARD,
     )
+
+
+def _parse_mlb_master_block(text):
+    """Parse a publication-ready MLB Triple Pick block.
+
+    Accepted format:
+      DATE: YYYY-MM-DD
+      Away vs Home | Selection
+      Away vs Home | Selection
+      Away vs Home | Selection
+
+    A line containing only Selection is also accepted for backwards compatibility.
+    The MLB schedule remains the source of truth for gamePk, teams, start time and pitchers.
+    """
+    raw_lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    if not raw_lines:
+        return None, [], [{"line": 0, "text": "", "error": "bloque vacío"}]
+
+    pick_date = local_now().strftime("%Y-%m-%d")
+    body = raw_lines
+    mdate = re.match(r"^DATE\s*:\s*(\d{4}-\d{2}-\d{2})$", raw_lines[0], flags=re.I)
+    if mdate:
+        pick_date = mdate.group(1)
+        try:
+            datetime.strptime(pick_date, "%Y-%m-%d")
+        except ValueError:
+            return None, [], [{"line": 1, "text": raw_lines[0], "error": "DATE inválida"}]
+        body = raw_lines[1:]
+
+    if len(body) != 3:
+        return pick_date, [], [{
+            "line": 0,
+            "text": "",
+            "error": f"se requieren exactamente 3 picks; recibidos: {len(body)}",
+        }]
+
+    games = _today_schedule_games(pick_date)
+    if not games:
+        return pick_date, [], [{"line": 0, "text": "", "error": "no pude obtener la cartelera MLB para esa fecha"}]
+
+    resolved = []
+    errors = []
+    used_games = set()
+    offset = 2 if mdate else 1
+
+    for idx, raw in enumerate(body, start=offset):
+        matchup_text = None
+        pick_text = raw
+        if "|" in raw:
+            parts = [part.strip() for part in raw.split("|")]
+            if len(parts) != 2 or not parts[0] or not parts[1]:
+                errors.append({"line": idx, "text": raw, "error": "usa: Visitante vs Local | Selección"})
+                continue
+            matchup_text, pick_text = parts
+
+        item, error = _parse_official_pick(pick_text, games)
+        if item is None:
+            errors.append({"line": idx, "text": raw, "error": error or "pick no reconocido"})
+            continue
+
+        if matchup_text:
+            mm = re.match(r"^(.+?)\s+vs\.?\s+(.+?)$", matchup_text, flags=re.I)
+            if not mm:
+                errors.append({"line": idx, "text": raw, "error": "matchup inválido; usa Visitante vs Local"})
+                continue
+            matchup = _resolve_official_matchup(mm.group(1), mm.group(2), games)
+            if not matchup:
+                errors.append({"line": idx, "text": raw, "error": "partido no encontrado de forma única en MLB"})
+                continue
+            if int(matchup["game_pk"]) != int(item["game_pk"]):
+                errors.append({"line": idx, "text": raw, "error": "la selección no pertenece al partido escrito"})
+                continue
+
+        if item["game_pk"] in used_games:
+            errors.append({"line": idx, "text": raw, "error": f"partido duplicado: {item['away']} vs {item['home']}"})
+            continue
+        used_games.add(item["game_pk"])
+        resolved.append(item)
+
+    return pick_date, resolved, errors
+
+
+def _commit_mlb_master_import(pick_date, resolved, admin_user_id):
+    """Persist a fully validated MLB master import atomically using the existing official tables."""
+    if len(resolved) != 3:
+        return False, "La importación validada debe contener exactamente 3 picks."
+    now_iso = local_now().isoformat()
+    with _tracking_connection() as conn:
+        conn.execute(
+            "UPDATE tracked_picks SET official=0 WHERE pick_date=? AND source IN ('TRIPLE_PICK','TRIPLE_PICK_FALLBACK')",
+            (pick_date,),
+        )
+        conn.execute("DELETE FROM official_daily_picks WHERE pick_date=?", (pick_date,))
+        conn.execute(
+            "DELETE FROM tracked_picks WHERE pick_date=? AND source='CHANNEL_OFFICIAL' AND result='PENDING'",
+            (pick_date,),
+        )
+        for slot, item in enumerate(resolved, 1):
+            conn.execute(
+                """
+                INSERT INTO official_daily_picks (
+                    pick_date, slot, game_pk, game_date, away, home, selection, pitcher,
+                    pick_text, market_family, line, created_by, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    pick_date, slot, item["game_pk"], item["game_date"], item["away"], item["home"],
+                    item["selection"], item["pitcher"], item["pick_text"], item["market_family"],
+                    item["line"], int(admin_user_id), now_iso, now_iso,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO tracked_picks (
+                    created_at, pick_date, game_pk, game_date, away, home, selection,
+                    product, source, official, market_family, line, odds, book,
+                    model_version, bot_version, result, units_risked, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'OFFICIAL', 'CHANNEL_OFFICIAL', 1,
+                          ?, ?, NULL, NULL, 'CHANNEL_OFFICIAL', ?,
+                          'PENDING', 1.0, 'MLB master import confirmed by admin')
+                """,
+                (
+                    now_iso, pick_date, item["game_pk"], item["game_date"], item["away"], item["home"],
+                    item["selection"], item["market_family"], item["line"], BOT_VERSION,
+                ),
+            )
+    return True, "OK"
+
+
+async def admin_mlb_master_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user is None or int(user.id) not in SUBSCRIPTION_ADMIN_IDS:
+        await update.effective_message.reply_text("⛔ Acceso exclusivo para administradores.")
+        return
+    context.user_data["awaiting_mlb_master_import"] = True
+    context.user_data.pop("awaiting_official_picks", None)
+    await update.effective_message.reply_text(
+        "📥 IMPORTAR JORNADA MLB\n\n"
+        "Pega el bloque completo con exactamente 3 picks oficiales.\n\n"
+        "Formato recomendado:\n"
+        "DATE: 2026-09-24\n\n"
+        "Baltimore Orioles vs New York Yankees | Yankees ML\n"
+        "Milwaukee Brewers vs Philadelphia Phillies | Brewers vs Phillies Under 8.5\n"
+        "Los Angeles Dodgers vs San Diego Padres | Dodgers -1.5\n\n"
+        "El bot obtiene automáticamente gamePk, horario y abridores desde MLB.\n"
+        "Si una línea falla, NO publica ninguna.\n\n"
+        "También puedes omitir el matchup y pegar solo los 3 picks, uno por línea.\n"
+        "Pulsa ❌ Cancelar importación para salir.",
+        reply_markup=ReplyKeyboardMarkup([["❌ Cancelar importación"]], resize_keyboard=True, is_persistent=True),
+    )
+
+
+async def _handle_mlb_master_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("awaiting_mlb_master_import"):
+        return False
+    user = update.effective_user
+    if user is None or int(user.id) not in SUBSCRIPTION_ADMIN_IDS:
+        context.user_data.pop("awaiting_mlb_master_import", None)
+        return False
+
+    text = (update.message.text or "").strip()
+    if text == "❌ Cancelar importación":
+        context.user_data.pop("awaiting_mlb_master_import", None)
+        await update.effective_message.reply_text("Importación cancelada.", reply_markup=OFFICIAL_PICKS_ADMIN_KEYBOARD)
+        return True
+
+    pick_date, resolved, errors = await asyncio.to_thread(_parse_mlb_master_block, text)
+    if errors:
+        lines = ["❌ IMPORTACIÓN MLB CANCELADA", "", "Corrige estos errores:", ""]
+        for err in errors[:10]:
+            label = f"Línea {err['line']}" if err.get("line") else "Bloque"
+            lines.append(f"• {label}: {err['error']}")
+            if err.get("text"):
+                lines.append(f"  ↳ {err['text']}")
+        lines.append("\nNo se guardó ningún pick. Corrige el bloque y vuelve a enviarlo.")
+        await update.effective_message.reply_text("\n".join(lines))
+        return True
+
+    ok, message = await asyncio.to_thread(_commit_mlb_master_import, pick_date, resolved, user.id)
+    if not ok:
+        await update.effective_message.reply_text(f"❌ {message}")
+        return True
+
+    context.user_data.pop("awaiting_mlb_master_import", None)
+    rows = await asyncio.to_thread(_official_pick_rows, pick_date)
+    try:
+        alert_info = await schedule_alert_jobs(context.application, pick_date)
+    except Exception as exc:
+        alert_info = {"scheduled": 0, "skipped": 0, "reason": str(exc)}
+
+    await update.effective_message.reply_text(
+        "✅ JORNADA MLB IMPORTADA\n\n"
+        + _format_official_picks_text(rows, title=f"🎯 PICKS OFICIALES MLB — {pick_date}")
+        + f"\n\n🔔 Alertas programadas: {alert_info.get('scheduled', 0)} | omitidas: {alert_info.get('skipped', 0)}",
+        reply_markup=OFFICIAL_PICKS_ADMIN_KEYBOARD,
+    )
+    return True
 
 
 async def admin_official_start_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4811,6 +5009,8 @@ async def menu_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Route visual keyboard labels to the existing command functions."""
+    if await _handle_mlb_master_import(update, context):
+        return
     if await _handle_official_picks_input(update, context):
         return
     if await _handle_soccer_picks_input(update, context):
@@ -4859,6 +5059,7 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "📝 Cargar picks fútbol": admin_soccer_start_input,
         "🗑️ Borrar picks fútbol": admin_soccer_clear,
         "📋 Ver picks oficiales": admin_official_picks_panel,
+        "📥 Importar jornada MLB": admin_mlb_master_start,
         "📝 Cargar 3 picks": admin_official_start_input,
         "🤖 Usar picks del modelo": admin_official_use_model,
         "🗑️ Borrar picks oficiales": admin_official_clear,
@@ -5348,6 +5549,7 @@ def main():
     app.add_handler(CommandHandler("adminexpiring", admin_expiring_command))
     app.add_handler(CommandHandler("adminsubs", admin_subscriptions_command))
     app.add_handler(CommandHandler("official", admin_official_picks_panel))
+    app.add_handler(CommandHandler("mlbimport", admin_mlb_master_start))
     app.add_handler(CallbackQueryHandler(membership_callback, pattern=r"^tp_"))
     app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))

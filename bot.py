@@ -76,7 +76,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.5.0"
+BOT_VERSION = "3.5.1"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -5976,8 +5976,9 @@ async def schedule_nba_alert_jobs(application, pick_date=None):
 MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["⚾ MLB", "⚽ Fútbol", "🏀 NBA"],
+        ["🎯 Picks del día", "📡 Picks en vivo"],
         ["🔔 Alertas", "👤 Mi cuenta"],
-        ["📡 Picks en vivo", "⭐ Suscripción"],
+        ["⭐ Suscripción"],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -5988,8 +5989,9 @@ MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
 def _main_menu_keyboard_for(user_id=None):
     rows = [
         ["⚾ MLB", "⚽ Fútbol", "🏀 NBA"],
+        ["🎯 Picks del día", "📡 Picks en vivo"],
         ["🔔 Alertas", "👤 Mi cuenta"],
-        ["📡 Picks en vivo", "⭐ Suscripción"],
+        ["⭐ Suscripción"],
     ]
     if user_id is not None and int(user_id) in SUBSCRIPTION_ADMIN_IDS:
         rows.append(["🛡️ Panel Admin"])
@@ -6022,6 +6024,7 @@ def _menu_text():
         "🏀 NBA — juegos, picks, props y marcadores en vivo\n"
         "🔔 Alertas — avisos pregame\n"
         "👤 Mi cuenta — membresía y estado de alertas\n"
+        "🎯 Picks del día — resumen de MLB, Fútbol y NBA\n"
         "📡 Picks en vivo — seguimiento de todos los picks publicados\n"
         "⭐ Suscripción — FREE, PREMIUM y PRO"
     )
@@ -6042,6 +6045,46 @@ async def menu_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎯 Calibración — predicted vs actual\n"
         "🆔 Mi ID — identificador del chat",
         reply_markup=MORE_MENU_KEYBOARD,
+    )
+
+
+async def daily_picks_hub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show today's published Triple Pick selections across MLB, Soccer and NBA."""
+    user = update.effective_user
+    user_id = user.id if user else None
+    fecha = local_now().strftime("%Y-%m-%d")
+
+    sections = [f"🎯 PICKS DEL DÍA — {fecha}"]
+    total = 0
+
+    # MLB official picks are the canonical picks shown to the channel.
+    mlb_rows = await asyncio.to_thread(_official_pick_rows, fecha)
+    if mlb_rows:
+        total += len(mlb_rows)
+        sections.append("\n⚾ MLB\n" + _format_official_picks_text(mlb_rows, title="").strip())
+    else:
+        sections.append("\n⚾ MLB\nℹ️ Sin picks publicados.")
+
+    soccer_rows = await asyncio.to_thread(_soccer_visible_rows, user_id, fecha, None) if user_id is not None else []
+    if soccer_rows:
+        total += len(soccer_rows)
+        sections.append("\n⚽ FÚTBOL\n" + _format_soccer_rows(soccer_rows, title="").strip())
+    else:
+        sections.append("\n⚽ FÚTBOL\nℹ️ Sin picks publicados o sin acceso para tu plan.")
+
+    nba_rows = await asyncio.to_thread(_nba_visible_rows, user_id, fecha, None) if user_id is not None else []
+    if nba_rows:
+        total += len(nba_rows)
+        sections.append("\n🏀 NBA\n" + _format_nba_rows(nba_rows, title="").strip())
+    else:
+        sections.append("\n🏀 NBA\nℹ️ Sin picks publicados o sin acceso para tu plan.")
+
+    if total == 0:
+        sections.append("\n📭 Aún no hay picks disponibles para hoy.")
+
+    await update.effective_message.reply_text(
+        "\n".join(sections),
+        reply_markup=_main_menu_keyboard_for(user_id),
     )
 
 
@@ -6076,6 +6119,11 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "🏆 Ligas Fútbol": soccer_leagues,
         "📊 Resultados Fútbol": soccer_results,
         "🔴 En vivo Fútbol": soccer_live,
+        "🎯 Picks del día": daily_picks_hub,
+        "🔥 Picks del día": daily_picks_hub,
+        "📅 Picks del día": daily_picks_hub,
+        "Picks del día": daily_picks_hub,
+        "Picks del dia": daily_picks_hub,
         "🔥 Picks MLB": picks,
         "⚾ Picks de hoy": picks,
         "🔴 En vivo MLB": mlb_live,

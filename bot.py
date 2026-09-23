@@ -69,7 +69,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.1.0"
+BOT_VERSION = "3.2.0"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -4318,7 +4318,7 @@ MLB_MENU_KEYBOARD = ReplyKeyboardMarkup(
 
 SOCCER_ADMIN_KEYBOARD = ReplyKeyboardMarkup(
     [
-        ["📋 Ver picks fútbol", "📝 Cargar picks fútbol"],
+        ["📋 Ver picks fútbol", "📝 Importar jornada fútbol"],
         ["🗑️ Borrar picks fútbol", "📊 Resultados Fútbol"],
         ["⬅️ Panel Admin"],
     ],
@@ -4478,20 +4478,90 @@ def _parse_soccer_kickoff(value):
         raise ValueError("hora inválida")
 
 
-def _save_soccer_picks(rows, created_by):
+def _save_soccer_picks(rows, created_by, pick_date=None):
     now = local_now().isoformat()
-    today = local_now().strftime("%Y-%m-%d")
+    pick_date = pick_date or local_now().strftime("%Y-%m-%d")
     with _tracking_connection() as conn:
-        conn.execute("DELETE FROM soccer_picks WHERE pick_date=?", (today,))
+        conn.execute("DELETE FROM soccer_picks WHERE pick_date=?", (pick_date,))
         for slot, item in enumerate(rows, start=1):
             conn.execute(
                 """INSERT INTO soccer_picks
                 (pick_date, slot, league, away, home, selection, product, plan_required,
                  kickoff_utc, created_by, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (today, slot, item["league"], item["away"], item["home"], item["selection"],
+                (pick_date, slot, item["league"], item["away"], item["home"], item["selection"],
                  item["product"], item["plan_required"], item["kickoff_utc"], created_by, now, now),
             )
+
+
+def _parse_soccer_master_block(text):
+    """Parse a full soccer card with optional DATE header and per-line validation."""
+    raw_lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    if not raw_lines:
+        return None, [], [{"line": 0, "text": "", "error": "bloque vacío"}]
+
+    pick_date = local_now().strftime("%Y-%m-%d")
+    body = raw_lines
+    first = raw_lines[0]
+    date_match = re.match(r"^DATE\s*:\s*(\d{4}-\d{2}-\d{2})$", first, flags=re.I)
+    if date_match:
+        pick_date = date_match.group(1)
+        try:
+            datetime.strptime(pick_date, "%Y-%m-%d")
+        except ValueError:
+            return None, [], [{"line": 1, "text": first, "error": "DATE inválida"}]
+        body = raw_lines[1:]
+
+    if not body:
+        return pick_date, [], [{"line": 0, "text": "", "error": "no hay picks debajo de DATE"}]
+    if len(body) > 20:
+        return pick_date, [], [{"line": 0, "text": "", "error": "máximo 20 picks por importación"}]
+
+    products = {"SURVIVAL", "TOP PICK", "CORE", "VALUE", "HYBRID", "PLAYER"}
+    plans = {"FREE", "PREMIUM", "PRO"}
+    parsed, rejected = [], []
+
+    for idx, raw in enumerate(body, start=(2 if date_match else 1)):
+        try:
+            parts = [x.strip() for x in raw.split("|")]
+            if len(parts) != 6:
+                raise ValueError("requiere 6 campos separados por |")
+            league, matchup, selection, product, plan, kickoff = parts
+            if not league:
+                raise ValueError("liga vacía")
+            if not selection:
+                raise ValueError("selección vacía")
+            match = re.split(r"\s+vs\s+", matchup, maxsplit=1, flags=re.I)
+            if len(match) != 2 or not match[0].strip() or not match[1].strip():
+                raise ValueError("partido inválido; usa VISITANTE vs LOCAL")
+            product = product.upper()
+            plan = plan.upper()
+            if product not in products:
+                raise ValueError(f"producto no válido: {product}")
+            if plan not in plans:
+                raise ValueError(f"plan no válido: {plan}")
+
+            kickoff_text = kickoff
+            if kickoff_text and kickoff_text.upper() not in {"N/D", "ND", "TBD"}:
+                # Permit HH:MM when DATE header is supplied; otherwise keep legacy full timestamp support.
+                if re.fullmatch(r"\d{1,2}:\d{2}", kickoff_text):
+                    kickoff_text = f"{pick_date} {kickoff_text}"
+                elif re.fullmatch(r"\d{1,2}:\d{2}\s*(AM|PM)", kickoff_text, flags=re.I):
+                    kickoff_text = f"{pick_date} {kickoff_text}"
+
+            parsed.append({
+                "league": league,
+                "away": match[0].strip(),
+                "home": match[1].strip(),
+                "selection": selection,
+                "product": product,
+                "plan_required": plan,
+                "kickoff_utc": _parse_soccer_kickoff(kickoff_text),
+            })
+        except ValueError as exc:
+            rejected.append({"line": idx, "text": raw, "error": str(exc)})
+
+    return pick_date, parsed, rejected
 
 
 async def admin_soccer_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4513,15 +4583,17 @@ async def admin_soccer_start_input(update: Update, context: ContextTypes.DEFAULT
         return
     context.user_data["awaiting_soccer_picks"] = True
     await update.effective_message.reply_text(
-        "📝 CARGAR PICKS DE FÚTBOL\n\n"
-        "Pega de 1 a 20 picks, uno por línea, usando:\n\n"
-        "LIGA | VISITANTE vs LOCAL | SELECCIÓN | PRODUCTO | PLAN | HORA\n\n"
-        "Ejemplo:\n"
-        "LaLiga | Villarreal vs Real Madrid | Under 4.5 Goals | SURVIVAL | PREMIUM | 2026-09-24 15:00\n"
-        "Premier League | Arsenal vs Everton | Over 7.5 Corners | CORE | PREMIUM | 2026-09-24 14:45\n"
-        "LaLiga | Barcelona vs Sevilla | Lamine Yamal Over 1.5 SOT | PLAYER | PRO | 2026-09-24 16:00\n\n"
+        "📝 IMPORTAR JORNADA — FÚTBOL\n\n"
+        "Pega el bloque completo del día. Formato recomendado:\n\n"
+        "DATE: 2026-09-24\n\n"
+        "LaLiga | Villarreal vs Real Madrid | Under 4.5 Goals | SURVIVAL | FREE | 15:00\n"
+        "Premier League | Arsenal vs Everton | Over 7.5 Corners | CORE | PREMIUM | 14:45\n"
+        "LaLiga | Barcelona vs Sevilla | Lamine Yamal Over 1.5 SOT | PLAYER | PRO | 16:00\n\n"
+        "Campos: LIGA | VISITANTE vs LOCAL | SELECCIÓN | PRODUCTO | PLAN | HORA\n"
         "Productos: SURVIVAL, TOP PICK, CORE, VALUE, HYBRID, PLAYER.\n"
-        "Planes: FREE, PREMIUM, PRO. Hora local del bot. Usa N/D si no está confirmada.",
+        "Planes: FREE, PREMIUM, PRO.\n"
+        "Con DATE puedes usar solo HH:MM. También admite N/D.\n\n"
+        "El bot validará cada línea antes de publicar. Si alguna falla, no publicará nada hasta que la corrijas.",
         reply_markup=ReplyKeyboardMarkup([["❌ Cancelar carga fútbol"]], resize_keyboard=True, is_persistent=True),
     )
 
@@ -4533,53 +4605,39 @@ async def _handle_soccer_picks_input(update: Update, context: ContextTypes.DEFAU
     if user is None or int(user.id) not in SUBSCRIPTION_ADMIN_IDS:
         context.user_data.pop("awaiting_soccer_picks", None)
         return False
+
     text = (update.message.text or "").strip()
     if text == "❌ Cancelar carga fútbol":
         context.user_data.pop("awaiting_soccer_picks", None)
         await update.effective_message.reply_text("Carga cancelada.", reply_markup=SOCCER_ADMIN_KEYBOARD)
         return True
-    raw_lines = [x.strip() for x in text.splitlines() if x.strip()]
-    if not (1 <= len(raw_lines) <= 20):
-        await update.effective_message.reply_text("⚠️ Pega entre 1 y 20 picks, uno por línea.")
+
+    pick_date, parsed, rejected = _parse_soccer_master_block(text)
+    if rejected:
+        lines = ["⚠️ IMPORTACIÓN DETENIDA", "", "Corrige estas líneas y vuelve a pegar el bloque completo:", ""]
+        for item in rejected[:12]:
+            prefix = f"Línea {item['line']}" if item['line'] else "Bloque"
+            lines.append(f"• {prefix}: {item['error']}")
+            if item.get("text"):
+                lines.append(f"  ↳ {item['text'][:160]}")
+        if len(rejected) > 12:
+            lines.append(f"… y {len(rejected) - 12} error(es) más.")
+        lines.append("\nNo se publicó ningún pick.")
+        await update.effective_message.reply_text("\n".join(lines))
         return True
-    parsed = []
-    products = {"SURVIVAL", "TOP PICK", "CORE", "VALUE", "HYBRID", "PLAYER"}
-    plans = {"FREE", "PREMIUM", "PRO"}
-    try:
-        for raw in raw_lines:
-            parts = [x.strip() for x in raw.split("|")]
-            if len(parts) != 6:
-                raise ValueError("cada línea necesita 6 campos separados por |")
-            league, matchup, selection, product, plan, kickoff = parts
-            if " vs " not in matchup.lower():
-                raise ValueError("el partido debe usar VISITANTE vs LOCAL")
-            m = re.split(r"\s+vs\s+", matchup, maxsplit=1, flags=re.I)
-            if len(m) != 2 or not m[0].strip() or not m[1].strip():
-                raise ValueError("partido inválido")
-            product = product.upper()
-            plan = plan.upper()
-            if product not in products:
-                raise ValueError(f"producto no válido: {product}")
-            if plan not in plans:
-                raise ValueError(f"plan no válido: {plan}")
-            parsed.append({
-                "league": league,
-                "away": m[0].strip(),
-                "home": m[1].strip(),
-                "selection": selection,
-                "product": product,
-                "plan_required": plan,
-                "kickoff_utc": _parse_soccer_kickoff(kickoff),
-            })
-    except ValueError as exc:
-        await update.effective_message.reply_text(f"⚠️ No pude cargar los picks: {exc}")
+
+    if not parsed:
+        await update.effective_message.reply_text("⚠️ No encontré picks válidos en el bloque.")
         return True
-    await asyncio.to_thread(_save_soccer_picks, parsed, int(user.id))
+
+    await asyncio.to_thread(_save_soccer_picks, parsed, int(user.id), pick_date)
     context.user_data.pop("awaiting_soccer_picks", None)
-    await schedule_soccer_alert_jobs(context.application)
-    rows = await asyncio.to_thread(_soccer_pick_rows)
+    alert_summary = await schedule_soccer_alert_jobs(context.application, pick_date)
+    rows = await asyncio.to_thread(_soccer_pick_rows, pick_date)
     await update.effective_message.reply_text(
-        "✅ Picks de fútbol publicados.\n\n" + _format_soccer_rows(rows, "⚽ PICKS ACTIVOS"),
+        f"✅ Jornada {pick_date} publicada: {len(parsed)} pick(s).\n"
+        f"🔔 Alertas programadas: {alert_summary.get('scheduled', 0)} | omitidas: {alert_summary.get('skipped', 0)}\n\n"
+        + _format_soccer_rows(rows, "⚽ PICKS ACTIVOS"),
         reply_markup=SOCCER_ADMIN_KEYBOARD,
     )
     return True
@@ -4797,6 +4855,7 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "🎯 Picks oficiales": admin_official_picks_panel,
         "⚽ Admin Fútbol": admin_soccer_panel,
         "📋 Ver picks fútbol": admin_soccer_panel,
+        "📝 Importar jornada fútbol": admin_soccer_start_input,
         "📝 Cargar picks fútbol": admin_soccer_start_input,
         "🗑️ Borrar picks fútbol": admin_soccer_clear,
         "📋 Ver picks oficiales": admin_official_picks_panel,

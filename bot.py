@@ -76,7 +76,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.5.12"
+BOT_VERSION = "3.5.13"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -4425,6 +4425,9 @@ async def admin_live_alert_test(update: Update, context: ContextTypes.DEFAULT_TY
         "selection": "Toronto Blue Jays ML",
         "away": "Cincinnati Reds",
         "home": "Toronto Blue Jays",
+        "market_family": "FULL_GAME_ML",
+        "line": None,
+        "product": "CORE",
     }
     fake_payload = {
         "state": "in",
@@ -5880,6 +5883,9 @@ def _live_pick_monitor_text(user_id):
                     lines.append("⏱️ JUEGO: horario/marcador pendiente")
 
             lines.append(f"📈 PROGRESO: {pick_state}")
+            progress_detail = _live_pick_progress_detail(row, payload)
+            if progress_detail:
+                lines.append(f"📐 MERCADO: {progress_detail}")
             lines.append("")
 
             # Telegram messages are capped at 4096 characters. Leave a margin
@@ -6047,6 +6053,133 @@ def _live_pick_watch_rows_for_user(user_id, pick_date):
     return rows
 
 
+def _row_value(row, key, default=None):
+    """Safely read sqlite.Row/dict values used by live monitoring."""
+    try:
+        value = row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+    return default if value is None else value
+
+
+def _live_pick_progress_detail(row, payload):
+    """Return a human-readable market progress line from the current score.
+
+    This helper is informational only. Settlement/status remains controlled by
+    _selection_live_state so the notification layer cannot change a pick result.
+    """
+    if not payload or payload.get("state") == "pre":
+        return None
+
+    try:
+        away_score = float(payload.get("away_score", 0) or 0)
+        home_score = float(payload.get("home_score", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+
+    selection = str(_row_value(row, "selection", "") or "").strip()
+    upper = selection.upper()
+    away = str(_row_value(row, "away", "") or "")
+    home = str(_row_value(row, "home", "") or "")
+    market_family = str(_row_value(row, "market_family", "") or "").upper()
+    line_raw = _row_value(row, "line", None)
+    try:
+        numeric_line = float(line_raw) if line_raw not in (None, "") else None
+    except (TypeError, ValueError):
+        numeric_line = None
+
+    total = away_score + home_score
+
+    def fmt(v):
+        return _format_score(v)
+
+    # Full-game totals from structured MLB rows or selection text.
+    is_over_family = market_family in {"FULL_GAME_TOTAL_OVER", "GAME_TOTAL_OVER"}
+    is_under_family = market_family in {"FULL_GAME_TOTAL_UNDER", "GAME_TOTAL_UNDER"}
+    target = numeric_line if (is_over_family or is_under_family) else None
+    over = is_over_family
+    if target is None:
+        m = re.search(r"\b(OVER|UNDER|O|U)\s*([0-9]+(?:\.[0-9]+)?)", upper)
+        if m and not re.search(r"[A-Z]+\s+[A-Z]+\s+(OVER|UNDER)", upper):
+            target = float(m.group(2))
+            over = m.group(1) in {"OVER", "O"}
+    if target is not None:
+        if over:
+            needed = max(0.0, target - total)
+            if total > target:
+                return f"Over {fmt(target)} · total actual {fmt(total)} · margen +{fmt(total-target)}"
+            return f"Over {fmt(target)} · total actual {fmt(total)} · faltan {fmt(needed)}"
+        remaining = target - total
+        if total < target:
+            return f"Under {fmt(target)} · total actual {fmt(total)} · margen {fmt(remaining)}"
+        return f"Under {fmt(target)} · total actual {fmt(total)} · excede por {fmt(total-target)}"
+
+    # Team totals.
+    team_total = market_family in {"TEAM_TOTAL_OVER", "TEAM_TOTAL_UNDER"}
+    tm = re.match(r"^(.+?)\s+(?:TEAM\s+TOTAL\s+)?(OVER|UNDER)\s+([0-9]+(?:\.[0-9]+)?)", upper)
+    if team_total or tm:
+        if tm:
+            team_text, over_word, target_text = tm.group(1).strip(), tm.group(2), tm.group(3)
+            target = float(target_text)
+            over = over_word == "OVER"
+        else:
+            team_text = selection
+            target = numeric_line
+            over = market_family.endswith("OVER")
+        if target is not None:
+            selected_home = _team_name_matches(team_text, home) or _team_name_matches(selection, home)
+            selected_away = _team_name_matches(team_text, away) or _team_name_matches(selection, away)
+            team_score = home_score if selected_home else away_score if selected_away else None
+            team_name = home if selected_home else away if selected_away else "Equipo"
+            if team_score is not None:
+                if over:
+                    needed = max(0.0, target - team_score)
+                    if team_score > target:
+                        return f"{team_name} Over {fmt(target)} · lleva {fmt(team_score)} · margen +{fmt(team_score-target)}"
+                    return f"{team_name} Over {fmt(target)} · lleva {fmt(team_score)} · faltan {fmt(needed)}"
+                remaining = target - team_score
+                if team_score < target:
+                    return f"{team_name} Under {fmt(target)} · lleva {fmt(team_score)} · margen {fmt(remaining)}"
+                return f"{team_name} Under {fmt(target)} · lleva {fmt(team_score)} · excede por {fmt(team_score-target)}"
+
+    # Moneyline / spreads.
+    clean_selection = re.sub(r"\b(ML|MONEYLINE)\b", "", selection, flags=re.I).strip()
+    selected_home = _team_name_matches(selection, home) or _team_name_matches(clean_selection, home)
+    selected_away = _team_name_matches(selection, away) or _team_name_matches(clean_selection, away)
+    selected_score = home_score if selected_home else away_score if selected_away else None
+    opponent_score = away_score if selected_home else home_score if selected_away else None
+    selected_name = home if selected_home else away if selected_away else None
+
+    spread = None
+    spread_match = re.search(r"(^|\s)([+-]\d+(?:\.\d+)?)\b", selection)
+    if market_family == "RUN_LINE" and numeric_line is not None:
+        spread = numeric_line
+    elif spread_match:
+        spread = float(spread_match.group(2))
+    if selected_score is not None and spread is not None:
+        raw_margin = selected_score - opponent_score
+        cover_margin = raw_margin + spread
+        return (
+            f"{selected_name} {spread:+g} · margen real {raw_margin:+g} · "
+            f"margen de cobertura {cover_margin:+g}"
+        )
+
+    if selected_score is not None or market_family == "FULL_GAME_ML" or " ML" in f" {upper}":
+        if selected_score is not None:
+            margin = selected_score - opponent_score
+            if margin > 0:
+                return f"Moneyline {selected_name} · ventaja actual +{fmt(margin)}"
+            if margin < 0:
+                return f"Moneyline {selected_name} · desventaja actual {fmt(margin)}"
+            return f"Moneyline {selected_name} · partido empatado"
+
+    # Player props require player-stat feeds that are not currently part of the watcher.
+    if str(_row_value(row, "product", "") or "").upper() == "PLAYER":
+        return "Prop de jugador · esperando estadística individual verificable"
+
+    return None
+
+
 def _live_pick_watch_message(sport, row, payload, pick_state, previous_code):
     """Build a compact, user-facing alert for an actual pick-state transition."""
     sport = (sport or "").upper()
@@ -6088,6 +6221,10 @@ def _live_pick_watch_message(sport, row, payload, pick_state, previous_code):
         detail = payload.get("detail")
         if detail:
             lines.append(f"⏱️ MOMENTO: {detail}")
+
+        progress_detail = _live_pick_progress_detail(row, payload)
+        if progress_detail:
+            lines.append(f"📐 PROGRESO DEL MERCADO: {progress_detail}")
 
     lines.extend([
         "",

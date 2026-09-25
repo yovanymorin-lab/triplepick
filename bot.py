@@ -76,7 +76,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.5.8"
+BOT_VERSION = "3.5.9"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -116,6 +116,14 @@ ALERT_LEAD_MINUTES = int(os.environ.get("ALERT_LEAD_MINUTES", "45"))
 ALERTS_DEFAULT_ENABLED = os.environ.get("ALERTS_DEFAULT_ENABLED", "0").strip().lower() in {
     "1", "true", "yes", "on"
 }
+
+# v3.5.9 — automatic live-pick state tracking.
+# The watcher polls live score feeds but only notifies users when the pick's
+# canonical state changes, preventing score-by-score spam.
+LIVE_PICK_WATCH_ENABLED = os.environ.get("LIVE_PICK_WATCH_ENABLED", "1").strip().lower() not in {
+    "0", "false", "no", "off"
+}
+LIVE_PICK_WATCH_INTERVAL_SECONDS = max(60, int(os.environ.get("LIVE_PICK_WATCH_INTERVAL_SECONDS", "120")))
 
 # Optional Twilio SMS channel. Secrets stay in Railway environment variables.
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
@@ -5865,6 +5873,225 @@ async def live_pick_monitor_refresh_callback(update: Update, context: ContextTyp
         print(f"Live pick monitor refresh skipped: {exc}")
 
 
+
+# ---------------------------------------------------------------------------
+# v3.5.9 AUTOMATIC LIVE PICK WATCHER
+# ---------------------------------------------------------------------------
+
+
+def _ensure_live_pick_watch_schema():
+    """Create persistent per-user pick-state storage without touching prior data."""
+    init_tracking_db()
+    with _tracking_connection() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS live_pick_watch_states (
+                chat_id INTEGER NOT NULL,
+                sport TEXT NOT NULL,
+                pick_date TEXT NOT NULL,
+                pick_key TEXT NOT NULL,
+                state_code TEXT NOT NULL,
+                state_text TEXT,
+                updated_at TEXT NOT NULL,
+                last_notified_at TEXT,
+                PRIMARY KEY(chat_id, sport, pick_date, pick_key)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_live_pick_watch_date
+            ON live_pick_watch_states(pick_date, chat_id)
+            """
+        )
+
+
+def _live_pick_watch_key(sport, row):
+    """Stable key for one published selection within one sport/day."""
+    sport = (sport or "").upper()
+    try:
+        row_id = row["id"]
+    except (KeyError, IndexError, TypeError):
+        row_id = None
+    if sport == "MLB":
+        try:
+            game_id = row["game_pk"]
+        except (KeyError, IndexError, TypeError):
+            game_id = None
+        return f"{game_id or row_id or 'game'}|{row['selection']}"
+    return f"{row_id or 'pick'}|{row['selection']}|{row['away']}|{row['home']}"
+
+
+def _live_pick_state_code(payload, pick_state):
+    """Reduce verbose monitor text to a state that changes only when action matters."""
+    text = (pick_state or "").upper()
+    state = (payload or {}).get("state") if payload else None
+    if state == "pre" or text.startswith("⏳"):
+        return "PRE"
+    if state == "post" or text.startswith("🏁"):
+        if "✅" in text or "GANADO" in text:
+            return "FINAL_WIN"
+        if "❌" in text or "PERDIDO" in text:
+            return "FINAL_LOSS"
+        if "PUSH" in text or "EMPATE" in text:
+            return "FINAL_PUSH"
+        return "FINAL_PENDING"
+    if text.startswith("✅") or "GANANDO" in text:
+        return "WINNING"
+    if text.startswith("❌") or "PERDIENDO" in text:
+        return "LOSING"
+    if text.startswith("⚠️") or "RIESGO" in text or "EN JUEGO" in text:
+        return "RISK"
+    return "OTHER"
+
+
+def _live_pick_watch_previous(chat_id, sport, pick_date, pick_key):
+    _ensure_live_pick_watch_schema()
+    with _tracking_connection() as conn:
+        return conn.execute(
+            """
+            SELECT state_code, state_text, updated_at, last_notified_at
+            FROM live_pick_watch_states
+            WHERE chat_id=? AND sport=? AND pick_date=? AND pick_key=?
+            """,
+            (int(chat_id), sport, pick_date, pick_key),
+        ).fetchone()
+
+
+def _live_pick_watch_store(chat_id, sport, pick_date, pick_key, state_code, state_text, notified=False):
+    _ensure_live_pick_watch_schema()
+    now_iso = local_now().isoformat()
+    with _tracking_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO live_pick_watch_states(
+                chat_id, sport, pick_date, pick_key, state_code, state_text,
+                updated_at, last_notified_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id, sport, pick_date, pick_key) DO UPDATE SET
+                state_code=excluded.state_code,
+                state_text=excluded.state_text,
+                updated_at=excluded.updated_at,
+                last_notified_at=CASE
+                    WHEN excluded.last_notified_at IS NOT NULL THEN excluded.last_notified_at
+                    ELSE live_pick_watch_states.last_notified_at
+                END
+            """,
+            (
+                int(chat_id), sport, pick_date, pick_key, state_code, state_text,
+                now_iso, now_iso if notified else None,
+            ),
+        )
+
+
+def _live_pick_watch_rows_for_user(user_id, pick_date):
+    """Use the exact same live-state engine already shown by 📡 Picks en vivo."""
+    rows = []
+    rows.extend(_mlb_pick_monitor_rows(pick_date))
+    rows.extend(_soccer_pick_monitor_rows(user_id, pick_date))
+    rows.extend(_nba_pick_monitor_rows(user_id, pick_date))
+    return rows
+
+
+def _live_pick_watch_message(sport, row, payload, pick_state, previous_code):
+    icons = {"MLB": "⚾", "SOCCER": "⚽", "NBA": "🏀"}
+    icon = icons.get(sport, "🎯")
+    lines = [
+        f"📡 TRIPLE PICK — CAMBIO EN VIVO {icon}",
+        "",
+        f"🎯 {row['selection']}",
+        f"🏟️ {row['away']} vs {row['home']}",
+    ]
+    if payload:
+        state = payload.get("state")
+        if state != "pre":
+            lines.append(
+                f"📊 Marcador: {_format_score(payload.get('away_score', 0))}–{_format_score(payload.get('home_score', 0))}"
+            )
+        detail = payload.get("detail")
+        if detail:
+            lines.append(f"⏱️ {detail}")
+    lines.extend([
+        f"📈 Estado: {pick_state}",
+        "",
+        "Este aviso se envía porque cambió el estado del pick.",
+    ])
+    return "\n".join(lines)
+
+
+async def automatic_live_pick_watch(context: ContextTypes.DEFAULT_TYPE):
+    """Poll all published picks and notify alert-enabled users on state transitions."""
+    if not LIVE_PICK_WATCH_ENABLED:
+        return
+    try:
+        chats = await asyncio.to_thread(_enabled_alert_chats)
+        if not chats:
+            return
+        pick_date = local_now().strftime("%Y-%m-%d")
+        for chat in chats:
+            chat_id = int(chat["chat_id"])
+            try:
+                rows = await asyncio.to_thread(_live_pick_watch_rows_for_user, chat_id, pick_date)
+            except Exception as exc:
+                print(f"Live watch feed error (chat={chat_id}): {exc}")
+                continue
+
+            for sport, row, payload, pick_state in rows:
+                state_code = _live_pick_state_code(payload, pick_state)
+                pick_key = _live_pick_watch_key(sport, row)
+                previous = await asyncio.to_thread(
+                    _live_pick_watch_previous, chat_id, sport, pick_date, pick_key
+                )
+
+                # First observation establishes a baseline silently. This avoids a burst
+                # of messages whenever Railway restarts or the watcher is first enabled.
+                if previous is None:
+                    await asyncio.to_thread(
+                        _live_pick_watch_store,
+                        chat_id, sport, pick_date, pick_key, state_code, pick_state, False,
+                    )
+                    continue
+
+                previous_code = previous["state_code"]
+                if previous_code == state_code:
+                    # Keep the current descriptive text/score fresh without notifying.
+                    await asyncio.to_thread(
+                        _live_pick_watch_store,
+                        chat_id, sport, pick_date, pick_key, state_code, pick_state, False,
+                    )
+                    continue
+
+                # A transition back to PRE can happen because of postponements/feed
+                # corrections; store it but do not send a confusing regression alert.
+                if state_code == "PRE":
+                    await asyncio.to_thread(
+                        _live_pick_watch_store,
+                        chat_id, sport, pick_date, pick_key, state_code, pick_state, False,
+                    )
+                    continue
+
+                message = _live_pick_watch_message(
+                    sport, row, payload, pick_state, previous_code
+                )
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=message)
+                    await asyncio.to_thread(
+                        _live_pick_watch_store,
+                        chat_id, sport, pick_date, pick_key, state_code, pick_state, True,
+                    )
+                except Exception as exc:
+                    # Store no new state when delivery fails so the transition remains
+                    # retryable on the next watcher cycle.
+                    print(
+                        f"Live watch notification error (chat={chat_id}, sport={sport}, "
+                        f"pick={pick_key}): {exc}"
+                    )
+
+    except Exception as exc:
+        # The watcher must never bring down polling or the rest of the bot.
+        print(f"Automatic live pick watch error: {exc}")
+
+
 NBA_MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["🏀 Juegos NBA", "🔴 En vivo NBA"],
@@ -7063,6 +7290,18 @@ def main():
             print(
                 f"🧾 Auto-settle programado diariamente a "
                 f"{TRACK_SETTLE_HOUR:02d}:{TRACK_SETTLE_MINUTE:02d} ({AUTO_TZ})"
+            )
+
+        if LIVE_PICK_WATCH_ENABLED:
+            app.job_queue.run_repeating(
+                automatic_live_pick_watch,
+                interval=LIVE_PICK_WATCH_INTERVAL_SECONDS,
+                first=45,
+                name="triple_pick_live_pick_watch",
+            )
+            print(
+                f"📡 Seguimiento automático de picks: ACTIVO "
+                f"(cada {LIVE_PICK_WATCH_INTERVAL_SECONDS}s)"
             )
 
         app.job_queue.run_repeating(

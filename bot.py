@@ -76,7 +76,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.5.9"
+BOT_VERSION = "3.5.11"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -4387,7 +4387,7 @@ ADMIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
         ["📊 Estadísticas", "👥 Usuarios"],
         ["🎯 Picks oficiales", "⚽ Admin Fútbol"],
         ["🏀 Admin NBA", "⏳ Vencen pronto"],
-        ["💳 Suscripciones"],
+        ["💳 Suscripciones", "🧪 Probar alerta en vivo"],
         ["⬅️ Menú principal"],
     ],
     resize_keyboard=True,
@@ -4407,7 +4407,47 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👥 Usuarios — listado de miembros\n"
         "🎯 Picks oficiales — lista maestra del canal y el bot\n"
         "⏳ Vencen pronto — próximos 7 días\n"
-        "💳 Suscripciones — PREMIUM/PRO activas",
+        "💳 Suscripciones — PREMIUM/PRO activas\n"
+        "🧪 Probar alerta en vivo — envía una transición simulada solo al administrador",
+        reply_markup=ADMIN_MENU_KEYBOARD,
+    )
+
+
+async def admin_live_alert_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send a safe simulated live-pick transition only to the requesting admin."""
+    user = update.effective_user
+    if user is None or int(user.id) not in SUBSCRIPTION_ADMIN_IDS:
+        await update.effective_message.reply_text("⛔ Prueba exclusiva para administradores.")
+        return
+
+    fake_row = {
+        "id": "ADMIN_TEST",
+        "selection": "Toronto Blue Jays ML",
+        "away": "Cincinnati Reds",
+        "home": "Toronto Blue Jays",
+    }
+    fake_payload = {
+        "state": "in",
+        "away_score": 2,
+        "home_score": 3,
+        "detail": "Top 7th · 1 out",
+    }
+    previous_code = "LOSING"
+    pick_state = "✅ GANANDO"
+
+    message = _live_pick_watch_message(
+        "MLB", fake_row, fake_payload, pick_state, previous_code
+    )
+    message = (
+        "🧪 PRUEBA ADMINISTRATIVA — NO ES UN PICK REAL\n\n"
+        + message
+        + "\n\n✅ Si recibes este mensaje, el canal de notificaciones en vivo está funcionando."
+    )
+    await context.bot.send_message(chat_id=int(user.id), text=message)
+    await update.effective_message.reply_text(
+        "✅ Prueba enviada a tu chat privado.\n\n"
+        "Simulé el cambio ❌ PERDIENDO → ✅ GANANDO. "
+        "No se modificó ningún pick real ni el historial del watcher.",
         reply_markup=ADMIN_MENU_KEYBOARD,
     )
 
@@ -5994,27 +6034,54 @@ def _live_pick_watch_rows_for_user(user_id, pick_date):
 
 
 def _live_pick_watch_message(sport, row, payload, pick_state, previous_code):
+    """Build a compact, user-facing alert for an actual pick-state transition."""
+    sport = (sport or "").upper()
     icons = {"MLB": "⚾", "SOCCER": "⚽", "NBA": "🏀"}
+    sport_names = {"MLB": "MLB", "SOCCER": "FÚTBOL", "NBA": "NBA"}
+    previous_labels = {
+        "PRE": "⏳ PENDIENTE",
+        "WINNING": "✅ GANANDO",
+        "LOSING": "❌ PERDIENDO",
+        "RISK": "⚠️ EN RIESGO",
+        "FINAL_WIN": "🏁 ✅ GANADO",
+        "FINAL_LOSS": "🏁 ❌ PERDIDO",
+        "FINAL_PUSH": "🏁 ↔️ PUSH",
+        "FINAL_PENDING": "🏁 FINAL",
+        "OTHER": "EN JUEGO",
+    }
+
     icon = icons.get(sport, "🎯")
+    sport_name = sport_names.get(sport, sport or "DEPORTE")
+    away = row["away"]
+    home = row["home"]
+    previous_text = previous_labels.get(previous_code, previous_code or "N/D")
+
     lines = [
-        f"📡 TRIPLE PICK — CAMBIO EN VIVO {icon}",
+        f"📡 TRIPLE PICK — ALERTA EN VIVO {icon}",
+        f"🏷️ {sport_name}",
         "",
-        f"🎯 {row['selection']}",
-        f"🏟️ {row['away']} vs {row['home']}",
+        f"🏟️ {away} vs {home}",
+        f"🎯 PICK: {row['selection']}",
     ]
+
     if payload:
         state = payload.get("state")
         if state != "pre":
-            lines.append(
-                f"📊 Marcador: {_format_score(payload.get('away_score', 0))}–{_format_score(payload.get('home_score', 0))}"
-            )
+            away_score = _format_score(payload.get("away_score", 0))
+            home_score = _format_score(payload.get("home_score", 0))
+            lines.append(f"📊 MARCADOR: {away} {away_score} — {home_score} {home}")
+
         detail = payload.get("detail")
         if detail:
-            lines.append(f"⏱️ {detail}")
+            lines.append(f"⏱️ MOMENTO: {detail}")
+
     lines.extend([
-        f"📈 Estado: {pick_state}",
         "",
-        "Este aviso se envía porque cambió el estado del pick.",
+        f"↩️ Antes: {previous_text}",
+        f"➡️ Ahora: {pick_state}",
+        "",
+        "🔔 El estado del pick acaba de cambiar.",
+        f"🕒 Actualizado: {_format_live_stamp()}",
     ])
     return "\n".join(lines)
 
@@ -6695,6 +6762,7 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "👥 Usuarios": adminusers_command,
         "⏳ Vencen pronto": admin_expiring_command,
         "💳 Suscripciones": admin_subscriptions_command,
+        "🧪 Probar alerta en vivo": admin_live_alert_test,
     }
     handler = routes.get(text)
     if handler is not None:
@@ -7246,6 +7314,7 @@ def main():
     app.add_handler(CommandHandler("history", history))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("adminnotifytest", adminnotifytest))
+    app.add_handler(CommandHandler("livealerttest", admin_live_alert_test))
     app.add_handler(CommandHandler("autostatus", autostatus))
     app.add_handler(CommandHandler("alerts", alerts_menu))
     app.add_handler(CommandHandler("alertson", alerts_enable))

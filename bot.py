@@ -76,7 +76,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.5.16"
+BOT_VERSION = "3.5.17"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -4790,7 +4790,7 @@ SOCCER_MENU_KEYBOARD = ReplyKeyboardMarkup(
         ["🔥 Picks Fútbol", "📊 Resultados Fútbol"],
         ["🛡️ Survival Fútbol", "⭐ Top Picks Fútbol"],
         ["🎯 Player Props Fútbol", "🏆 Ligas Fútbol"],
-        ["📡 Picks en vivo"],
+        ["📋 Alineaciones Fútbol", "📡 Picks en vivo"],
         ["⬅️ Menú principal"],
     ],
     resize_keyboard=True,
@@ -4804,7 +4804,7 @@ MLB_MENU_KEYBOARD = ReplyKeyboardMarkup(
         ["🔥 Picks MLB", "📊 Resultados MLB"],
         ["🧮 Mercado MLB", "📈 Rendimiento MLB"],
         ["📋 Historial MLB", "🧪 Más opciones"],
-        ["📡 Picks en vivo"],
+        ["📋 Alineaciones MLB", "📡 Picks en vivo"],
         ["⬅️ Menú principal"],
     ],
     resize_keyboard=True,
@@ -5586,6 +5586,373 @@ def _nba_live_text():
 
 
 
+
+# ---------------------------------------------------------------------------
+# v3.5.17 MLB PLAYER PROPS — live individual progress
+# ---------------------------------------------------------------------------
+
+
+def _mlb_boxscore(game_pk):
+    """Fetch the MLB Stats API boxscore for one game."""
+    if not game_pk:
+        return None
+    return safe_get_json(f"{MLB_API}/game/{int(game_pk)}/boxscore", cache_ttl=0)
+
+
+def _mlb_prop_definition(selection, row=None):
+    """Parse supported MLB player props from the published selection text."""
+    text = str(selection or "").strip()
+    if not text:
+        return None
+
+    # Examples: Aaron Judge Over 1.5 Total Bases / Tarik Skubal Over 6.5 Strikeouts
+    m = re.match(r"^(.+?)\s+(OVER|UNDER)\s+([0-9]+(?:\.[0-9]+)?)\s+(.+?)$", text, flags=re.I)
+    if m:
+        player, direction, line_text, stat_text = m.groups()
+    else:
+        # Examples: Aaron Judge 2+ Hits / 1+ HR / 2+ RBI
+        m = re.match(r"^(.+?)\s+([0-9]+)\+\s+(.+?)$", text, flags=re.I)
+        if not m:
+            return None
+        player, n_text, stat_text = m.groups()
+        direction = "OVER"
+        line_text = str(max(0, int(n_text)) - 0.5)
+
+    key = re.sub(r"[^A-Z0-9 ]+", " ", stat_text.upper())
+    key = re.sub(r"\s+", " ", key).strip()
+    aliases = {
+        "HIT": "H", "HITS": "H", "H": "H",
+        "TOTAL BASE": "TB", "TOTAL BASES": "TB", "TB": "TB",
+        "STRIKEOUT": "K", "STRIKEOUTS": "K", "PITCHER STRIKEOUTS": "K", "K": "K", "KS": "K",
+        "RBI": "RBI", "RBIS": "RBI", "RUNS BATTED IN": "RBI",
+        "HOME RUN": "HR", "HOME RUNS": "HR", "HOMER": "HR", "HOMERS": "HR", "HR": "HR",
+        "RUN": "R", "RUNS": "R", "R": "R",
+        "WALK": "BB", "WALKS": "BB", "BASES ON BALLS": "BB", "BB": "BB",
+    }
+    code = aliases.get(key)
+    if not code:
+        return None
+    return {
+        "player": player.strip(),
+        "direction": direction.upper(),
+        "line": float(line_text),
+        "stat_code": code,
+        "stat_label": stat_text.strip(),
+    }
+
+
+def _mlb_stat_number(raw):
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        m = re.match(r"^(-?[0-9]+(?:\.[0-9]+)?)", str(raw).strip())
+        return float(m.group(1)) if m else None
+
+
+def _mlb_boxscore_players(boxscore):
+    """Build {player_name: MLB counting stats} from the official boxscore."""
+    out = {}
+    for side in ("away", "home"):
+        team = ((boxscore or {}).get("teams") or {}).get(side) or {}
+        for item in (team.get("players") or {}).values():
+            if not isinstance(item, dict):
+                continue
+            person = item.get("person") or {}
+            name = person.get("fullName") or person.get("displayName")
+            if not name:
+                continue
+            stats = item.get("stats") or {}
+            batting = stats.get("batting") or {}
+            pitching = stats.get("pitching") or {}
+            mapped = {
+                "H": _mlb_stat_number(batting.get("hits")),
+                "TB": _mlb_stat_number(batting.get("totalBases")),
+                "RBI": _mlb_stat_number(batting.get("rbi")),
+                "HR": _mlb_stat_number(batting.get("homeRuns")),
+                "R": _mlb_stat_number(batting.get("runs")),
+                "BB": _mlb_stat_number(batting.get("baseOnBalls")),
+                "K": _mlb_stat_number(pitching.get("strikeOuts")),
+            }
+            out[name] = {k: v for k, v in mapped.items() if v is not None}
+    return out
+
+
+def _mlb_player_prop_snapshot(boxscore, definition):
+    if not boxscore or not definition:
+        return None
+    for pname, stats in _mlb_boxscore_players(boxscore).items():
+        if _person_name_matches(pname, definition["player"]):
+            value = stats.get(definition["stat_code"])
+            if value is not None:
+                return {**definition, "player": pname, "value": float(value)}
+    return None
+
+
+def _mlb_player_prop_state(snapshot, state):
+    if state == "pre":
+        return "⏳ NO INICIADO"
+    if not snapshot:
+        return "⚠️ EN JUEGO · PROP SIN DATO INDIVIDUAL" if state != "post" else "🏁 FINAL · PROP PENDIENTE DE LIQUIDAR"
+    value = float(snapshot["value"])
+    line = float(snapshot["line"])
+    over = snapshot["direction"] == "OVER"
+    if state == "post":
+        if value == line:
+            return "🏁 FINAL · ➖ PUSH"
+        won = value > line if over else value < line
+        return "🏁 FINAL · ✅ GANADO" if won else "🏁 FINAL · ❌ PERDIDO"
+    if over:
+        return f"✅ GANANDO · {value:g}/{line:g}" if value > line else f"⚠️ EN RIESGO · {value:g}/{line:g}"
+    # Counting stats cannot decrease.
+    return f"✅ GANANDO · {value:g}/{line:g}" if value < line else f"❌ PERDIENDO · {value:g}/{line:g}"
+
+
+def _mlb_player_prop_progress(snapshot):
+    if not snapshot:
+        return None
+    value = float(snapshot["value"])
+    line = float(snapshot["line"])
+    player = snapshot["player"]
+    label = snapshot["stat_label"]
+    direction = snapshot["direction"].title()
+    if snapshot["direction"] == "OVER":
+        detail = f"margen +{value-line:g}" if value > line else f"faltan {max(0.0, line-value):g}"
+    else:
+        detail = f"margen {line-value:g}" if value < line else f"excede por {value-line:g}"
+    return f"{player} {direction} {line:g} {label} · lleva {value:g} · {detail}"
+
+
+# ---------------------------------------------------------------------------
+# v3.5.17 RECOMMENDED-PICK LINEUPS — MLB / SOCCER / NBA
+# ---------------------------------------------------------------------------
+
+
+def _mlb_team_lineup(team_box):
+    players = team_box.get("players") or {}
+    starters = []
+    for item in players.values():
+        if not isinstance(item, dict):
+            continue
+        order = item.get("battingOrder")
+        person = item.get("person") or {}
+        name = person.get("fullName") or person.get("displayName")
+        if order and name:
+            try:
+                order_num = int(str(order))
+            except ValueError:
+                continue
+            starters.append((order_num, name))
+    starters.sort(key=lambda x: x[0])
+    names = [name for _, name in starters[:9]]
+    pitcher = None
+    pitcher_ids = team_box.get("pitchers") or []
+    if pitcher_ids:
+        pid = str(pitcher_ids[0])
+        for key in (f"ID{pid}", pid):
+            item = players.get(key)
+            if item:
+                pitcher = ((item.get("person") or {}).get("fullName") or (item.get("person") or {}).get("displayName"))
+                if pitcher:
+                    break
+    return names, pitcher
+
+
+def _format_mlb_lineups_for_picks(pick_date):
+    rows = _official_pick_rows(pick_date)
+    if not rows:
+        return "📋 ALINEACIONES MLB — PICKS TRIPLE PICK\n\nℹ️ No hay picks MLB publicados para hoy."
+    lines = ["📋 ALINEACIONES MLB — PICKS TRIPLE PICK", f"📅 {pick_date}", ""]
+    seen = set()
+    for row in rows:
+        game_pk = int(row["game_pk"] or 0)
+        if game_pk in seen:
+            continue
+        seen.add(game_pk)
+        box = _mlb_boxscore(game_pk)
+        lines.append(f"🏟️ {row['away']} vs {row['home']}")
+        related = [r for r in rows if int(r["game_pk"] or 0) == game_pk]
+        for r in related:
+            lines.append(f"🎯 {r['pick_text'] or r['selection']}")
+        if not box:
+            lines.append("⚠️ Alineaciones: por confirmar / feed no disponible")
+            lines.append("")
+            continue
+        away_box = ((box.get("teams") or {}).get("away") or {})
+        home_box = ((box.get("teams") or {}).get("home") or {})
+        away_names, away_sp = _mlb_team_lineup(away_box)
+        home_names, home_sp = _mlb_team_lineup(home_box)
+        if away_names:
+            lines.append(f"✅ {row['away']} — alineación confirmada")
+            lines.extend([f"  {i}. {name}" for i, name in enumerate(away_names, 1)])
+        else:
+            lines.append(f"⏳ {row['away']} — por confirmar")
+        if away_sp:
+            lines.append(f"  SP: {away_sp}")
+        if home_names:
+            lines.append(f"✅ {row['home']} — alineación confirmada")
+            lines.extend([f"  {i}. {name}" for i, name in enumerate(home_names, 1)])
+        else:
+            lines.append(f"⏳ {row['home']} — por confirmar")
+        if home_sp:
+            lines.append(f"  SP: {home_sp}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def _soccer_summary_lineups(summary):
+    """Return [(team_name, [starters])] from ESPN soccer summary rosters."""
+    out = []
+    rosters = (summary or {}).get("rosters") or []
+    for group in rosters:
+        if not isinstance(group, dict):
+            continue
+        team = group.get("team") or {}
+        team_name = team.get("displayName") or team.get("shortDisplayName") or group.get("displayName") or "Equipo"
+        roster = group.get("roster") or group.get("athletes") or []
+        starters = []
+        for item in roster:
+            if not isinstance(item, dict):
+                continue
+            athlete = item.get("athlete") or item
+            name = athlete.get("displayName") or athlete.get("fullName") or athlete.get("shortName")
+            starter = item.get("starter")
+            if starter is None:
+                starter = item.get("isStarter")
+            if name and starter is True:
+                starters.append(name)
+        if starters:
+            out.append((team_name, starters))
+    return out
+
+
+def _format_soccer_lineups_for_picks(user_id, pick_date):
+    rows = _soccer_visible_rows(user_id, pick_date)
+    if not rows:
+        return "📋 ALINEACIONES FÚTBOL — PICKS TRIPLE PICK\n\nℹ️ No hay picks de fútbol visibles para hoy."
+    events = []
+    leagues = {}
+    for league, _name in SOCCER_LIVE_LEAGUES:
+        data = _espn_get_json(f"soccer/{league}/scoreboard", {"dates": pick_date.replace("-", "")}) or {}
+        for event in data.get("events", []):
+            events.append(event)
+            if event.get("id"):
+                leagues[str(event.get("id"))] = league
+    lines = ["📋 ALINEACIONES FÚTBOL — PICKS TRIPLE PICK", f"📅 {pick_date}", ""]
+    seen = set()
+    for row in rows:
+        key = (row["away"], row["home"])
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(f"🏟️ {row['away']} vs {row['home']}")
+        for r in rows:
+            if r["away"] == row["away"] and r["home"] == row["home"]:
+                lines.append(f"🎯 {r['selection']}")
+        event = _find_espn_event(events, row["away"], row["home"])
+        if not event:
+            lines.append("⚠️ Alineaciones: partido no localizado en el feed")
+            lines.append("")
+            continue
+        event_id = str(event.get("id") or "")
+        summary = _soccer_summary(leagues.get(event_id), event_id)
+        groups = _soccer_summary_lineups(summary)
+        if not groups:
+            lines.append("⏳ Alineaciones titulares: por confirmar")
+        else:
+            for team_name, starters in groups:
+                lines.append(f"✅ {team_name} — titulares")
+                lines.append("  " + " · ".join(starters[:11]))
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def _nba_summary_lineups(summary):
+    """Return [(team_name, [starting five])] from ESPN NBA summary boxscore."""
+    out = []
+    for group in (((summary or {}).get("boxscore") or {}).get("players") or []):
+        if not isinstance(group, dict):
+            continue
+        team = group.get("team") or {}
+        team_name = team.get("displayName") or team.get("shortDisplayName") or "Equipo"
+        starters = []
+        for stat_group in group.get("statistics") or []:
+            for item in stat_group.get("athletes") or []:
+                if not isinstance(item, dict):
+                    continue
+                athlete = item.get("athlete") or {}
+                name = athlete.get("displayName") or athlete.get("fullName") or athlete.get("shortName")
+                starter = item.get("starter")
+                if starter is None:
+                    starter = item.get("isStarter")
+                if name and starter is True and name not in starters:
+                    starters.append(name)
+        if starters:
+            out.append((team_name, starters[:5]))
+    return out
+
+
+def _format_nba_lineups_for_picks(user_id, pick_date):
+    rows = _nba_visible_rows(user_id, pick_date)
+    if not rows:
+        return "📋 ALINEACIONES NBA — PICKS TRIPLE PICK\n\nℹ️ No hay picks NBA visibles para hoy."
+    data = _nba_scoreboard(pick_date) or {}
+    events = data.get("events", [])
+    lines = ["📋 ALINEACIONES NBA — PICKS TRIPLE PICK", f"📅 {pick_date}", ""]
+    seen = set()
+    for row in rows:
+        key = (row["away"], row["home"])
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(f"🏟️ {row['away']} vs {row['home']}")
+        for r in rows:
+            if r["away"] == row["away"] and r["home"] == row["home"]:
+                lines.append(f"🎯 {r['selection']}")
+        event = _find_espn_event(events, row["away"], row["home"])
+        if not event:
+            lines.append("⚠️ Alineaciones: partido no localizado en el feed")
+            lines.append("")
+            continue
+        summary = _nba_summary(event.get("id"))
+        groups = _nba_summary_lineups(summary)
+        if not groups:
+            lines.append("⏳ Quintetos titulares: por confirmar")
+        else:
+            for team_name, starters in groups:
+                lines.append(f"✅ {team_name} — quinteto titular")
+                lines.append("  " + " · ".join(starters))
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+async def mlb_lineups(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _premium_gate(update, "FREE"):
+        return
+    fecha = local_now().strftime("%Y-%m-%d")
+    text = await asyncio.to_thread(_format_mlb_lineups_for_picks, fecha)
+    await update.effective_message.reply_text(text, reply_markup=MLB_MENU_KEYBOARD)
+
+
+async def soccer_lineups(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _premium_gate(update, "FREE"):
+        return
+    user_id = update.effective_user.id if update.effective_user else 0
+    fecha = local_now().strftime("%Y-%m-%d")
+    text = await asyncio.to_thread(_format_soccer_lineups_for_picks, user_id, fecha)
+    await update.effective_message.reply_text(text, reply_markup=SOCCER_MENU_KEYBOARD)
+
+
+async def nba_lineups(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _premium_gate(update, "FREE"):
+        return
+    user_id = update.effective_user.id if update.effective_user else 0
+    fecha = local_now().strftime("%Y-%m-%d")
+    text = await asyncio.to_thread(_format_nba_lineups_for_picks, user_id, fecha)
+    await update.effective_message.reply_text(text, reply_markup=NBA_MENU_KEYBOARD)
+
+
 # ---------------------------------------------------------------------------
 # v3.5.16 SOCCER PLAYER PROPS — live individual progress
 # ---------------------------------------------------------------------------
@@ -6171,11 +6538,20 @@ def _mlb_pick_monitor_rows(pick_date):
             detail = " ".join(x for x in [str(half), str(inning)] if x).strip() or detail
             if outs is not None:
                 detail += f" · {outs} out{'s' if outs != 1 else ''}"
-        pick_state = _selection_live_state(
-            row["selection"], row["away"], row["home"], a_score, h_score, state,
-            market_family=row["market_family"], line=row["line"],
-        )
         payload = {"state": state, "detail": detail, "away_score": a_score, "home_score": h_score}
+        prop_definition = _mlb_prop_definition(row["selection"], row)
+        if prop_definition:
+            boxscore = _mlb_boxscore(row["game_pk"]) if state != "pre" else None
+            snapshot = _mlb_player_prop_snapshot(boxscore, prop_definition)
+            payload["player_prop"] = snapshot
+            payload["player_prop_definition"] = prop_definition
+            payload["player_prop_sport"] = "MLB"
+            pick_state = _mlb_player_prop_state(snapshot, state)
+        else:
+            pick_state = _selection_live_state(
+                row["selection"], row["away"], row["home"], a_score, h_score, state,
+                market_family=row["market_family"], line=row["line"],
+            )
         out.append(("MLB", row, payload, pick_state))
     return out
 
@@ -6642,14 +7018,18 @@ def _live_pick_progress_detail(row, payload):
             return f"Moneyline {selected_name} · partido empatado"
 
     # Player props can carry a verified individual-stat snapshot in the payload.
-    if str(_row_value(row, "product", "") or "").upper() == "PLAYER":
+    has_prop_payload = isinstance(payload, dict) and (
+        payload.get("player_prop_definition") is not None or payload.get("player_prop") is not None
+    )
+    if str(_row_value(row, "product", "") or "").upper() == "PLAYER" or has_prop_payload:
         snapshot = payload.get("player_prop") if isinstance(payload, dict) else None
         prop_sport = str(payload.get("player_prop_sport") or "NBA").upper() if isinstance(payload, dict) else "NBA"
-        progress = (
-            _soccer_player_prop_progress(snapshot)
-            if prop_sport == "SOCCER"
-            else _nba_player_prop_progress(snapshot)
-        )
+        if prop_sport == "SOCCER":
+            progress = _soccer_player_prop_progress(snapshot)
+        elif prop_sport == "MLB":
+            progress = _mlb_player_prop_progress(snapshot)
+        else:
+            progress = _nba_player_prop_progress(snapshot)
         if progress:
             return progress
         definition = payload.get("player_prop_definition") if isinstance(payload, dict) else None
@@ -6795,7 +7175,7 @@ NBA_MENU_KEYBOARD = ReplyKeyboardMarkup(
         ["🏀 Juegos NBA", "🔴 En vivo NBA"],
         ["🔥 Picks NBA", "📊 Resultados NBA"],
         ["🛡️ Survival NBA", "⭐ Top Picks NBA"],
-        ["🎯 Player Props NBA"],
+        ["🎯 Player Props NBA", "📋 Alineaciones NBA"],
         ["📡 Picks en vivo"],
         ["⬅️ Menú principal"],
     ],
@@ -7281,6 +7661,7 @@ async def manual_mlb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🧮 Mercado MLB — comparación mercado/modelo.\n"
         "📈 Rendimiento MLB — W-L, hit rate, unidades y ROI cuando aplica.\n"
         "📋 Historial MLB — registros recientes del tracking.\n"
+        "📋 Alineaciones MLB — titulares de los juegos donde hay picks publicados.\n"
         "🧪 Más opciones — Candidate Pool, Value Board y auditorías avanzadas.\n"
         "📡 Picks en vivo — seguimiento de los picks publicados durante el juego.",
         reply_markup=_manual_keyboard_for(user_id),
@@ -7299,6 +7680,7 @@ async def manual_soccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⭐ Top Picks Fútbol — selecciones principales publicadas.\n"
         "🎯 Player Props Fútbol — props individuales de jugadores.\n"
         "🏆 Ligas Fútbol — ligas con picks disponibles.\n"
+        "📋 Alineaciones Fútbol — onces titulares de los partidos con picks publicados.\n"
         "📡 Picks en vivo — seguimiento de picks durante los partidos.",
         reply_markup=_manual_keyboard_for(user_id),
     )
@@ -7315,6 +7697,7 @@ async def manual_nba(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🛡️ Survival NBA — selecciones Survival.\n"
         "⭐ Top Picks NBA — picks principales.\n"
         "🎯 Player Props NBA — props de jugadores.\n"
+        "📋 Alineaciones NBA — quintetos titulares de los partidos con picks publicados.\n"
         "📡 Picks en vivo — seguimiento de los picks publicados.",
         reply_markup=_manual_keyboard_for(user_id),
     )
@@ -7505,6 +7888,7 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "🛡️ Survival NBA": nba_survival,
         "⭐ Top Picks NBA": nba_top,
         "🎯 Player Props NBA": nba_player_props,
+        "📋 Alineaciones NBA": nba_lineups,
         "📊 Resultados NBA": nba_results,
         "📡 Picks en vivo": live_pick_monitor,
         "⚽ Partidos Fútbol": soccer_games,
@@ -7513,6 +7897,7 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "⭐ Top Picks Fútbol": soccer_top,
         "🎯 Player Props Fútbol": soccer_player_props,
         "🏆 Ligas Fútbol": soccer_leagues,
+        "📋 Alineaciones Fútbol": soccer_lineups,
         "📊 Resultados Fútbol": soccer_results,
         "🔴 En vivo Fútbol": soccer_live,
         "🎯 Picks del día": daily_picks_hub,
@@ -7530,6 +7915,7 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "🧮 Mercado MLB": market,
         "🧮 Mercado": market,
         "📋 Historial MLB": history,
+        "📋 Alineaciones MLB": mlb_lineups,
         "📋 Historial": history,
         "📘 Manual de usuario": manual_menu,
         "📗 Guía general": manual_general,

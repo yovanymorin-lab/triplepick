@@ -76,7 +76,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.5.15"
+BOT_VERSION = "3.5.16"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -5585,6 +5585,243 @@ def _nba_live_text():
     return f"🔴 NBA EN VIVO\n📅 {fecha}\n\n{body}\n\n🔄 Actualizado: {_format_live_stamp()}"
 
 
+
+# ---------------------------------------------------------------------------
+# v3.5.16 SOCCER PLAYER PROPS — live individual progress
+# ---------------------------------------------------------------------------
+
+
+def _soccer_summary(league, event_id):
+    """Fetch one ESPN soccer match summary. Returns None on feed failure."""
+    if not league or not event_id:
+        return None
+    return _espn_get_json(f"soccer/{league}/summary", {"event": str(event_id)})
+
+
+def _soccer_prop_definition(selection, row=None):
+    """Parse supported soccer player props from imported selection text.
+
+    Supported examples:
+      Lamine Yamal Over 1.5 SOT
+      Lamine Yamal 2+ Shots
+      Kylian Mbappe Over 0.5 Goals
+      Pedri 1+ Assists
+      Erling Haaland Anytime Goalscorer
+    """
+    text = str(selection or "").strip()
+    if not text:
+        return None
+
+    # Anytime goalscorer / to score.
+    m = re.match(r"^(.+?)\s+(?:ANYTIME\s+GOALSCORER|TO\s+SCORE)(?:\s+ANYTIME)?$", text, flags=re.I)
+    if m:
+        return {
+            "player": m.group(1).strip(),
+            "direction": "OVER",
+            "line": 0.5,
+            "stat_code": "GOALS",
+            "stat_label": "Goals",
+        }
+
+    # Conventional Over/Under form.
+    m = re.match(r"^(.+?)\s+(OVER|UNDER)\s+([0-9]+(?:\.[0-9]+)?)\s+(.+?)$", text, flags=re.I)
+    if m:
+        player, direction, line_text, stat_text = m.groups()
+    else:
+        # N+ form, e.g. "Player 2+ SOT".
+        m = re.match(r"^(.+?)\s+([0-9]+)\+\s+(.+?)$", text, flags=re.I)
+        if not m:
+            return None
+        player, n_text, stat_text = m.groups()
+        direction = "OVER"
+        # 2+ is equivalent to Over 1.5 for integer counting stats.
+        line_text = str(max(0, int(n_text)) - 0.5)
+
+    stat_key = re.sub(r"[^A-Z0-9 ]+", " ", stat_text.upper())
+    stat_key = re.sub(r"\s+", " ", stat_key).strip()
+    aliases = {
+        "SHOT": "SHOTS", "SHOTS": "SHOTS", "TOTAL SHOTS": "SHOTS",
+        "SOT": "SOT", "SHOT ON TARGET": "SOT", "SHOTS ON TARGET": "SOT",
+        "SHOT ON GOAL": "SOT", "SHOTS ON GOAL": "SOT", "SOG": "SOT",
+        "GOAL": "GOALS", "GOALS": "GOALS",
+        "ASSIST": "ASSISTS", "ASSISTS": "ASSISTS", "AST": "ASSISTS",
+    }
+    code = aliases.get(stat_key)
+    if not code:
+        return None
+    return {
+        "player": player.strip(),
+        "direction": direction.upper(),
+        "line": float(line_text),
+        "stat_code": code,
+        "stat_label": stat_text.strip(),
+    }
+
+
+def _soccer_stat_number(raw):
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return float(int(raw))
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    text = str(raw).strip()
+    # Accept simple display values such as "2", "2.0", or "2/4" (first number).
+    m = re.match(r"^(-?[0-9]+(?:\.[0-9]+)?)", text)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
+def _soccer_stat_alias(name):
+    """Normalize ESPN/provider stat labels to one supported soccer metric."""
+    key = re.sub(r"[^A-Z0-9]+", " ", str(name or "").upper()).strip()
+    compact = key.replace(" ", "")
+    shot_aliases = {
+        "SH", "SHOT", "SHOTS", "TOTALSHOTS", "SHOTSTOTAL", "TOTALSHOTATTEMPTS",
+        "SHOTATTEMPTS", "ATTEMPTS",
+    }
+    sot_aliases = {
+        "SOT", "SOG", "SHOTSONTARGET", "SHOTONTARGET", "SHOTSONGOAL", "SHOTONGOAL",
+        "TOTALSHOTSONTARGET", "ON_TARGET_SCORING_ATT",
+    }
+    goal_aliases = {"G", "GOAL", "GOALS"}
+    assist_aliases = {"A", "AST", "ASSIST", "ASSISTS", "GOALASSISTS"}
+    if compact in {x.replace(" ", "") for x in sot_aliases}:
+        return "SOT"
+    if compact in {x.replace(" ", "") for x in shot_aliases}:
+        return "SHOTS"
+    if compact in {x.replace(" ", "") for x in goal_aliases}:
+        return "GOALS"
+    if compact in {x.replace(" ", "") for x in assist_aliases}:
+        return "ASSISTS"
+    return None
+
+
+def _soccer_collect_named_stats(node, out):
+    """Recursively collect named numeric stats below one athlete object."""
+    if isinstance(node, dict):
+        # Common {name/abbreviation/displayName, value/displayValue} stat item.
+        label = node.get("name") or node.get("abbreviation") or node.get("displayName") or node.get("label")
+        metric = _soccer_stat_alias(label)
+        if metric:
+            value = _soccer_stat_number(node.get("value"))
+            if value is None:
+                value = _soccer_stat_number(node.get("displayValue"))
+            if value is not None:
+                out[metric] = max(value, out.get(metric, value))
+
+        # Some feeds use direct key:value pairs such as goals:1, assists:0.
+        for k, v in node.items():
+            metric = _soccer_stat_alias(k)
+            if metric:
+                value = _soccer_stat_number(v)
+                if value is not None:
+                    out[metric] = max(value, out.get(metric, value))
+
+        # Paired names + stats arrays, similar to other ESPN box-score payloads.
+        names = node.get("names") or node.get("labels")
+        stats = node.get("stats")
+        if isinstance(names, list) and isinstance(stats, list):
+            for name, raw in zip(names, stats):
+                metric = _soccer_stat_alias(name)
+                value = _soccer_stat_number(raw)
+                if metric and value is not None:
+                    out[metric] = max(value, out.get(metric, value))
+
+        for k, v in node.items():
+            if k == "athlete":
+                continue
+            if isinstance(v, (dict, list)):
+                _soccer_collect_named_stats(v, out)
+    elif isinstance(node, list):
+        for item in node:
+            _soccer_collect_named_stats(item, out)
+
+
+def _soccer_boxscore_players(summary):
+    """Build {player_name: {SHOTS,SOT,GOALS,ASSISTS}} from flexible ESPN summary shapes."""
+    result = {}
+    seen_nodes = set()
+
+    def walk(node):
+        if isinstance(node, dict):
+            athlete = node.get("athlete")
+            if isinstance(athlete, dict):
+                pname = athlete.get("displayName") or athlete.get("fullName") or athlete.get("shortName")
+                if pname:
+                    stats = {}
+                    _soccer_collect_named_stats(node, stats)
+                    if stats:
+                        target = result.setdefault(pname, {})
+                        for metric, value in stats.items():
+                            # Same athlete may appear in multiple summary sections; use max, never sum duplicates.
+                            target[metric] = max(value, target.get(metric, value))
+            for v in node.values():
+                if isinstance(v, (dict, list)):
+                    walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    if summary:
+        walk(summary)
+    return result
+
+
+def _soccer_player_prop_snapshot(summary, definition):
+    if not summary or not definition:
+        return None
+    players = _soccer_boxscore_players(summary)
+    for pname, stats in players.items():
+        if _person_name_matches(pname, definition["player"]):
+            value = stats.get(definition["stat_code"])
+            if value is not None:
+                return {**definition, "player": pname, "value": float(value)}
+    return None
+
+
+def _soccer_player_prop_state(snapshot, state):
+    if state == "pre":
+        return "⏳ NO INICIADO"
+    if not snapshot:
+        return "⚠️ EN JUEGO · PROP SIN DATO INDIVIDUAL" if state != "post" else "🏁 FINAL · PROP PENDIENTE DE LIQUIDAR"
+    value = float(snapshot["value"])
+    line = float(snapshot["line"])
+    over = snapshot["direction"] == "OVER"
+    final = state == "post"
+    if final:
+        if value == line:
+            return "🏁 FINAL · ➖ PUSH"
+        won = value > line if over else value < line
+        return "🏁 FINAL · ✅ GANADO" if won else "🏁 FINAL · ❌ PERDIDO"
+    if over:
+        if value > line:
+            return f"✅ GANANDO · {value:g}/{line:g}"
+        return f"⚠️ EN RIESGO · {value:g}/{line:g}"
+    # Shots/goals/assists are cumulative; once an Under crosses its line it cannot recover.
+    if value < line:
+        return f"✅ GANANDO · {value:g}/{line:g}"
+    return f"❌ PERDIENDO · {value:g}/{line:g}"
+
+
+def _soccer_player_prop_progress(snapshot):
+    if not snapshot:
+        return None
+    value = float(snapshot["value"])
+    line = float(snapshot["line"])
+    player = snapshot["player"]
+    label = snapshot["stat_label"]
+    direction = snapshot["direction"].title()
+    if snapshot["direction"] == "OVER":
+        detail = f"margen +{value-line:g}" if value > line else f"faltan {max(0.0, line-value):g}"
+    else:
+        detail = f"margen {line-value:g}" if value < line else f"excede por {value-line:g}"
+    return f"{player} {direction} {line:g} {label} · lleva {value:g} · {detail}"
+
 def _soccer_games_text():
     fecha = local_now().strftime("%Y-%m-%d")
     seen = set()
@@ -5948,20 +6185,40 @@ def _soccer_pick_monitor_rows(user_id, pick_date):
     if not rows:
         return []
     events = []
+    event_leagues = {}
     for league, _name in SOCCER_LIVE_LEAGUES:
         data = _espn_get_json(f"soccer/{league}/scoreboard", {"dates": pick_date.replace("-", "")}) or {}
-        events.extend(data.get("events", []))
+        for event in data.get("events", []):
+            events.append(event)
+            if event.get("id"):
+                event_leagues[str(event.get("id"))] = league
     out = []
+    summary_cache = {}
     for row in rows:
         event = _find_espn_event(events, row["away"], row["home"])
         if not event:
             out.append(("SOCCER", row, None, "⏳ Sin marcador disponible"))
             continue
         p = _event_score_state(event)
-        pick_state = _selection_live_state(
-            row["selection"], row["away"], row["home"], p["away_score"], p["home_score"], p["state"],
-            product=row["product"], line=row["line"],
-        )
+        if str(_row_value(row, "product", "") or "").upper() == "PLAYER":
+            definition = _soccer_prop_definition(row["selection"], row)
+            snapshot = None
+            if definition and p["state"] != "pre":
+                event_id = str(event.get("id") or "")
+                league = event_leagues.get(event_id)
+                cache_key = (league, event_id)
+                if cache_key not in summary_cache:
+                    summary_cache[cache_key] = _soccer_summary(league, event_id)
+                snapshot = _soccer_player_prop_snapshot(summary_cache.get(cache_key), definition)
+            p["player_prop"] = snapshot
+            p["player_prop_definition"] = definition
+            p["player_prop_sport"] = "SOCCER"
+            pick_state = _soccer_player_prop_state(snapshot, p["state"])
+        else:
+            pick_state = _selection_live_state(
+                row["selection"], row["away"], row["home"], p["away_score"], p["home_score"], p["state"],
+                product=row["product"], line=row["line"],
+            )
         out.append(("SOCCER", row, p, pick_state))
     return out
 
@@ -5990,6 +6247,7 @@ def _nba_pick_monitor_rows(user_id, pick_date):
                 snapshot = _nba_player_prop_snapshot(summary_cache.get(event_id), definition)
             p["player_prop"] = snapshot
             p["player_prop_definition"] = definition
+            p["player_prop_sport"] = "NBA"
             pick_state = _nba_player_prop_state(snapshot, p["state"])
         else:
             pick_state = _selection_live_state(
@@ -6383,10 +6641,15 @@ def _live_pick_progress_detail(row, payload):
                 return f"Moneyline {selected_name} · desventaja actual {fmt(margin)}"
             return f"Moneyline {selected_name} · partido empatado"
 
-    # NBA player props can carry a verified ESPN boxscore snapshot in the payload.
+    # Player props can carry a verified individual-stat snapshot in the payload.
     if str(_row_value(row, "product", "") or "").upper() == "PLAYER":
         snapshot = payload.get("player_prop") if isinstance(payload, dict) else None
-        progress = _nba_player_prop_progress(snapshot)
+        prop_sport = str(payload.get("player_prop_sport") or "NBA").upper() if isinstance(payload, dict) else "NBA"
+        progress = (
+            _soccer_player_prop_progress(snapshot)
+            if prop_sport == "SOCCER"
+            else _nba_player_prop_progress(snapshot)
+        )
         if progress:
             return progress
         definition = payload.get("player_prop_definition") if isinstance(payload, dict) else None

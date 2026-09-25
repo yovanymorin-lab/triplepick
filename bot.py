@@ -88,7 +88,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.5.18"
+BOT_VERSION = "3.5.19"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -4803,6 +4803,7 @@ SOCCER_MENU_KEYBOARD = ReplyKeyboardMarkup(
         ["🛡️ Survival Fútbol", "⭐ Top Picks Fútbol"],
         ["🎯 Player Props Fútbol", "🏆 Ligas Fútbol"],
         ["📋 Alineaciones Fútbol", "🌦️ Clima Fútbol"],
+        ["📈 Últimos 10 Fútbol"],
         ["📡 Picks en vivo"],
         ["⬅️ Menú principal"],
     ],
@@ -4818,6 +4819,7 @@ MLB_MENU_KEYBOARD = ReplyKeyboardMarkup(
         ["🧮 Mercado MLB", "📈 Rendimiento MLB"],
         ["📋 Historial MLB", "🧪 Más opciones"],
         ["📋 Alineaciones MLB", "🌦️ Clima MLB"],
+        ["🏟️ Dimensiones MLB", "📈 Últimos 10 MLB"],
         ["📡 Picks en vivo"],
         ["⬅️ Menú principal"],
     ],
@@ -6324,6 +6326,341 @@ async def soccer_weather(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
+# v3.5.19 VENUE DIMENSIONS + LAST-10 FORM FOR RECOMMENDED PICKS
+# ---------------------------------------------------------------------------
+
+
+def _safe_score_number(value):
+    try:
+        if isinstance(value, dict):
+            value = value.get("value") or value.get("displayValue")
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _form_summary(results):
+    """results: most-recent-first list of W/L/D."""
+    results = [r for r in results if r in {"W", "L", "D"}][:10]
+    if not results:
+        return None
+    wins = results.count("W")
+    losses = results.count("L")
+    draws = results.count("D")
+    first = results[0]
+    streak_n = 0
+    for r in results:
+        if r == first:
+            streak_n += 1
+        else:
+            break
+    record = f"{wins}-{losses}" if draws == 0 else f"{wins}-{draws}-{losses}"
+    pct = (wins / len(results) * 100.0) if results else 0.0
+    return {
+        "record": record,
+        "wins": wins,
+        "losses": losses,
+        "draws": draws,
+        "win_pct": pct,
+        "sequence": " · ".join(results),
+        "streak": f"{first}{streak_n}",
+        "games": len(results),
+    }
+
+
+def _mlb_game_info(game_pk):
+    data = safe_get_json(
+        f"{MLB_API}/schedule",
+        {"sportId": 1, "gamePk": int(game_pk), "hydrate": "venue"},
+        cache_ttl=300,
+    ) or {}
+    for block in data.get("dates", []):
+        games = block.get("games") or []
+        if games:
+            return games[0]
+    return None
+
+
+def _mlb_venue_dimensions(venue_id):
+    if not venue_id:
+        return None
+    data = safe_get_json(
+        f"{MLB_API}/venues/{int(venue_id)}",
+        {"hydrate": "location,fieldInfo,timezone"},
+        cache_ttl=86400,
+    ) or {}
+    venues = data.get("venues") or []
+    if not venues:
+        return None
+    venue = venues[0]
+    field = venue.get("fieldInfo") or {}
+    location = venue.get("location") or {}
+    return {
+        "name": venue.get("name") or "Estadio MLB",
+        "city": location.get("city") or "",
+        "roof": field.get("roofType") or "N/D",
+        "turf": field.get("turfType") or "N/D",
+        "capacity": field.get("capacity"),
+        "left_line": field.get("leftLine"),
+        "left_center": field.get("leftCenter"),
+        "center": field.get("center"),
+        "right_center": field.get("rightCenter"),
+        "right_line": field.get("rightLine"),
+    }
+
+
+def _format_mlb_dimensions_for_picks(pick_date):
+    rows = _official_pick_rows(pick_date)
+    if not rows:
+        return "🏟️ DIMENSIONES MLB — PICKS TRIPLE PICK\n\nℹ️ No hay picks MLB publicados para hoy."
+    lines = ["🏟️ DIMENSIONES MLB — PICKS TRIPLE PICK", f"📅 {pick_date}", ""]
+    seen = set()
+    for row in rows:
+        game_pk = int(row["game_pk"] or 0)
+        if game_pk in seen:
+            continue
+        seen.add(game_pk)
+        lines.append(f"⚾ {row['away']} vs {row['home']}")
+        for related in rows:
+            if int(related["game_pk"] or 0) == game_pk:
+                lines.append(f"🎯 {related['pick_text'] or related['selection']}")
+        game = _mlb_game_info(game_pk)
+        venue = (game or {}).get("venue") or {}
+        meta = _mlb_venue_dimensions(venue.get("id"))
+        if not meta:
+            lines.extend(["⚠️ Dimensiones del parque no disponibles", ""])
+            continue
+        place = meta["name"] + (f" · {meta['city']}" if meta.get("city") else "")
+        lines.append(f"📍 {place}")
+        lines.append(f"🏠 Techo: {meta['roof']} · Superficie: {meta['turf']}")
+        if meta.get("capacity"):
+            lines.append(f"👥 Capacidad: {meta['capacity']}")
+        dims = [
+            ("LF", meta.get("left_line")),
+            ("LCF", meta.get("left_center")),
+            ("CF", meta.get("center")),
+            ("RCF", meta.get("right_center")),
+            ("RF", meta.get("right_line")),
+        ]
+        dims = [(label, val) for label, val in dims if val not in (None, "", "N/D")]
+        if dims:
+            lines.append("📏 Outfield: " + " · ".join(f"{label} {val}" for label, val in dims))
+        else:
+            lines.append("📏 Outfield: dimensiones no publicadas por el feed")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def _mlb_team_last10(team_id, pick_date):
+    try:
+        end_dt = datetime.strptime(pick_date, "%Y-%m-%d") - timedelta(days=1)
+    except ValueError:
+        end_dt = local_now().replace(tzinfo=None) - timedelta(days=1)
+    start_dt = end_dt - timedelta(days=60)
+    data = safe_get_json(
+        f"{MLB_API}/schedule",
+        {
+            "sportId": 1,
+            "teamId": int(team_id),
+            "startDate": start_dt.strftime("%Y-%m-%d"),
+            "endDate": end_dt.strftime("%Y-%m-%d"),
+        },
+        cache_ttl=900,
+    ) or {}
+    completed = []
+    for block in data.get("dates", []):
+        for game in block.get("games", []):
+            if (game.get("status") or {}).get("abstractGameState") != "Final":
+                continue
+            teams = game.get("teams") or {}
+            home = teams.get("home") or {}
+            away = teams.get("away") or {}
+            is_home = int(((home.get("team") or {}).get("id") or 0)) == int(team_id)
+            own = home if is_home else away
+            opp = away if is_home else home
+            own_score = _safe_score_number(own.get("score"))
+            opp_score = _safe_score_number(opp.get("score"))
+            if own_score is None or opp_score is None:
+                continue
+            result = "W" if own_score > opp_score else "L"
+            completed.append((game.get("gameDate") or block.get("date") or "", result))
+    completed.sort(key=lambda x: x[0], reverse=True)
+    return _form_summary([r for _, r in completed[:10]])
+
+
+def _format_mlb_last10_for_picks(pick_date):
+    rows = _official_pick_rows(pick_date)
+    if not rows:
+        return "📈 ÚLTIMOS 10 MLB — PICKS TRIPLE PICK\n\nℹ️ No hay picks MLB publicados para hoy."
+    lines = ["📈 ÚLTIMOS 10 MLB — PICKS TRIPLE PICK", f"📅 {pick_date}", ""]
+    seen_teams = set()
+    for row in rows:
+        game = _mlb_game_info(int(row["game_pk"] or 0)) or {}
+        teams = game.get("teams") or {}
+        for side in ("away", "home"):
+            team = ((teams.get(side) or {}).get("team") or {})
+            tid = team.get("id")
+            name = team.get("name") or row[side]
+            if not tid or tid in seen_teams:
+                continue
+            seen_teams.add(tid)
+            form = _mlb_team_last10(tid, pick_date)
+            if not form:
+                lines.append(f"⚾ {name}: forma no disponible")
+                continue
+            lines.append(f"⚾ {name} — {form['record']} · {form['win_pct']:.0f}% victorias · Racha {form['streak']}")
+            lines.append(f"   {form['sequence']}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def _espn_completed_team_form(sport_path, team_id):
+    data = _espn_get_json(f"{sport_path}/teams/{team_id}/schedule", {"limit": 40}) or {}
+    games = []
+    for event in data.get("events", []):
+        competition = (event.get("competitions") or [{}])[0]
+        status = ((competition.get("status") or {}).get("type") or {})
+        if not status.get("completed"):
+            continue
+        competitors = competition.get("competitors") or []
+        own = None
+        opp = None
+        for c in competitors:
+            cid = str(((c.get("team") or {}).get("id") or c.get("id") or ""))
+            if cid == str(team_id):
+                own = c
+            else:
+                opp = c
+        if not own or not opp:
+            continue
+        # Prefer ESPN's explicit winner flag, then fall back to score comparison.
+        if own.get("winner") is True:
+            result = "W"
+        elif opp.get("winner") is True:
+            result = "L"
+        else:
+            own_score = _safe_score_number(own.get("score"))
+            opp_score = _safe_score_number(opp.get("score"))
+            if own_score is None or opp_score is None:
+                continue
+            if own_score > opp_score:
+                result = "W"
+            elif own_score < opp_score:
+                result = "L"
+            else:
+                result = "D"
+        games.append((event.get("date") or "", result))
+    games.sort(key=lambda x: x[0], reverse=True)
+    return _form_summary([r for _, r in games[:10]])
+
+
+def _format_soccer_last10_for_picks(user_id, pick_date):
+    rows = _soccer_visible_rows(user_id, pick_date)
+    if not rows:
+        return "📈 ÚLTIMOS 10 FÚTBOL — PICKS TRIPLE PICK\n\nℹ️ No hay picks de fútbol visibles para hoy."
+    event_rows = []
+    for league in SOCCER_LIVE_LEAGUES:
+        data = _espn_get_json(f"soccer/{league}/scoreboard", {"dates": pick_date.replace("-", "")}) or {}
+        for event in data.get("events", []):
+            event_rows.append((league, event))
+    lines = ["📈 ÚLTIMOS 10 FÚTBOL — PICKS TRIPLE PICK", f"📅 {pick_date}", ""]
+    seen_teams = set()
+    for row in rows:
+        match = None
+        league = None
+        for lg, event in event_rows:
+            if _find_espn_event([event], row["away"], row["home"]):
+                match = event
+                league = lg
+                break
+        if not match:
+            lines.append(f"⚽ {row['away']} vs {row['home']} — partido no localizado para calcular forma")
+            continue
+        _competition, away, home = _espn_competitors(match)
+        for comp, fallback in ((away, row["away"]), (home, row["home"])):
+            team = comp.get("team") or {}
+            tid = team.get("id") or comp.get("id")
+            name = team.get("displayName") or team.get("shortDisplayName") or fallback
+            key = (league, str(tid))
+            if not tid or key in seen_teams:
+                continue
+            seen_teams.add(key)
+            form = _espn_completed_team_form(f"soccer/{league}", tid)
+            if not form:
+                lines.append(f"⚽ {name}: forma no disponible")
+                continue
+            lines.append(f"⚽ {name} — {form['record']} · {form['win_pct']:.0f}% victorias · Racha {form['streak']}")
+            lines.append(f"   {form['sequence']}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def _format_nba_last10_for_picks(user_id, pick_date):
+    rows = _nba_visible_rows(user_id, pick_date)
+    if not rows:
+        return "📈 ÚLTIMOS 10 NBA — PICKS TRIPLE PICK\n\nℹ️ No hay picks NBA visibles para hoy."
+    data = _nba_scoreboard(pick_date) or {}
+    events = data.get("events") or []
+    lines = ["📈 ÚLTIMOS 10 NBA — PICKS TRIPLE PICK", f"📅 {pick_date}", ""]
+    seen_teams = set()
+    for row in rows:
+        event = _find_espn_event(events, row["away"], row["home"])
+        if not event:
+            lines.append(f"🏀 {row['away']} vs {row['home']} — partido no localizado para calcular forma")
+            continue
+        _competition, away, home = _espn_competitors(event)
+        for comp, fallback in ((away, row["away"]), (home, row["home"])):
+            team = comp.get("team") or {}
+            tid = team.get("id") or comp.get("id")
+            name = team.get("displayName") or team.get("shortDisplayName") or fallback
+            if not tid or str(tid) in seen_teams:
+                continue
+            seen_teams.add(str(tid))
+            form = _espn_completed_team_form("basketball/nba", tid)
+            if not form:
+                lines.append(f"🏀 {name}: forma no disponible")
+                continue
+            lines.append(f"🏀 {name} — {form['record']} · {form['win_pct']:.0f}% victorias · Racha {form['streak']}")
+            lines.append(f"   {form['sequence']}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+async def mlb_dimensions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _premium_gate(update, "FREE"):
+        return
+    fecha = local_now().strftime("%Y-%m-%d")
+    text = await asyncio.to_thread(_format_mlb_dimensions_for_picks, fecha)
+    await update.effective_message.reply_text(text, reply_markup=MLB_MENU_KEYBOARD)
+
+
+async def mlb_last10(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _premium_gate(update, "FREE"):
+        return
+    fecha = local_now().strftime("%Y-%m-%d")
+    text = await asyncio.to_thread(_format_mlb_last10_for_picks, fecha)
+    await update.effective_message.reply_text(text, reply_markup=MLB_MENU_KEYBOARD)
+
+
+async def soccer_last10(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _premium_gate(update, "FREE"):
+        return
+    user_id = update.effective_user.id if update.effective_user else 0
+    fecha = local_now().strftime("%Y-%m-%d")
+    text = await asyncio.to_thread(_format_soccer_last10_for_picks, user_id, fecha)
+    await update.effective_message.reply_text(text, reply_markup=SOCCER_MENU_KEYBOARD)
+
+
+async def nba_last10(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _premium_gate(update, "FREE"):
+        return
+    user_id = update.effective_user.id if update.effective_user else 0
+    fecha = local_now().strftime("%Y-%m-%d")
+    text = await asyncio.to_thread(_format_nba_last10_for_picks, user_id, fecha)
+    await update.effective_message.reply_text(text, reply_markup=NBA_MENU_KEYBOARD)
+
+
+# ---------------------------------------------------------------------------
 # v3.5.16 SOCCER PLAYER PROPS — live individual progress
 # ---------------------------------------------------------------------------
 
@@ -7546,6 +7883,7 @@ NBA_MENU_KEYBOARD = ReplyKeyboardMarkup(
         ["🔥 Picks NBA", "📊 Resultados NBA"],
         ["🛡️ Survival NBA", "⭐ Top Picks NBA"],
         ["🎯 Player Props NBA", "📋 Alineaciones NBA"],
+        ["📈 Últimos 10 NBA"],
         ["📡 Picks en vivo"],
         ["⬅️ Menú principal"],
     ],
@@ -8033,6 +8371,8 @@ async def manual_mlb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📋 Historial MLB — registros recientes del tracking.\n"
         "📋 Alineaciones MLB — titulares de los juegos donde hay picks publicados.\n"
         "🌦️ Clima MLB — pronóstico a la hora del juego, techo e impacto climático de nuestros picks.\n"
+        "🏟️ Dimensiones MLB — LF/LCF/CF/RCF/RF, superficie y techo del parque de nuestros picks.\n"
+        "📈 Últimos 10 MLB — récord, porcentaje de victorias, secuencia y racha reciente.\n"
         "🧪 Más opciones — Candidate Pool, Value Board y auditorías avanzadas.\n"
         "📡 Picks en vivo — seguimiento de los picks publicados durante el juego.",
         reply_markup=_manual_keyboard_for(user_id),
@@ -8053,6 +8393,7 @@ async def manual_soccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🏆 Ligas Fútbol — ligas con picks disponibles.\n"
         "📋 Alineaciones Fútbol — onces titulares de los partidos con picks publicados.\n"
         "🌦️ Clima Fútbol — pronóstico a la hora del partido e impacto climático de nuestros picks.\n"
+        "📈 Últimos 10 Fútbol — W-D-L, porcentaje de victorias, secuencia y racha reciente.\n"
         "📡 Picks en vivo — seguimiento de picks durante los partidos.",
         reply_markup=_manual_keyboard_for(user_id),
     )
@@ -8070,6 +8411,7 @@ async def manual_nba(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⭐ Top Picks NBA — picks principales.\n"
         "🎯 Player Props NBA — props de jugadores.\n"
         "📋 Alineaciones NBA — quintetos titulares de los partidos con picks publicados.\n"
+        "📈 Últimos 10 NBA — récord, porcentaje de victorias, secuencia y racha reciente.\n"
         "📡 Picks en vivo — seguimiento de los picks publicados.",
         reply_markup=_manual_keyboard_for(user_id),
     )
@@ -8261,6 +8603,7 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "⭐ Top Picks NBA": nba_top,
         "🎯 Player Props NBA": nba_player_props,
         "📋 Alineaciones NBA": nba_lineups,
+        "📈 Últimos 10 NBA": nba_last10,
         "📊 Resultados NBA": nba_results,
         "📡 Picks en vivo": live_pick_monitor,
         "⚽ Partidos Fútbol": soccer_games,
@@ -8271,6 +8614,7 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "🏆 Ligas Fútbol": soccer_leagues,
         "📋 Alineaciones Fútbol": soccer_lineups,
         "🌦️ Clima Fútbol": soccer_weather,
+        "📈 Últimos 10 Fútbol": soccer_last10,
         "📊 Resultados Fútbol": soccer_results,
         "🔴 En vivo Fútbol": soccer_live,
         "🎯 Picks del día": daily_picks_hub,
@@ -8290,6 +8634,8 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "📋 Historial MLB": history,
         "📋 Alineaciones MLB": mlb_lineups,
         "🌦️ Clima MLB": mlb_weather,
+        "🏟️ Dimensiones MLB": mlb_dimensions,
+        "📈 Últimos 10 MLB": mlb_last10,
         "📋 Historial": history,
         "📘 Manual de usuario": manual_menu,
         "📗 Guía general": manual_general,

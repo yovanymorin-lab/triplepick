@@ -76,7 +76,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.5.11"
+BOT_VERSION = "3.5.12"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -4443,10 +4443,24 @@ async def admin_live_alert_test(update: Update, context: ContextTypes.DEFAULT_TY
         + message
         + "\n\n✅ Si recibes este mensaje, el canal de notificaciones en vivo está funcionando."
     )
-    await context.bot.send_message(chat_id=int(user.id), text=message)
+    try:
+        # Reply in the exact chat where the admin launched the test. This avoids
+        # failures caused by attempting a separate private-message delivery.
+        await update.effective_message.reply_text(
+            message,
+            reply_markup=ADMIN_MENU_KEYBOARD,
+        )
+    except Exception as exc:
+        print(f"Admin live alert test delivery error: {exc}")
+        await update.effective_message.reply_text(
+            f"❌ No pude enviar la alerta de prueba.\n\nError Telegram: {exc}",
+            reply_markup=ADMIN_MENU_KEYBOARD,
+        )
+        return
+
     await update.effective_message.reply_text(
-        "✅ Prueba enviada a tu chat privado.\n\n"
-        "Simulé el cambio ❌ PERDIENDO → ✅ GANANDO. "
+        "✅ PRUEBA COMPLETADA\n\n"
+        "La alerta simulada fue enviada en este mismo chat. "
         "No se modificó ningún pick real ni el historial del watcher.",
         reply_markup=ADMIN_MENU_KEYBOARD,
     )

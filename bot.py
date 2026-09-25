@@ -46,6 +46,18 @@ LOCAL_TZ = resolve_timezone(AUTO_TZ)
 
 MLB_API = "https://statsapi.mlb.com/api/v1"
 ESPN_API_BASE = "https://site.api.espn.com/apis/site/v2/sports"
+
+# v3.5.18 — Weather for recommended MLB/Soccer picks.
+WEATHER_ENABLED = os.environ.get("WEATHER_ENABLED", "1").strip().lower() not in {
+    "0", "false", "no", "off"
+}
+OPEN_METEO_FORECAST_URL = os.environ.get(
+    "OPEN_METEO_FORECAST_URL", "https://api.open-meteo.com/v1/forecast"
+).strip()
+OPEN_METEO_GEOCODING_URL = os.environ.get(
+    "OPEN_METEO_GEOCODING_URL", "https://geocoding-api.open-meteo.com/v1/search"
+).strip()
+WEATHER_CACHE_TTL = max(300, int(os.environ.get("WEATHER_CACHE_TTL", "900")))
 SOCCER_LIVE_LEAGUES = [
     x.strip() for x in os.environ.get(
         "SOCCER_LIVE_LEAGUES",
@@ -76,7 +88,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.5.17"
+BOT_VERSION = "3.5.18"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -4790,7 +4802,8 @@ SOCCER_MENU_KEYBOARD = ReplyKeyboardMarkup(
         ["🔥 Picks Fútbol", "📊 Resultados Fútbol"],
         ["🛡️ Survival Fútbol", "⭐ Top Picks Fútbol"],
         ["🎯 Player Props Fútbol", "🏆 Ligas Fútbol"],
-        ["📋 Alineaciones Fútbol", "📡 Picks en vivo"],
+        ["📋 Alineaciones Fútbol", "🌦️ Clima Fútbol"],
+        ["📡 Picks en vivo"],
         ["⬅️ Menú principal"],
     ],
     resize_keyboard=True,
@@ -4804,7 +4817,8 @@ MLB_MENU_KEYBOARD = ReplyKeyboardMarkup(
         ["🔥 Picks MLB", "📊 Resultados MLB"],
         ["🧮 Mercado MLB", "📈 Rendimiento MLB"],
         ["📋 Historial MLB", "🧪 Más opciones"],
-        ["📋 Alineaciones MLB", "📡 Picks en vivo"],
+        ["📋 Alineaciones MLB", "🌦️ Clima MLB"],
+        ["📡 Picks en vivo"],
         ["⬅️ Menú principal"],
     ],
     resize_keyboard=True,
@@ -5951,6 +5965,362 @@ async def nba_lineups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fecha = local_now().strftime("%Y-%m-%d")
     text = await asyncio.to_thread(_format_nba_lineups_for_picks, user_id, fecha)
     await update.effective_message.reply_text(text, reply_markup=NBA_MENU_KEYBOARD)
+
+
+# ---------------------------------------------------------------------------
+# v3.5.18 WEATHER — RECOMMENDED MLB / SOCCER PICKS
+# ---------------------------------------------------------------------------
+
+
+def _weather_code_label(code):
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        return "Condición N/D"
+    if code == 0:
+        return "Despejado"
+    if code in {1, 2}:
+        return "Parcialmente nublado"
+    if code == 3:
+        return "Nublado"
+    if code in {45, 48}:
+        return "Niebla"
+    if code in {51, 53, 55, 56, 57}:
+        return "Llovizna"
+    if code in {61, 63, 65, 66, 67}:
+        return "Lluvia"
+    if code in {71, 73, 75, 77}:
+        return "Nieve"
+    if code in {80, 81, 82}:
+        return "Chubascos"
+    if code in {85, 86}:
+        return "Chubascos de nieve"
+    if code in {95, 96, 99}:
+        return "Tormenta"
+    return f"Código meteorológico {code}"
+
+
+def _wind_compass(degrees):
+    try:
+        deg = float(degrees) % 360
+    except (TypeError, ValueError):
+        return "N/D"
+    labels = ["N", "NE", "E", "SE", "S", "SO", "O", "NO"]
+    return labels[int((deg + 22.5) // 45) % 8]
+
+
+def _parse_external_datetime(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _weather_forecast_at(latitude, longitude, event_dt):
+    """Return nearest hourly Open-Meteo forecast to event_dt."""
+    if not WEATHER_ENABLED or latitude is None or longitude is None or event_dt is None:
+        return None
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "hourly": (
+            "temperature_2m,apparent_temperature,relative_humidity_2m,"
+            "precipitation_probability,precipitation,rain,weather_code,"
+            "wind_speed_10m,wind_direction_10m,wind_gusts_10m"
+        ),
+        "temperature_unit": "fahrenheit",
+        "wind_speed_unit": "mph",
+        "timezone": "auto",
+        "forecast_days": 16,
+    }
+    data = safe_get_json(OPEN_METEO_FORECAST_URL, params, cache_ttl=WEATHER_CACHE_TTL)
+    if not data:
+        return None
+    hourly = data.get("hourly") or {}
+    times = hourly.get("time") or []
+    if not times:
+        return None
+    offset = int(data.get("utc_offset_seconds") or 0)
+    local_tz = timezone(timedelta(seconds=offset))
+    if event_dt.tzinfo is None:
+        event_dt = event_dt.replace(tzinfo=timezone.utc)
+    target = event_dt.astimezone(local_tz).replace(tzinfo=None)
+    nearest_idx = None
+    nearest_delta = None
+    for idx, value in enumerate(times):
+        try:
+            dt = datetime.fromisoformat(value)
+        except (TypeError, ValueError):
+            continue
+        delta = abs((dt - target).total_seconds())
+        if nearest_delta is None or delta < nearest_delta:
+            nearest_delta = delta
+            nearest_idx = idx
+    if nearest_idx is None:
+        return None
+
+    def value(name):
+        arr = hourly.get(name) or []
+        return arr[nearest_idx] if nearest_idx < len(arr) else None
+
+    return {
+        "forecast_time": times[nearest_idx],
+        "timezone": data.get("timezone") or "",
+        "temperature_f": value("temperature_2m"),
+        "apparent_f": value("apparent_temperature"),
+        "humidity": value("relative_humidity_2m"),
+        "precip_probability": value("precipitation_probability"),
+        "precipitation_mm": value("precipitation"),
+        "rain_mm": value("rain"),
+        "weather_code": value("weather_code"),
+        "wind_mph": value("wind_speed_10m"),
+        "wind_direction": value("wind_direction_10m"),
+        "gust_mph": value("wind_gusts_10m"),
+    }
+
+
+def _weather_impact(weather, roof_type=None):
+    """Objective weather severity classification; does not change the pick."""
+    roof = (roof_type or "").strip().lower()
+    if roof and any(token in roof for token in ("dome", "fixed", "indoor", "closed")) and "retract" not in roof:
+        return "🟢 BAJO", "Estadio cubierto: el clima exterior no tiene impacto directo."
+    if not weather:
+        return "⚪ N/D", "Pronóstico no disponible."
+
+    def num(key, default=0.0):
+        try:
+            return float(weather.get(key))
+        except (TypeError, ValueError):
+            return default
+
+    temp = num("temperature_f", 70)
+    pop = num("precip_probability")
+    precip = num("precipitation_mm")
+    wind = num("wind_mph")
+    gust = num("gust_mph")
+    try:
+        code = int(weather.get("weather_code"))
+    except (TypeError, ValueError):
+        code = -1
+
+    high_reasons = []
+    medium_reasons = []
+    if code in {95, 96, 99}:
+        high_reasons.append("tormenta")
+    if gust >= 30 or wind >= 20:
+        high_reasons.append("viento fuerte")
+    elif gust >= 20 or wind >= 12:
+        medium_reasons.append("viento moderado")
+    if pop >= 70 and precip >= 2.0:
+        high_reasons.append("lluvia probable/intensa")
+    elif pop >= 40 or precip >= 0.5:
+        medium_reasons.append("riesgo de lluvia")
+    if temp <= 35 or temp >= 100:
+        high_reasons.append("temperatura extrema")
+    elif temp <= 45 or temp >= 90:
+        medium_reasons.append("temperatura exigente")
+
+    retract_note = " Techo retráctil: el impacto final depende de si se cierra." if "retract" in roof else ""
+    if high_reasons:
+        return "🔴 ALTO", ", ".join(dict.fromkeys(high_reasons)).capitalize() + "." + retract_note
+    if medium_reasons:
+        return "🟡 MEDIO", ", ".join(dict.fromkeys(medium_reasons)).capitalize() + "." + retract_note
+    return "🟢 BAJO", "Condiciones generalmente estables." + retract_note
+
+
+def _format_weather_lines(weather, impact, reason):
+    if not weather:
+        return ["🌦️ Pronóstico: no disponible", f"⚠️ Impacto climático: {impact}", f"ℹ️ {reason}"]
+
+    def fmt(value, suffix="", digits=0):
+        try:
+            return f"{float(value):.{digits}f}{suffix}"
+        except (TypeError, ValueError):
+            return "N/D"
+
+    wind_dir = _wind_compass(weather.get("wind_direction"))
+    return [
+        f"🌤️ Condición: {_weather_code_label(weather.get('weather_code'))}",
+        f"🌡️ Temperatura: {fmt(weather.get('temperature_f'), '°F')} · sensación {fmt(weather.get('apparent_f'), '°F')}",
+        f"🌧️ Lluvia: {fmt(weather.get('precip_probability'), '%')} · precipitación {fmt(weather.get('precipitation_mm'), ' mm', 1)}",
+        f"💨 Viento: {fmt(weather.get('wind_mph'), ' mph')} {wind_dir} · ráfagas {fmt(weather.get('gust_mph'), ' mph')}",
+        f"💧 Humedad: {fmt(weather.get('humidity'), '%')}",
+        f"⚠️ Impacto climático: {impact}",
+        f"ℹ️ {reason}",
+    ]
+
+
+def _mlb_venue_weather_meta(venue_id):
+    if not venue_id:
+        return None
+    data = safe_get_json(
+        f"{MLB_API}/venues/{int(venue_id)}",
+        {"hydrate": "location,fieldInfo,timezone"},
+        cache_ttl=3600,
+    ) or {}
+    venues = data.get("venues") or []
+    if not venues:
+        return None
+    venue = venues[0]
+    location = venue.get("location") or {}
+    coords = location.get("defaultCoordinates") or {}
+    field = venue.get("fieldInfo") or {}
+    return {
+        "name": venue.get("name") or "Estadio MLB",
+        "city": location.get("city") or "",
+        "latitude": coords.get("latitude"),
+        "longitude": coords.get("longitude"),
+        "roof_type": field.get("roofType") or "N/D",
+    }
+
+
+def _format_mlb_weather_for_picks(pick_date):
+    rows = _official_pick_rows(pick_date)
+    if not rows:
+        return "🌦️ CLIMA MLB — PICKS TRIPLE PICK\n\nℹ️ No hay picks MLB publicados para hoy."
+    schedule = safe_get_json(
+        f"{MLB_API}/schedule",
+        {"sportId": 1, "date": pick_date, "hydrate": "venue"},
+        cache_ttl=300,
+    ) or {}
+    games = {}
+    for block in schedule.get("dates", []):
+        for game in block.get("games", []):
+            games[int(game.get("gamePk") or 0)] = game
+
+    lines = ["🌦️ CLIMA MLB — PICKS TRIPLE PICK", f"📅 {pick_date}", ""]
+    seen = set()
+    for row in rows:
+        game_pk = int(row["game_pk"] or 0)
+        if game_pk in seen:
+            continue
+        seen.add(game_pk)
+        lines.append(f"🏟️ {row['away']} vs {row['home']}")
+        for related in rows:
+            if int(related["game_pk"] or 0) == game_pk:
+                lines.append(f"🎯 {related['pick_text'] or related['selection']}")
+        game = games.get(game_pk)
+        if not game:
+            lines.extend(["⚠️ Partido no localizado en MLB Stats API", ""])
+            continue
+        venue = game.get("venue") or {}
+        meta = _mlb_venue_weather_meta(venue.get("id"))
+        event_dt = _parse_external_datetime(game.get("gameDate"))
+        if not meta:
+            lines.extend([f"📍 {venue.get('name') or 'Estadio N/D'}", "🌦️ Pronóstico: no disponible", ""])
+            continue
+        lines.append(f"📍 {meta['name']}{' · ' + meta['city'] if meta['city'] else ''}")
+        lines.append(f"🏠 Techo: {meta['roof_type']}")
+        weather = _weather_forecast_at(meta.get("latitude"), meta.get("longitude"), event_dt)
+        impact, reason = _weather_impact(weather, meta.get("roof_type"))
+        lines.extend(_format_weather_lines(weather, impact, reason))
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def _geocode_weather_city(city, region=None, country=None):
+    if not city:
+        return None
+    qualifiers = [x for x in (region, country) if x]
+    query = str(city)
+    if qualifiers:
+        query += ", " + str(qualifiers[0])
+    data = safe_get_json(
+        OPEN_METEO_GEOCODING_URL,
+        {"name": query, "count": 5, "language": "es", "format": "json"},
+        cache_ttl=86400,
+    ) or {}
+    results = data.get("results") or []
+    if not results and qualifiers:
+        data = safe_get_json(
+            OPEN_METEO_GEOCODING_URL,
+            {"name": str(city), "count": 5, "language": "es", "format": "json"},
+            cache_ttl=86400,
+        ) or {}
+        results = data.get("results") or []
+    if not results:
+        return None
+    result = results[0]
+    return {
+        "name": result.get("name") or city,
+        "latitude": result.get("latitude"),
+        "longitude": result.get("longitude"),
+        "timezone": result.get("timezone") or "",
+    }
+
+
+def _soccer_event_weather_location(event):
+    competition = ((event or {}).get("competitions") or [{}])[0]
+    venue = competition.get("venue") or {}
+    address = venue.get("address") or {}
+    city = address.get("city") or ""
+    region = address.get("state") or address.get("province") or ""
+    country = address.get("country") or ""
+    geo = _geocode_weather_city(city, region, country) if city else None
+    return {
+        "venue": venue.get("fullName") or venue.get("shortName") or "Estadio N/D",
+        "city": city,
+        "region": region,
+        "country": country,
+        "latitude": (geo or {}).get("latitude"),
+        "longitude": (geo or {}).get("longitude"),
+    }
+
+
+def _format_soccer_weather_for_picks(user_id, pick_date):
+    rows = _soccer_visible_rows(user_id, pick_date)
+    if not rows:
+        return "🌦️ CLIMA FÚTBOL — PICKS TRIPLE PICK\n\nℹ️ No hay picks de fútbol visibles para hoy."
+    events = []
+    for league, _name in SOCCER_LIVE_LEAGUES:
+        data = _espn_get_json(f"soccer/{league}/scoreboard", {"dates": pick_date.replace("-", "")}) or {}
+        events.extend(data.get("events", []))
+
+    lines = ["🌦️ CLIMA FÚTBOL — PICKS TRIPLE PICK", f"📅 {pick_date}", ""]
+    seen = set()
+    for row in rows:
+        key = (row["away"], row["home"])
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(f"🏟️ {row['away']} vs {row['home']}")
+        for related in rows:
+            if related["away"] == row["away"] and related["home"] == row["home"]:
+                lines.append(f"🎯 {related['selection']}")
+        event = _find_espn_event(events, row["away"], row["home"])
+        if not event:
+            lines.extend(["⚠️ Partido no localizado en el feed de fútbol", ""])
+            continue
+        location = _soccer_event_weather_location(event)
+        event_dt = _parse_external_datetime(event.get("date"))
+        place = location.get("venue") or "Estadio N/D"
+        if location.get("city"):
+            place += f" · {location['city']}"
+        lines.append(f"📍 {place}")
+        weather = _weather_forecast_at(location.get("latitude"), location.get("longitude"), event_dt)
+        impact, reason = _weather_impact(weather)
+        lines.extend(_format_weather_lines(weather, impact, reason))
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+async def mlb_weather(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _premium_gate(update, "FREE"):
+        return
+    fecha = local_now().strftime("%Y-%m-%d")
+    text = await asyncio.to_thread(_format_mlb_weather_for_picks, fecha)
+    await update.effective_message.reply_text(text, reply_markup=MLB_MENU_KEYBOARD)
+
+
+async def soccer_weather(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _premium_gate(update, "FREE"):
+        return
+    user_id = update.effective_user.id if update.effective_user else 0
+    fecha = local_now().strftime("%Y-%m-%d")
+    text = await asyncio.to_thread(_format_soccer_weather_for_picks, user_id, fecha)
+    await update.effective_message.reply_text(text, reply_markup=SOCCER_MENU_KEYBOARD)
 
 
 # ---------------------------------------------------------------------------
@@ -7662,6 +8032,7 @@ async def manual_mlb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📈 Rendimiento MLB — W-L, hit rate, unidades y ROI cuando aplica.\n"
         "📋 Historial MLB — registros recientes del tracking.\n"
         "📋 Alineaciones MLB — titulares de los juegos donde hay picks publicados.\n"
+        "🌦️ Clima MLB — pronóstico a la hora del juego, techo e impacto climático de nuestros picks.\n"
         "🧪 Más opciones — Candidate Pool, Value Board y auditorías avanzadas.\n"
         "📡 Picks en vivo — seguimiento de los picks publicados durante el juego.",
         reply_markup=_manual_keyboard_for(user_id),
@@ -7681,6 +8052,7 @@ async def manual_soccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎯 Player Props Fútbol — props individuales de jugadores.\n"
         "🏆 Ligas Fútbol — ligas con picks disponibles.\n"
         "📋 Alineaciones Fútbol — onces titulares de los partidos con picks publicados.\n"
+        "🌦️ Clima Fútbol — pronóstico a la hora del partido e impacto climático de nuestros picks.\n"
         "📡 Picks en vivo — seguimiento de picks durante los partidos.",
         reply_markup=_manual_keyboard_for(user_id),
     )
@@ -7898,6 +8270,7 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "🎯 Player Props Fútbol": soccer_player_props,
         "🏆 Ligas Fútbol": soccer_leagues,
         "📋 Alineaciones Fútbol": soccer_lineups,
+        "🌦️ Clima Fútbol": soccer_weather,
         "📊 Resultados Fútbol": soccer_results,
         "🔴 En vivo Fútbol": soccer_live,
         "🎯 Picks del día": daily_picks_hub,
@@ -7916,6 +8289,7 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "🧮 Mercado": market,
         "📋 Historial MLB": history,
         "📋 Alineaciones MLB": mlb_lineups,
+        "🌦️ Clima MLB": mlb_weather,
         "📋 Historial": history,
         "📘 Manual de usuario": manual_menu,
         "📗 Guía general": manual_general,

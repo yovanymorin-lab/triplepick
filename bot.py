@@ -88,7 +88,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.5.19"
+BOT_VERSION = "3.5.20"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -1414,6 +1414,39 @@ def _market_agreement(model_prob, market_prob):
     return "DIVERGENCIA ALTA"
 
 
+def _price_quality(model_prob, american_price):
+    """Classify the actionable price against the model probability proxy."""
+    implied = american_to_implied_probability(american_price)
+    if implied is None or model_prob is None:
+        return {
+            "implied_probability": None,
+            "price_edge": None,
+            "price_quality": "⚪ NO PRICE",
+            "price_gate_pass": False,
+        }
+
+    edge = float(model_prob) - float(implied)
+    if edge >= 0.05:
+        quality = "🟢 STRONG"
+        gate = True
+    elif edge >= 0.02:
+        quality = "🔵 ACCEPTABLE"
+        gate = True
+    elif edge >= -0.015:
+        quality = "🟡 BORDERLINE"
+        gate = False
+    else:
+        quality = "🔴 PASS"
+        gate = False
+
+    return {
+        "implied_probability": implied,
+        "price_edge": edge,
+        "price_quality": quality,
+        "price_gate_pass": gate,
+    }
+
+
 def _classify_market_pick(partido):
     """Separate survival and value objectives; never force a market approval."""
     if not partido.get("eligible"):
@@ -1431,16 +1464,24 @@ def _classify_market_pick(partido):
     if agreement == "DIVERGENCIA ALTA" and abs(gap) > 0.10:
         return "🟠 REVIEW — DIVERGENCIA", False, False
 
+    # When Hard Rock is available, the actual user-facing price must clear the
+    # Price Gate. A strong matchup at a bad price is not an approved pick.
+    if partido.get("hardrock_available") and not partido.get("price_gate_pass"):
+        if partido.get("price_quality") == "🔴 PASS":
+            return "🔴 PRICE REJECT", False, False
+
     survival = (
         market_prob >= 0.55
         and gap >= -0.03
         and abs(gap) <= 0.08
         and partido.get("confidence", 0) >= 76
+        and (not partido.get("hardrock_available") or partido.get("price_gate_pass"))
     )
 
-    # VALUE requires an actionable Hard Rock price, not just consensus odds.
+    # VALUE requires an actionable Hard Rock price that also clears Price Gate.
     value = (
         partido.get("hardrock_available")
+        and partido.get("price_gate_pass")
         and model_prob >= 0.56
         and gap >= 0.035
         and gap <= 0.10
@@ -1475,6 +1516,10 @@ def build_daily_matchups_v28(fecha, season):
         partido["hardrock_price"] = None
         partido["consensus_no_vig"] = None
         partido["value_gap"] = None
+        partido["price_implied_probability"] = None
+        partido["price_edge"] = None
+        partido["price_quality"] = "⚪ NO PRICE"
+        partido["price_gate_pass"] = False
         partido["market_agreement"] = "SIN MERCADO"
         partido["market_grade"] = "⚪ MARKET OFF" if odds_status == "not_configured" else "⚪ SIN MERCADO"
         partido["survival_approved"] = False
@@ -1494,6 +1539,9 @@ def build_daily_matchups_v28(fecha, season):
         partido["hardrock_no_vig"] = snapshot["primary_no_vig"]
         partido["hardrock_price"] = snapshot["selected_price"]
         partido["consensus_no_vig"] = snapshot["consensus_no_vig"]
+
+        price_info = _price_quality(model_prob, snapshot["selected_price"])
+        partido.update(price_info)
 
         # Agreement uses consensus when available; the value gap uses Hard Rock
         # no-vig whenever Hard Rock is available, otherwise consensus for audit only.
@@ -1521,6 +1569,7 @@ def build_daily_matchups_v28(fecha, season):
         "⚪ SIN MERCADO": 0,
         "⚪ MARKET OFF": 0,
         "🔴 MARKET REJECT": -1,
+        "🔴 PRICE REJECT": -1,
         "🔴 NO BET": -2,
     }
     partidos.sort(
@@ -1669,6 +1718,9 @@ def init_tracking_db():
                 market_probability REAL,
                 hardrock_no_vig REAL,
                 value_gap REAL,
+                price_implied_probability REAL,
+                price_edge REAL,
+                price_quality TEXT,
                 market_grade TEXT,
                 result TEXT NOT NULL DEFAULT 'PENDING',
                 outcome INTEGER,
@@ -1864,6 +1916,14 @@ def init_tracking_db():
         if "line" not in cols:
             conn.execute("ALTER TABLE official_daily_picks ADD COLUMN line REAL")
 
+        tracked_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tracked_picks)").fetchall()}
+        if "price_implied_probability" not in tracked_cols:
+            conn.execute("ALTER TABLE tracked_picks ADD COLUMN price_implied_probability REAL")
+        if "price_edge" not in tracked_cols:
+            conn.execute("ALTER TABLE tracked_picks ADD COLUMN price_edge REAL")
+        if "price_quality" not in tracked_cols:
+            conn.execute("ALTER TABLE tracked_picks ADD COLUMN price_quality TEXT")
+
 
 def _product_from_market_grade(grade):
     if grade == "🟢 HYBRID":
@@ -1890,10 +1950,10 @@ def _insert_tracked_pick(conn, partido, pick_date, product, source, official):
             model_version, bot_version, matchup_score, difference,
             model_probability, confidence, data_reliability, starter_reliability,
             lineup_published, market_probability, hardrock_no_vig, value_gap,
-            market_grade, result, units_risked
+            price_implied_probability, price_edge, price_quality, market_grade, result, units_risked
         ) VALUES (
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'FULL_GAME_ML', NULL, ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 1.0
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 1.0
         )
         """,
         (
@@ -1921,6 +1981,9 @@ def _insert_tracked_pick(conn, partido, pick_date, product, source, official):
             partido.get("market_probability"),
             partido.get("hardrock_no_vig"),
             partido.get("value_gap"),
+            partido.get("price_implied_probability"),
+            partido.get("price_edge"),
+            partido.get("price_quality"),
             partido.get("market_grade"),
         ),
     )
@@ -8873,24 +8936,27 @@ async def pool(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     mensaje = (
-        "🔎 MLB CANDIDATE POOL — v2.9.5\n"
+        "🔎 MLB CANDIDATE POOL — PRICE ENGINE v1\n"
         f"📅 {fecha}\n"
         f"Market: {'ON' if odds_status == 'ok' else 'OFF/FALLBACK'} | "
         f"Primary: {ODDS_PRIMARY_BOOKMAKER}\n\n"
         "C=Confidence | DR=Data Reliability | MP=Model Probability Proxy | "
-        "MKT=consensus no-vig | VG=value gap.\n\n"
+        "MKT=consensus no-vig | VG=value gap | PE=price edge.\n\n"
     )
     mensaje += _primary_feed_notice(partidos, odds_status)
     for i, p in enumerate(partidos, 1):
         icon = "✅" if p.get("eligible") else "❌"
         vg = p.get("value_gap")
         vg_text = "N/D" if vg is None else f"{vg * 100:+.1f}pp"
+        pe = p.get("price_edge")
+        pe_text = "N/D" if pe is None else f"{pe * 100:+.1f}pp"
         mensaje += (
             f"{i}. {icon} {p['away']} vs {p['home']}\n"
             f"🎯 {p['favorite']} | {p['risk']} | {p.get('market_grade')}\n"
             f"📈 C {p['confidence']:.0f} | DR {p['data_reliability']:.0f} | "
             f"Δ {p['difference']:.1f} | SR {p['min_starter_reliability']:.0f}\n"
             f"🧮 MP {_pct(p.get('model_probability'))} | MKT {_pct(p.get('market_probability'))} | VG {vg_text}\n"
+            f"💲 HR {_format_american(p.get('hardrock_price'))} | Impl {_pct(p.get('price_implied_probability'))} | PE {pe_text} | {p.get('price_quality')}\n"
             f"🛡️ Model Gate: {p['gate_reason']}\n\n"
         )
     await _reply_long(update.message, mensaje)
@@ -8922,7 +8988,7 @@ async def market(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     mensaje = (
-        "💵 MLB MARKET AUDIT — v2.9.5\n"
+        "💵 MLB MARKET AUDIT — PRICE ENGINE v1\n"
         f"📅 {fecha}\n"
         f"Primary: {ODDS_PRIMARY_BOOKMAKER} | Books: {ODDS_BOOKMAKERS}\n""⏱️ PREMATCH ONLY: juegos iniciados/live se excluyen del Market Engine.\n\n"
     )
@@ -8930,11 +8996,14 @@ async def market(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i, p in enumerate(partidos, 1):
         vg = p.get("value_gap")
         vg_text = "N/D" if vg is None else f"{vg * 100:+.1f} pp"
+        pe = p.get("price_edge")
+        pe_text = "N/D" if pe is None else f"{pe * 100:+.1f} pp"
         mensaje += (
             f"{i}. {p['away']} vs {p['home']}\n"
             f"🎯 Model: {p['favorite']} | MP {_pct(p.get('model_probability'))}\n"
             f"💵 Hard Rock {_format_american(p.get('hardrock_price'))} | "
-            f"HR no-vig {_pct(p.get('hardrock_no_vig'))}\n"
+            f"Impl {_pct(p.get('price_implied_probability'))} | PE {pe_text}\n"
+            f"🏷️ Price Gate: {p.get('price_quality')} | HR no-vig {_pct(p.get('hardrock_no_vig'))}\n"
             f"🌐 Consensus {_pct(p.get('consensus_no_vig'))} | Gap {vg_text}\n"
             f"🤝 {p.get('market_agreement')} | {p.get('market_grade')}\n\n"
         )

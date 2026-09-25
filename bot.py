@@ -88,7 +88,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.5.21"
+BOT_VERSION = "3.5.22"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -1221,7 +1221,7 @@ def _odds_cache_get(key):
 
 def get_mlb_moneyline_odds(fecha):
     """
-    Fetch MLB h2h/moneyline odds once per cache window.
+    Fetch MLB featured odds (moneyline, run line and totals) once per cache window.
 
     Primary target is Hard Rock Bet Florida. FanDuel/DraftKings are requested by
     default only to create a consensus market reference and fallback audit layer.
@@ -1233,7 +1233,7 @@ def get_mlb_moneyline_odds(fecha):
     bookmakers = ",".join(
         b.strip() for b in ODDS_BOOKMAKERS.split(",") if b.strip()
     )
-    key = (fecha, bookmakers, "h2h")
+    key = (fecha, bookmakers, "h2h,spreads,totals")
     cached = _odds_cache_get(key)
     if cached is not None:
         return "ok", cached
@@ -1241,7 +1241,7 @@ def get_mlb_moneyline_odds(fecha):
     params = {
         "apiKey": ODDS_API_KEY,
         "bookmakers": bookmakers,
-        "markets": "h2h",
+        "markets": "h2h,spreads,totals",
         "oddsFormat": "american",
         "dateFormat": "iso",
     }
@@ -1267,6 +1267,44 @@ def get_mlb_moneyline_odds(fecha):
         print(f"Odds API error: {exc}")
         return "api_error", []
 
+
+
+def get_mlb_event_odds(event_id, markets):
+    """Fetch event-specific MLB markets such as player props."""
+    if not ODDS_API_KEY or not event_id:
+        return "not_configured", None
+    market_text = ",".join(markets) if isinstance(markets, (list, tuple, set)) else str(markets)
+    bookmakers = ",".join(b.strip() for b in ODDS_BOOKMAKERS.split(",") if b.strip())
+    key = ("event", str(event_id), bookmakers, market_text)
+    cached = _odds_cache_get(key)
+    if cached is not None:
+        return "ok", cached
+    params = {
+        "apiKey": ODDS_API_KEY,
+        "bookmakers": bookmakers,
+        "markets": market_text,
+        "oddsFormat": "american",
+        "dateFormat": "iso",
+    }
+    try:
+        response = _HTTP.get(
+            f"{ODDS_API_BASE}/sports/baseball_mlb/events/{event_id}/odds",
+            params=params,
+            timeout=12,
+        )
+        _ODDS_LAST_META["remaining"] = response.headers.get("x-requests-remaining")
+        _ODDS_LAST_META["used"] = response.headers.get("x-requests-used")
+        _ODDS_LAST_META["last"] = response.headers.get("x-requests-last")
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            raise ValueError("respuesta event odds no es un objeto")
+        _ODDS_LAST_META["error"] = None
+        _ODDS_CACHE[key] = (time.monotonic() + ODDS_CACHE_TTL, data)
+        return "ok", data
+    except (requests.RequestException, ValueError) as exc:
+        _ODDS_LAST_META["error"] = str(exc)
+        return "api_error", None
 
 def _parse_iso_utc(value):
     if not value:
@@ -1353,6 +1391,114 @@ def _book_moneyline_quote(book, home_name, away_name):
         }
     return None
 
+
+
+def _primary_book(event):
+    if not event:
+        return None
+    for book in event.get("bookmakers", []):
+        if book.get("key") == ODDS_PRIMARY_BOOKMAKER:
+            return book
+    return None
+
+
+def _featured_quote_for_official_pick(item, event):
+    """Return the current Hard Rock featured-market number/price for an official MLB pick.
+
+    Supported here: moneyline, run line/spread, and full-game total. Team totals and
+    player props require event-specific markets and are handled separately.
+    """
+    book = _primary_book(event)
+    if not book:
+        return None
+    family = str(item.get("market_family") or "FULL_GAME_ML").upper()
+    selection = str(item.get("selection") or "")
+    wanted_direction = "OVER" if family.endswith("OVER") else "UNDER" if family.endswith("UNDER") else None
+
+    for market in book.get("markets", []):
+        key = market.get("key")
+        outcomes = market.get("outcomes", [])
+        if family == "FULL_GAME_ML" and key == "h2h":
+            for o in outcomes:
+                if _normalize_team_name(o.get("name")) == _normalize_team_name(selection):
+                    return {"market_key": key, "line": None, "price": o.get("price"), "book": book.get("key"), "book_title": book.get("title", book.get("key"))}
+
+        if family == "RUN_LINE" and key == "spreads":
+            for o in outcomes:
+                if _normalize_team_name(o.get("name")) == _normalize_team_name(selection):
+                    return {"market_key": key, "line": o.get("point"), "price": o.get("price"), "book": book.get("key"), "book_title": book.get("title", book.get("key"))}
+
+        if family in {"FULL_GAME_TOTAL_OVER", "FULL_GAME_TOTAL_UNDER", "GAME_TOTAL_OVER", "GAME_TOTAL_UNDER"} and key == "totals":
+            for o in outcomes:
+                if str(o.get("name") or "").upper() == wanted_direction:
+                    return {"market_key": key, "line": o.get("point"), "price": o.get("price"), "book": book.get("key"), "book_title": book.get("title", book.get("key"))}
+    return None
+
+
+
+def _player_prop_quote(item, event):
+    family = str(item.get("market_family") or "").upper()
+    if not family.startswith("PITCHER_STRIKEOUTS_") or not event:
+        return None
+    status, prop_event = get_mlb_event_odds(event.get("id"), ["pitcher_strikeouts"])
+    if status != "ok" or not prop_event:
+        return None
+    direction = "Over" if family.endswith("OVER") else "Under"
+    player = _normalize_team_name(item.get("selection"))
+    for book in prop_event.get("bookmakers", []):
+        if book.get("key") != ODDS_PRIMARY_BOOKMAKER:
+            continue
+        for market in book.get("markets", []):
+            if market.get("key") != "pitcher_strikeouts":
+                continue
+            for o in market.get("outcomes", []):
+                desc = _normalize_team_name(o.get("description"))
+                if desc == player and str(o.get("name") or "").lower() == direction.lower():
+                    return {
+                        "market_key": "pitcher_strikeouts",
+                        "line": o.get("point"),
+                        "price": o.get("price"),
+                        "book": book.get("key"),
+                        "book_title": book.get("title", book.get("key")),
+                    }
+    return None
+
+def _line_number_movement(market_family, first_line, current_line, first_price, current_price):
+    """Judge line-number movement from the perspective of the selected side."""
+    price_move = _american_price_movement(first_price, current_price)
+    result = dict(price_move)
+    result.update({
+        "first_seen_line": first_line,
+        "current_line": current_line,
+        "line_number_delta": None,
+        "number_move_status": "⚪ NO NUMBER",
+    })
+    if first_line is None or current_line is None:
+        return result
+    try:
+        first = float(first_line)
+        current = float(current_line)
+    except (TypeError, ValueError):
+        return result
+
+    family = str(market_family or "").upper()
+    if family.endswith("OVER"):
+        adverse = current - first
+    elif family.endswith("UNDER"):
+        adverse = first - current
+    elif family == "RUN_LINE":
+        adverse = first - current
+    else:
+        adverse = 0.0
+
+    result["line_number_delta"] = current - first
+    if adverse >= 0.5:
+        result["number_move_status"] = "🔴 WORSE NUMBER"
+    elif adverse <= -0.5:
+        result["number_move_status"] = "🟢 BETTER NUMBER"
+    else:
+        result["number_move_status"] = "⚪ STABLE NUMBER"
+    return result
 
 def _market_snapshot(partido, event):
     if not event:
@@ -1811,6 +1957,25 @@ def init_tracking_db():
             CREATE INDEX IF NOT EXISTS idx_market_price_history_date
             ON market_price_history(pick_date, book);
 
+            CREATE TABLE IF NOT EXISTS official_market_line_history (
+                pick_date TEXT NOT NULL,
+                game_pk INTEGER NOT NULL,
+                market_family TEXT NOT NULL,
+                selection TEXT NOT NULL,
+                book TEXT NOT NULL,
+                first_seen_line REAL,
+                first_seen_price REAL,
+                first_seen_at TEXT NOT NULL,
+                current_line REAL,
+                current_price REAL,
+                current_seen_at TEXT NOT NULL,
+                observations INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (pick_date, game_pk, market_family, selection, book)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_official_market_line_history_date
+            ON official_market_line_history(pick_date, book);
+
             CREATE TABLE IF NOT EXISTS official_daily_picks (
                 pick_date TEXT NOT NULL,
                 slot INTEGER NOT NULL,
@@ -2039,6 +2204,54 @@ def _record_and_get_line_movement(pick_date, partido, current_price, book):
     except Exception:
         return _american_price_movement(None, current_price)
 
+
+
+def _record_official_market_line(pick_date, item, quote):
+    """Persist FIRST SEEN and current line/price for an official non-ML pick market."""
+    if not quote:
+        return None
+    init_tracking_db()
+    now_iso = local_now().isoformat()
+    game_pk = int(item.get("game_pk") or 0)
+    family = str(item.get("market_family") or "FULL_GAME_ML").upper()
+    selection = str(item.get("selection") or "N/D")
+    book = str(quote.get("book") or ODDS_PRIMARY_BOOKMAKER)
+    current_line = quote.get("line")
+    current_price = quote.get("price")
+    with _tracking_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT first_seen_line, first_seen_price
+            FROM official_market_line_history
+            WHERE pick_date=? AND game_pk=? AND market_family=? AND selection=? AND book=?
+            """,
+            (pick_date, game_pk, family, selection, book),
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                """
+                INSERT INTO official_market_line_history (
+                    pick_date, game_pk, market_family, selection, book,
+                    first_seen_line, first_seen_price, first_seen_at,
+                    current_line, current_price, current_seen_at, observations
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                """,
+                (pick_date, game_pk, family, selection, book,
+                 current_line, current_price, now_iso,
+                 current_line, current_price, now_iso),
+            )
+            first_line, first_price = current_line, current_price
+        else:
+            first_line, first_price = row["first_seen_line"], row["first_seen_price"]
+            conn.execute(
+                """
+                UPDATE official_market_line_history
+                SET current_line=?, current_price=?, current_seen_at=?, observations=observations+1
+                WHERE pick_date=? AND game_pk=? AND market_family=? AND selection=? AND book=?
+                """,
+                (current_line, current_price, now_iso, pick_date, game_pk, family, selection, book),
+            )
+    return _line_number_movement(family, first_line, current_line, first_price, current_price)
 
 def _product_from_market_grade(grade):
     if grade == "🟢 HYBRID":
@@ -4066,6 +4279,33 @@ def _fmt_line(value):
     return (f"{value:.2f}").rstrip("0").rstrip(".")
 
 
+
+def _resolve_official_pitcher(player_text, games):
+    key = _normalize_team_name(player_text)
+    matches = []
+    for game in games:
+        for side in ("away", "home"):
+            pitcher = str(game.get(f"{side}_pitcher") or "")
+            pkey = _normalize_team_name(pitcher)
+            if not pkey or pkey == "por confirmar":
+                continue
+            if key == pkey or key in pkey or pkey in key:
+                matches.append((game, side, pitcher))
+    # dedupe by game/pitcher
+    unique = {(m[0]["game_pk"], m[2]): m for m in matches}
+    if len(unique) != 1:
+        return None
+    game, side, pitcher = next(iter(unique.values()))
+    return {
+        "game_pk": game["game_pk"],
+        "game_date": game["game_date"],
+        "away": game["away"],
+        "home": game["home"],
+        "selection": pitcher,
+        "pitcher": pitcher,
+        "side": side,
+    }
+
 def _parse_official_pick(raw_text, games):
     """Parse an admin-entered channel pick and bind it to today's MLB game.
 
@@ -4080,6 +4320,19 @@ def _parse_official_pick(raw_text, games):
     raw = re.sub(r"\s+", " ", str(raw_text or "").strip())
     if not raw:
         return None, "Pick vacío."
+
+    # Pitcher strikeouts player prop. Example: "Gerrit Cole Over 5.5 K".
+    m = re.match(r"^(.+?)\s+(over|under)\s+([0-9]+(?:\.[0-9]+)?)\s+(?:k|ks|strikeouts?)$", raw, re.I)
+    if m:
+        player = _resolve_official_pitcher(m.group(1), games)
+        if not player:
+            return None, f"No pude identificar de forma única al pitcher: {m.group(1)}"
+        direction = m.group(2).upper()
+        line = float(m.group(3))
+        player["market_family"] = f"PITCHER_STRIKEOUTS_{direction}"
+        player["line"] = line
+        player["pick_text"] = f"{player['selection']} {direction.title()} {_fmt_line(line)} K"
+        return player, None
 
     # Full-game total must be checked before team-total syntax.
     m = re.match(r"^(.+?)\s+vs\.?\s+(.+?)\s+(over|under)\s+([0-9]+(?:\.[0-9]+)?)$", raw, re.I)
@@ -4477,7 +4730,7 @@ async def admin_official_start_input(update: Update, context: ContextTypes.DEFAU
         "Baltimore Orioles ML\n"
         "Orioles Over 3.5\n"
         "Dodgers vs Padres Over 8.5\n\n"
-        "También acepta Team Total Over/Under y run line (+1.5/-1.5).\n"
+        "También acepta Team Total Over/Under, run line (+1.5/-1.5) y pitcher K (ej. Cole Over 5.5 K).\n"
         "El bot identificará automáticamente rival, pitcher, horario y partido.\n"
         "Pulsa ❌ Cancelar carga para salir.",
         reply_markup=ReplyKeyboardMarkup([["❌ Cancelar carga"]], resize_keyboard=True, is_persistent=True),
@@ -4994,8 +5247,9 @@ MLB_MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["⚾ Juegos MLB", "🔴 En vivo MLB"],
         ["🔥 Picks MLB", "📊 Resultados MLB"],
-        ["🧮 Mercado MLB", "📈 Rendimiento MLB"],
-        ["📋 Historial MLB", "🧪 Más opciones"],
+        ["🧮 Mercado MLB", "📐 Líneas MLB"],
+        ["📈 Rendimiento MLB", "📋 Historial MLB"],
+        ["🧪 Más opciones"],
         ["📋 Alineaciones MLB", "🌦️ Clima MLB"],
         ["🏟️ Dimensiones MLB", "📈 Últimos 10 MLB"],
         ["📡 Picks en vivo"],
@@ -8808,6 +9062,7 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "📈 Rendimiento MLB": performance,
         "📈 Rendimiento": performance,
         "🧮 Mercado MLB": market,
+        "📐 Líneas MLB": mlb_lines,
         "🧮 Mercado": market,
         "📋 Historial MLB": history,
         "📋 Alineaciones MLB": mlb_lineups,
@@ -9035,6 +9290,66 @@ async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _reply_long(update.message, mensaje)
 
 
+
+async def mlb_lines(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Audit current Hard Rock line/price for today's official MLB picks."""
+    if not await _premium_gate(update, "FREE"):
+        return
+    pick_date = local_now().strftime("%Y-%m-%d")
+    rows = await asyncio.to_thread(_official_pick_rows, pick_date)
+    if not rows:
+        await update.effective_message.reply_text(
+            "📐 LÍNEAS MLB\n\nNo hay picks oficiales cargados para hoy.",
+            reply_markup=MLB_MENU_KEYBOARD,
+        )
+        return
+
+    status, events = await asyncio.to_thread(get_mlb_moneyline_odds, pick_date)
+    if status != "ok":
+        await update.effective_message.reply_text(
+            "📐 LÍNEAS MLB\n\nNo pude consultar las líneas actuales. "
+            f"Detalle: {_ODDS_LAST_META.get('error') or status}",
+            reply_markup=MLB_MENU_KEYBOARD,
+        )
+        return
+
+    out = ["📐 LÍNEAS MLB — FIRST SEEN vs NOW", f"📅 {pick_date}", f"🏦 {ODDS_PRIMARY_BOOKMAKER}", ""]
+    for row in rows:
+        item = dict(row)
+        event = _find_odds_event(item, events, pick_date)
+        family = str(item.get("market_family") or "").upper()
+        if family.startswith("PITCHER_STRIKEOUTS_"):
+            quote = await asyncio.to_thread(_player_prop_quote, item, event)
+        else:
+            quote = _featured_quote_for_official_pick(item, event)
+        out.append(f"🎯 {item.get('pick_text') or _tracked_pick_display(item)}")
+        if not quote:
+            family = str(item.get("market_family") or "").upper()
+            if family.startswith("TEAM_TOTAL"):
+                out.append("⚪ Team Total requiere mercado específico del evento; no se fuerza un dato inexistente.")
+            else:
+                out.append("⚪ Línea Hard Rock no disponible para este mercado en la consulta actual.")
+            out.append("")
+            continue
+        movement = await asyncio.to_thread(_record_official_market_line, pick_date, item, quote)
+        first_line = movement.get("first_seen_line") if movement else None
+        current_line = movement.get("current_line") if movement else quote.get("line")
+        first_price = movement.get("first_seen_price") if movement else None
+        current_price = movement.get("current_price") if movement else quote.get("price")
+        def fmt_num(v):
+            if v is None:
+                return "—"
+            return _fmt_line(v)
+        out.extend([
+            f"First: {fmt_num(first_line)} @ {_format_american(first_price)}",
+            f"Now:   {fmt_num(current_line)} @ {_format_american(current_price)}",
+            f"📏 {movement.get('number_move_status') if movement else '⚪ SIN HISTORIAL'}",
+            f"💵 {movement.get('line_move_status') if movement else '⚪ SIN HISTORIAL'}",
+            "",
+        ])
+    out.append("FIRST SEEN = primera línea observada por Triple Pick; no se presenta como apertura oficial de la casa.")
+    await _reply_long(update.effective_message, "\n".join(out))
+
 async def pool(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """v2.8 Candidate Pool with model and market audit fields."""
     now = local_now()
@@ -9051,7 +9366,7 @@ async def pool(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     mensaje = (
-        "🔎 MLB CANDIDATE POOL — PRICE + LINE MOVEMENT v2\n"
+        "🔎 MLB CANDIDATE POOL — PRICE + LINE MOVEMENT v3\n"
         f"📅 {fecha}\n"
         f"Market: {'ON' if odds_status == 'ok' else 'OFF/FALLBACK'} | "
         f"Primary: {ODDS_PRIMARY_BOOKMAKER}\n\n"
@@ -9105,7 +9420,7 @@ async def market(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     mensaje = (
-        "💵 MLB MARKET AUDIT — PRICE + LINE MOVEMENT v2\n"
+        "💵 MLB MARKET AUDIT — PRICE + LINE MOVEMENT v3\n"
         f"📅 {fecha}\n"
         f"Primary: {ODDS_PRIMARY_BOOKMAKER} | Books: {ODDS_BOOKMAKERS}\n""⏱️ PREMATCH ONLY: juegos iniciados/live se excluyen del Market Engine.\n\n"
     )
@@ -9419,6 +9734,7 @@ def main():
     app.add_handler(CommandHandler("picks", picks))
     app.add_handler(CommandHandler("pool", pool))
     app.add_handler(CommandHandler("market", market))
+    app.add_handler(CommandHandler("lines", mlb_lines))
     app.add_handler(CommandHandler("value", value))
     app.add_handler(CommandHandler("oddsstatus", oddsstatus))
     app.add_handler(CommandHandler("oddsdebug", oddsdebug))

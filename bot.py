@@ -76,7 +76,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.5.14"
+BOT_VERSION = "3.5.15"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -5339,6 +5339,203 @@ def _nba_scoreboard(fecha=None):
     return _espn_get_json("basketball/nba/scoreboard", {"dates": fecha.replace("-", "")})
 
 
+def _nba_summary(event_id):
+    """Return ESPN NBA game summary/boxscore for one event."""
+    if not event_id:
+        return None
+    return _espn_get_json("basketball/nba/summary", {"event": str(event_id)})
+
+
+def _simple_person_key(name):
+    value = (name or "").lower()
+    value = re.sub(r"[^a-z0-9 ]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _person_name_matches(a, b):
+    ka, kb = _simple_person_key(a), _simple_person_key(b)
+    if not ka or not kb:
+        return False
+    if ka == kb:
+        return True
+    ta, tb = ka.split(), kb.split()
+    # Accept full-name containment and first-initial + last-name forms.
+    if ka in kb or kb in ka:
+        return True
+    if len(ta) >= 2 and len(tb) >= 2 and ta[-1] == tb[-1]:
+        return ta[0] == tb[0] or ta[0][0] == tb[0][0]
+    return False
+
+
+def _nba_boxscore_players(summary):
+    """Flatten ESPN NBA boxscore into {player_name: {stat_name: value}}."""
+    box = (summary or {}).get("boxscore", {}) or {}
+    groups = []
+    if isinstance(box.get("players"), list):
+        groups.extend(box.get("players") or [])
+    for team_block in box.get("teams", []) or []:
+        if isinstance(team_block, dict) and isinstance(team_block.get("players"), list):
+            groups.extend(team_block.get("players") or [])
+
+    result = {}
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        stat_groups = group.get("statistics") or []
+        # Some payloads place statistics directly on the group, others nest them.
+        if not stat_groups and group.get("athletes"):
+            stat_groups = [group]
+        for stat_group in stat_groups:
+            if not isinstance(stat_group, dict):
+                continue
+            names = stat_group.get("names") or stat_group.get("labels") or []
+            athletes = stat_group.get("athletes") or []
+            for item in athletes:
+                athlete = (item or {}).get("athlete", {}) or {}
+                pname = athlete.get("displayName") or athlete.get("shortName")
+                stats = (item or {}).get("stats") or []
+                if not pname or not names or not stats:
+                    continue
+                mapped = {}
+                for name, raw in zip(names, stats):
+                    mapped[str(name).upper()] = raw
+                result[pname] = mapped
+    return result
+
+
+def _nba_prop_definition(selection, row=None):
+    """Parse common NBA player props from imported selection text."""
+    text = str(selection or "").strip()
+    m = re.match(r"^(.+?)\s+(OVER|UNDER)\s+([0-9]+(?:\.[0-9]+)?)\s+(.+?)$", text, flags=re.I)
+    if not m:
+        return None
+    player, direction, line_text, stat_text = m.groups()
+    stat_key = re.sub(r"[^A-Z0-9+ ]+", " ", stat_text.upper())
+    stat_key = re.sub(r"\s+", " ", stat_key).strip()
+
+    aliases = {
+        "POINT": "PTS", "POINTS": "PTS", "PTS": "PTS",
+        "REBOUND": "REB", "REBOUNDS": "REB", "REB": "REB",
+        "ASSIST": "AST", "ASSISTS": "AST", "AST": "AST",
+        "STEAL": "STL", "STEALS": "STL", "STL": "STL",
+        "BLOCK": "BLK", "BLOCKS": "BLK", "BLK": "BLK",
+        "3 POINTERS": "3PTM", "3 POINTERS MADE": "3PTM", "3PM": "3PTM",
+        "THREES": "3PTM", "THREE POINTERS": "3PTM", "THREE POINTERS MADE": "3PTM",
+        "PTS+REB+AST": "PRA", "POINTS+REBOUNDS+ASSISTS": "PRA", "PRA": "PRA",
+        "PTS REB AST": "PRA", "POINTS REBOUNDS ASSISTS": "PRA",
+        "PTS+REB": "PR", "POINTS+REBOUNDS": "PR", "PR": "PR",
+        "PTS+AST": "PA", "POINTS+ASSISTS": "PA", "PA": "PA",
+        "REB+AST": "RA", "REBOUNDS+ASSISTS": "RA", "RA": "RA",
+    }
+    normalized_compact = stat_key.replace(" + ", "+").replace("+ ", "+").replace(" +", "+")
+    code = aliases.get(stat_key) or aliases.get(normalized_compact)
+    if not code:
+        return None
+    return {
+        "player": player.strip(),
+        "direction": direction.upper(),
+        "line": float(line_text),
+        "stat_code": code,
+        "stat_label": stat_text.strip(),
+    }
+
+
+def _nba_stat_number(raw, made_only=False):
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if made_only and "-" in text:
+        text = text.split("-", 1)[0]
+    try:
+        return float(text.replace("+", ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def _nba_player_prop_snapshot(summary, definition):
+    """Return current numeric progress for a supported NBA player prop."""
+    if not summary or not definition:
+        return None
+    players = _nba_boxscore_players(summary)
+    matched_name = None
+    stats = None
+    for pname, pstats in players.items():
+        if _person_name_matches(pname, definition["player"]):
+            matched_name, stats = pname, pstats
+            break
+    if stats is None:
+        return None
+
+    def get(code):
+        return _nba_stat_number(stats.get(code))
+
+    code = definition["stat_code"]
+    if code == "3PTM":
+        value = _nba_stat_number(stats.get("3PT"), made_only=True)
+    elif code == "PRA":
+        parts = [get("PTS"), get("REB"), get("AST")]
+        value = sum(parts) if all(v is not None for v in parts) else None
+    elif code == "PR":
+        parts = [get("PTS"), get("REB")]
+        value = sum(parts) if all(v is not None for v in parts) else None
+    elif code == "PA":
+        parts = [get("PTS"), get("AST")]
+        value = sum(parts) if all(v is not None for v in parts) else None
+    elif code == "RA":
+        parts = [get("REB"), get("AST")]
+        value = sum(parts) if all(v is not None for v in parts) else None
+    else:
+        value = get(code)
+    if value is None:
+        return None
+    return {**definition, "player": matched_name or definition["player"], "value": value}
+
+
+def _nba_player_prop_state(snapshot, state):
+    if state == "pre":
+        return "⏳ NO INICIADO"
+    if not snapshot:
+        return "⚠️ EN JUEGO · PROP SIN DATO INDIVIDUAL"
+    value = float(snapshot["value"])
+    line = float(snapshot["line"])
+    over = snapshot["direction"] == "OVER"
+    final = state == "post"
+    if final:
+        if value == line:
+            return "🏁 FINAL · ➖ PUSH"
+        won = value > line if over else value < line
+        return "🏁 FINAL · ✅ GANADO" if won else "🏁 FINAL · ❌ PERDIDO"
+    if over:
+        if value > line:
+            return f"✅ GANANDO · {value:g}/{line:g}"
+        return f"⚠️ EN RIESGO · {value:g}/{line:g}"
+    # Counting stats cannot decrease: once an under crosses the line it is effectively lost.
+    if value < line:
+        return f"✅ GANANDO · {value:g}/{line:g}"
+    return f"❌ PERDIENDO · {value:g}/{line:g}"
+
+
+def _nba_player_prop_progress(snapshot):
+    if not snapshot:
+        return None
+    value = float(snapshot["value"])
+    line = float(snapshot["line"])
+    player = snapshot["player"]
+    label = snapshot["stat_label"]
+    direction = snapshot["direction"].title()
+    if snapshot["direction"] == "OVER":
+        if value > line:
+            detail = f"margen +{value-line:g}"
+        else:
+            detail = f"faltan {max(0.0, line-value):g}"
+    else:
+        if value < line:
+            detail = f"margen {line-value:g}"
+        else:
+            detail = f"excede por {value-line:g}"
+    return f"{player} {direction} {line:g} {label} · lleva {value:g} · {detail}"
+
+
 def _nba_games_text(fecha=None):
     fecha = fecha or local_now().strftime("%Y-%m-%d")
     data = _nba_scoreboard(fecha)
@@ -5776,16 +5973,29 @@ def _nba_pick_monitor_rows(user_id, pick_date):
     data = _nba_scoreboard(pick_date) or {}
     events = data.get("events", [])
     out = []
+    summary_cache = {}
     for row in rows:
         event = _find_espn_event(events, row["away"], row["home"])
         if not event:
             out.append(("NBA", row, None, "⏳ Sin marcador disponible"))
             continue
         p = _event_score_state(event)
-        pick_state = _selection_live_state(
-            row["selection"], row["away"], row["home"], p["away_score"], p["home_score"], p["state"],
-            product=row["product"], line=row["line"],
-        )
+        if str(_row_value(row, "product", "") or "").upper() == "PLAYER":
+            definition = _nba_prop_definition(row["selection"], row)
+            snapshot = None
+            if definition and p["state"] != "pre":
+                event_id = event.get("id")
+                if event_id not in summary_cache:
+                    summary_cache[event_id] = _nba_summary(event_id)
+                snapshot = _nba_player_prop_snapshot(summary_cache.get(event_id), definition)
+            p["player_prop"] = snapshot
+            p["player_prop_definition"] = definition
+            pick_state = _nba_player_prop_state(snapshot, p["state"])
+        else:
+            pick_state = _selection_live_state(
+                row["selection"], row["away"], row["home"], p["away_score"], p["home_score"], p["state"],
+                product=row["product"], line=row["line"],
+            )
         out.append(("NBA", row, p, pick_state))
     return out
 
@@ -6173,9 +6383,16 @@ def _live_pick_progress_detail(row, payload):
                 return f"Moneyline {selected_name} · desventaja actual {fmt(margin)}"
             return f"Moneyline {selected_name} · partido empatado"
 
-    # Player props require player-stat feeds that are not currently part of the watcher.
+    # NBA player props can carry a verified ESPN boxscore snapshot in the payload.
     if str(_row_value(row, "product", "") or "").upper() == "PLAYER":
-        return "Prop de jugador · esperando estadística individual verificable"
+        snapshot = payload.get("player_prop") if isinstance(payload, dict) else None
+        progress = _nba_player_prop_progress(snapshot)
+        if progress:
+            return progress
+        definition = payload.get("player_prop_definition") if isinstance(payload, dict) else None
+        if definition:
+            return f"{definition['player']} · esperando estadística individual verificable"
+        return "Prop de jugador · mercado todavía no reconocido automáticamente"
 
     return None
 

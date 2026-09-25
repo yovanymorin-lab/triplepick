@@ -88,7 +88,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.5.20"
+BOT_VERSION = "3.5.21"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -1447,6 +1447,40 @@ def _price_quality(model_prob, american_price):
     }
 
 
+def _american_price_movement(first_price, current_price):
+    """Compare selected-side prices using implied probability, not raw American numbers.
+
+    Positive movement_pp means the current price requires a higher break-even
+    probability than the first price observed by Triple Pick (worse for a new
+    bettor). Negative movement_pp means a cheaper/better current entry.
+    """
+    first_implied = american_to_implied_probability(first_price)
+    current_implied = american_to_implied_probability(current_price)
+    if first_implied is None or current_implied is None:
+        return {
+            "first_seen_price": first_price,
+            "current_price": current_price,
+            "line_move_pp": None,
+            "line_move_status": "⚪ SIN HISTORIAL",
+        }
+
+    move = float(current_implied) - float(first_implied)
+    if move >= 0.05:
+        status = "🔴 STEAMED / TOO EXPENSIVE"
+    elif move >= 0.025:
+        status = "🟠 WORSE PRICE"
+    elif move <= -0.025:
+        status = "🟢 BETTER PRICE"
+    else:
+        status = "⚪ STABLE"
+    return {
+        "first_seen_price": first_price,
+        "current_price": current_price,
+        "line_move_pp": move,
+        "line_move_status": status,
+    }
+
+
 def _classify_market_pick(partido):
     """Separate survival and value objectives; never force a market approval."""
     if not partido.get("eligible"):
@@ -1469,6 +1503,11 @@ def _classify_market_pick(partido):
     if partido.get("hardrock_available") and not partido.get("price_gate_pass"):
         if partido.get("price_quality") == "🔴 PASS":
             return "🔴 PRICE REJECT", False, False
+
+    # Do not approve new entries after a material adverse move from the first
+    # price observed by Triple Pick. Existing published picks remain tracked.
+    if partido.get("line_move_status") == "🔴 STEAMED / TOO EXPENSIVE":
+        return "🔴 LINE MOVE REJECT", False, False
 
     survival = (
         market_prob >= 0.55
@@ -1520,6 +1559,10 @@ def build_daily_matchups_v28(fecha, season):
         partido["price_edge"] = None
         partido["price_quality"] = "⚪ NO PRICE"
         partido["price_gate_pass"] = False
+        partido["first_seen_price"] = None
+        partido["current_price"] = None
+        partido["line_move_pp"] = None
+        partido["line_move_status"] = "⚪ SIN HISTORIAL"
         partido["market_agreement"] = "SIN MERCADO"
         partido["market_grade"] = "⚪ MARKET OFF" if odds_status == "not_configured" else "⚪ SIN MERCADO"
         partido["survival_approved"] = False
@@ -1542,6 +1585,12 @@ def build_daily_matchups_v28(fecha, season):
 
         price_info = _price_quality(model_prob, snapshot["selected_price"])
         partido.update(price_info)
+
+        if partido.get("hardrock_available"):
+            movement = _record_and_get_line_movement(
+                fecha, partido, snapshot["selected_price"], ODDS_PRIMARY_BOOKMAKER
+            )
+            partido.update(movement)
 
         # Agreement uses consensus when available; the value gap uses Hard Rock
         # no-vig whenever Hard Rock is available, otherwise consensus for audit only.
@@ -1570,6 +1619,7 @@ def build_daily_matchups_v28(fecha, season):
         "⚪ MARKET OFF": 0,
         "🔴 MARKET REJECT": -1,
         "🔴 PRICE REJECT": -1,
+        "🔴 LINE MOVE REJECT": -1,
         "🔴 NO BET": -2,
     }
     partidos.sort(
@@ -1744,6 +1794,22 @@ def init_tracking_db():
 
             CREATE INDEX IF NOT EXISTS idx_tracked_picks_official
             ON tracked_picks(official, product, result);
+
+            CREATE TABLE IF NOT EXISTS market_price_history (
+                pick_date TEXT NOT NULL,
+                game_pk INTEGER NOT NULL,
+                selection TEXT NOT NULL,
+                book TEXT NOT NULL,
+                first_seen_price REAL,
+                first_seen_at TEXT NOT NULL,
+                current_price REAL,
+                current_seen_at TEXT NOT NULL,
+                observations INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (pick_date, game_pk, selection, book)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_market_price_history_date
+            ON market_price_history(pick_date, book);
 
             CREATE TABLE IF NOT EXISTS official_daily_picks (
                 pick_date TEXT NOT NULL,
@@ -1923,6 +1989,55 @@ def init_tracking_db():
             conn.execute("ALTER TABLE tracked_picks ADD COLUMN price_edge REAL")
         if "price_quality" not in tracked_cols:
             conn.execute("ALTER TABLE tracked_picks ADD COLUMN price_quality TEXT")
+
+
+def _record_and_get_line_movement(pick_date, partido, current_price, book):
+    """Persist first-seen/current selected-side price and return movement fields.
+
+    FIRST SEEN is intentionally not labeled sportsbook opening price. It is the
+    earliest actionable price observed by this bot for this game/selection/book.
+    """
+    if current_price is None:
+        return _american_price_movement(None, None)
+    try:
+        init_tracking_db()
+        game_pk = int(partido.get("game_pk") or 0)
+        selection = partido.get("favorite") or "N/D"
+        now_iso = local_now().isoformat()
+        with _tracking_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT first_seen_price, current_price, observations
+                FROM market_price_history
+                WHERE pick_date=? AND game_pk=? AND selection=? AND book=?
+                """,
+                (pick_date, game_pk, selection, book),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT INTO market_price_history (
+                        pick_date, game_pk, selection, book, first_seen_price,
+                        first_seen_at, current_price, current_seen_at, observations
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+                    """,
+                    (pick_date, game_pk, selection, book, float(current_price),
+                     now_iso, float(current_price), now_iso),
+                )
+                first_price = float(current_price)
+            else:
+                first_price = row["first_seen_price"]
+                conn.execute(
+                    """
+                    UPDATE market_price_history
+                    SET current_price=?, current_seen_at=?, observations=observations+1
+                    WHERE pick_date=? AND game_pk=? AND selection=? AND book=?
+                    """,
+                    (float(current_price), now_iso, pick_date, game_pk, selection, book),
+                )
+        return _american_price_movement(first_price, current_price)
+    except Exception:
+        return _american_price_movement(None, current_price)
 
 
 def _product_from_market_grade(grade):
@@ -8936,7 +9051,7 @@ async def pool(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     mensaje = (
-        "🔎 MLB CANDIDATE POOL — PRICE ENGINE v1\n"
+        "🔎 MLB CANDIDATE POOL — PRICE + LINE MOVEMENT v2\n"
         f"📅 {fecha}\n"
         f"Market: {'ON' if odds_status == 'ok' else 'OFF/FALLBACK'} | "
         f"Primary: {ODDS_PRIMARY_BOOKMAKER}\n\n"
@@ -8957,6 +9072,8 @@ async def pool(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Δ {p['difference']:.1f} | SR {p['min_starter_reliability']:.0f}\n"
             f"🧮 MP {_pct(p.get('model_probability'))} | MKT {_pct(p.get('market_probability'))} | VG {vg_text}\n"
             f"💲 HR {_format_american(p.get('hardrock_price'))} | Impl {_pct(p.get('price_implied_probability'))} | PE {pe_text} | {p.get('price_quality')}\n"
+            f"📉 First {_format_american(p.get('first_seen_price'))} → Now {_format_american(p.get('current_price'))} | "
+            f"Move {'N/D' if p.get('line_move_pp') is None else f"{p.get('line_move_pp') * 100:+.1f}pp"} | {p.get('line_move_status')}\n"
             f"🛡️ Model Gate: {p['gate_reason']}\n\n"
         )
     await _reply_long(update.message, mensaje)
@@ -8988,7 +9105,7 @@ async def market(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     mensaje = (
-        "💵 MLB MARKET AUDIT — PRICE ENGINE v1\n"
+        "💵 MLB MARKET AUDIT — PRICE + LINE MOVEMENT v2\n"
         f"📅 {fecha}\n"
         f"Primary: {ODDS_PRIMARY_BOOKMAKER} | Books: {ODDS_BOOKMAKERS}\n""⏱️ PREMATCH ONLY: juegos iniciados/live se excluyen del Market Engine.\n\n"
     )
@@ -9004,6 +9121,8 @@ async def market(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💵 Hard Rock {_format_american(p.get('hardrock_price'))} | "
             f"Impl {_pct(p.get('price_implied_probability'))} | PE {pe_text}\n"
             f"🏷️ Price Gate: {p.get('price_quality')} | HR no-vig {_pct(p.get('hardrock_no_vig'))}\n"
+            f"📉 First {_format_american(p.get('first_seen_price'))} → Now {_format_american(p.get('current_price'))} | "
+            f"Move {'N/D' if p.get('line_move_pp') is None else f"{p.get('line_move_pp') * 100:+.1f} pp"} | {p.get('line_move_status')}\n"
             f"🌐 Consensus {_pct(p.get('consensus_no_vig'))} | Gap {vg_text}\n"
             f"🤝 {p.get('market_agreement')} | {p.get('market_grade')}\n\n"
         )

@@ -76,7 +76,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.5.13"
+BOT_VERSION = "3.5.14"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -6683,7 +6683,7 @@ MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
         ["⚾ MLB", "⚽ Fútbol", "🏀 NBA"],
         ["🎯 Picks del día", "📡 Picks en vivo"],
         ["🔔 Alertas", "👤 Mi cuenta"],
-        ["⭐ Suscripción"],
+        ["📘 Manual de usuario", "⭐ Suscripción"],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -6696,7 +6696,7 @@ def _main_menu_keyboard_for(user_id=None):
         ["⚾ MLB", "⚽ Fútbol", "🏀 NBA"],
         ["🎯 Picks del día", "📡 Picks en vivo"],
         ["🔔 Alertas", "👤 Mi cuenta"],
-        ["⭐ Suscripción"],
+        ["📘 Manual de usuario", "⭐ Suscripción"],
     ]
     if user_id is not None and int(user_id) in SUBSCRIPTION_ADMIN_IDS:
         rows.append(["🛡️ Panel Admin"])
@@ -6731,11 +6731,190 @@ def _menu_text():
         "👤 Mi cuenta — membresía y estado de alertas\n"
         "🎯 Picks del día — resumen de MLB, Fútbol y NBA\n"
         "📡 Picks en vivo — seguimiento de todos los picks publicados\n"
+        "📘 Manual de usuario — guía de cada botón y deporte\n"
         "⭐ Suscripción — FREE, PREMIUM y PRO"
     )
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(_menu_text(), reply_markup=_main_menu_keyboard_for(update.effective_user.id if update.effective_user else None))
+
+
+
+
+def _manual_keyboard_for(user_id=None):
+    rows = [
+        ["📗 Guía general", "⚾ Manual MLB"],
+        ["⚽ Manual Fútbol", "🏀 Manual NBA"],
+        ["📡 Manual Picks en vivo", "🔔 Manual Alertas"],
+        ["👤 Manual Mi cuenta", "⭐ Manual Suscripción"],
+    ]
+    if user_id is not None and int(user_id) in SUBSCRIPTION_ADMIN_IDS:
+        rows.append(["🛡️ Guía Admin"])
+    rows.append(["⬅️ Menú principal"])
+    return ReplyKeyboardMarkup(
+        rows,
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Manual Triple Pick",
+    )
+
+
+async def manual_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if update.effective_user else None
+    await update.effective_message.reply_text(
+        "📘 MANUAL DE USUARIO — TRIPLE PICK\n\n"
+        "Selecciona la sección que deseas consultar.\n\n"
+        "📗 Guía general — cómo usar el bot\n"
+        "⚾ MLB — botones y funciones MLB\n"
+        "⚽ Fútbol — botones y funciones de fútbol\n"
+        "🏀 NBA — botones y funciones NBA\n"
+        "📡 Picks en vivo — seguimiento y estados\n"
+        "🔔 Alertas — avisos pregame y SMS\n"
+        "👤 Mi cuenta — plan y vigencia\n"
+        "⭐ Suscripción — FREE, PREMIUM y PRO",
+        reply_markup=_manual_keyboard_for(user_id),
+    )
+
+
+async def manual_general(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if update.effective_user else None
+    await update.effective_message.reply_text(
+        "📗 GUÍA GENERAL\n\n"
+        "1️⃣ Consulta 🎯 Picks del día para ver el resumen de MLB, Fútbol y NBA.\n"
+        "2️⃣ Entra al deporte correspondiente para ver funciones específicas.\n"
+        "3️⃣ Activa 🔔 Alertas si deseas avisos antes de los partidos.\n"
+        "4️⃣ Durante los juegos usa 📡 Picks en vivo para seguir marcador, estado y progreso.\n"
+        "5️⃣ Consulta 📊 Resultados después de que los picks sean liquidados.\n\n"
+        "El bot está diseñado para utilizarse con botones; no necesitas memorizar comandos.",
+        reply_markup=_manual_keyboard_for(user_id),
+    )
+
+
+async def manual_mlb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if update.effective_user else None
+    await update.effective_message.reply_text(
+        "⚾ MANUAL MLB\n\n"
+        "⚾ Juegos MLB — cartelera y horarios del día.\n"
+        "🔴 En vivo MLB — marcadores MLB en curso.\n"
+        "🔥 Picks MLB — picks oficiales publicados.\n"
+        "📊 Resultados MLB — picks ya liquidados.\n"
+        "🧮 Mercado MLB — comparación mercado/modelo.\n"
+        "📈 Rendimiento MLB — W-L, hit rate, unidades y ROI cuando aplica.\n"
+        "📋 Historial MLB — registros recientes del tracking.\n"
+        "🧪 Más opciones — Candidate Pool, Value Board y auditorías avanzadas.\n"
+        "📡 Picks en vivo — seguimiento de los picks publicados durante el juego.",
+        reply_markup=_manual_keyboard_for(user_id),
+    )
+
+
+async def manual_soccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if update.effective_user else None
+    await update.effective_message.reply_text(
+        "⚽ MANUAL FÚTBOL\n\n"
+        "⚽ Partidos Fútbol — partidos programados y horarios.\n"
+        "🔴 En vivo Fútbol — marcadores y estado de los partidos.\n"
+        "🔥 Picks Fútbol — todos los picks visibles para tu plan.\n"
+        "📊 Resultados Fútbol — picks ya liquidados.\n"
+        "🛡️ Survival Fútbol — selecciones del producto Survival.\n"
+        "⭐ Top Picks Fútbol — selecciones principales publicadas.\n"
+        "🎯 Player Props Fútbol — props individuales de jugadores.\n"
+        "🏆 Ligas Fútbol — ligas con picks disponibles.\n"
+        "📡 Picks en vivo — seguimiento de picks durante los partidos.",
+        reply_markup=_manual_keyboard_for(user_id),
+    )
+
+
+async def manual_nba(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if update.effective_user else None
+    await update.effective_message.reply_text(
+        "🏀 MANUAL NBA\n\n"
+        "🏀 Juegos NBA — cartelera y horarios.\n"
+        "🔴 En vivo NBA — marcadores en curso.\n"
+        "🔥 Picks NBA — picks visibles para tu plan.\n"
+        "📊 Resultados NBA — picks ya liquidados.\n"
+        "🛡️ Survival NBA — selecciones Survival.\n"
+        "⭐ Top Picks NBA — picks principales.\n"
+        "🎯 Player Props NBA — props de jugadores.\n"
+        "📡 Picks en vivo — seguimiento de los picks publicados.",
+        reply_markup=_manual_keyboard_for(user_id),
+    )
+
+
+async def manual_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if update.effective_user else None
+    await update.effective_message.reply_text(
+        "📡 MANUAL — PICKS EN VIVO\n\n"
+        "El monitor muestra:\n"
+        "🏟️ Partido\n"
+        "🎯 Pick publicado\n"
+        "📊 Marcador actual\n"
+        "⏱️ Momento del juego\n"
+        "📈 Estado del pick\n"
+        "📐 Progreso del mercado cuando puede calcularse\n\n"
+        "Estados habituales:\n"
+        "⏳ Pendiente — aún no comenzó.\n"
+        "✅ GANANDO — el pick cubre actualmente.\n"
+        "❌ PERDIENDO — no cubre actualmente.\n"
+        "⚠️ EN RIESGO — sigue abierto o cercano a la línea.\n"
+        "🏁 FINAL — resultado definitivo.\n\n"
+        "🔄 Actualizar todos vuelve a consultar todos los picks en vivo.",
+        reply_markup=_manual_keyboard_for(user_id),
+    )
+
+
+async def manual_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if update.effective_user else None
+    await update.effective_message.reply_text(
+        "🔔 MANUAL — ALERTAS\n\n"
+        "✅ Activar alertas — activa avisos pregame.\n"
+        "⛔ Desactivar alertas — detiene esos avisos.\n"
+        "📋 Próximas alertas — muestra avisos pendientes o enviados.\n"
+        "📱 SMS — abre la configuración opcional de mensajes de texto.\n\n"
+        f"El aviso pregame está configurado aproximadamente {ALERT_LEAD_MINUTES} minutos antes del juego.\n"
+        "Las alertas en vivo son independientes: se envían cuando cambia el estado de un pick y están habilitadas.",
+        reply_markup=_manual_keyboard_for(user_id),
+    )
+
+
+async def manual_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if update.effective_user else None
+    await update.effective_message.reply_text(
+        "👤 MANUAL — MI CUENTA\n\n"
+        "👤 Mi cuenta muestra tu plan, estado de membresía, vigencia y configuración de alertas.\n\n"
+        "Si una función no está disponible, revisa primero esta sección para confirmar que tu plan sigue activo.",
+        reply_markup=_manual_keyboard_for(user_id),
+    )
+
+
+async def manual_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if update.effective_user else None
+    await update.effective_message.reply_text(
+        "⭐ MANUAL — SUSCRIPCIÓN\n\n"
+        "FREE — prueba inicial configurada en el bot.\n"
+        "PREMIUM — acceso a productos y funciones PREMIUM habilitadas.\n"
+        "PRO — incluye productos y funciones PRO habilitadas, como Player Props cuando corresponda.\n\n"
+        "El acceso final también depende del nivel asignado a cada pick publicado.",
+        reply_markup=_manual_keyboard_for(user_id),
+    )
+
+
+async def manual_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user is None or int(user.id) not in SUBSCRIPTION_ADMIN_IDS:
+        await update.effective_message.reply_text("⛔ Acceso exclusivo para administradores.")
+        return
+    await update.effective_message.reply_text(
+        "🛡️ GUÍA ADMIN\n\n"
+        "📊 Estadísticas — conteos generales.\n"
+        "👥 Usuarios — listado de miembros.\n"
+        "🎯 Picks oficiales — administración MLB.\n"
+        "⚽ Admin Fútbol — importar, revisar o borrar picks de fútbol.\n"
+        "🏀 Admin NBA — importar, revisar o borrar picks NBA.\n"
+        "⏳ Vencen pronto — membresías próximas a vencer.\n"
+        "💳 Suscripciones — membresías activas.\n"
+        "🧪 Probar alerta en vivo — simula una transición sin alterar picks reales.",
+        reply_markup=_manual_keyboard_for(user.id),
+    )
 
 
 async def menu_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6810,6 +6989,7 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "📅 Picks del día": daily_picks_hub,
         "Picks del día": daily_picks_hub,
         "Picks del dia": daily_picks_hub,
+        "📘 Manual de usuario": manual_menu,
         "⬅️ Menú principal": menu,
         "⚾ MLB": mlb_menu,
         "⚽ Fútbol": soccer_menu,
@@ -6871,6 +7051,16 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "🧮 Mercado": market,
         "📋 Historial MLB": history,
         "📋 Historial": history,
+        "📘 Manual de usuario": manual_menu,
+        "📗 Guía general": manual_general,
+        "⚾ Manual MLB": manual_mlb,
+        "⚽ Manual Fútbol": manual_soccer,
+        "🏀 Manual NBA": manual_nba,
+        "📡 Manual Picks en vivo": manual_live,
+        "🔔 Manual Alertas": manual_alerts,
+        "👤 Manual Mi cuenta": manual_account,
+        "⭐ Manual Suscripción": manual_subscription,
+        "🛡️ Guía Admin": manual_admin,
         "🔔 Alertas": alerts_menu,
         "👤 Mi cuenta": account_command,
         "⭐ Suscripción": subscription_command,

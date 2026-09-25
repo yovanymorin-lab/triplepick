@@ -76,7 +76,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.5.7"
+BOT_VERSION = "3.5.8"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -5751,6 +5751,7 @@ def _pick_start_local(sport, row):
 
 
 def _live_pick_monitor_text(user_id):
+    """Render every published pick as a compact live-status card."""
     pick_date = local_now().strftime("%Y-%m-%d")
     groups = [
         ("⚾ MLB", _mlb_pick_monitor_rows(pick_date)),
@@ -5773,7 +5774,9 @@ def _live_pick_monitor_text(user_id):
     live_count = sum(1 for item in all_rows if item[2] and item[2].get("state") == "in")
     pre_count = sum(1 for item in all_rows if not item[2] or item[2].get("state") == "pre")
     final_count = sum(1 for item in all_rows if item[2] and item[2].get("state") == "post")
-    lines.append(f"🔴 En juego: {live_count}   ·   ⏳ Pendientes: {pre_count}   ·   🏁 Finales: {final_count}")
+    lines.append(
+        f"🔴 En juego: {live_count}   ·   ⏳ Pendientes: {pre_count}   ·   🏁 Finales: {final_count}"
+    )
     lines.append("")
 
     for title, rows in groups:
@@ -5781,29 +5784,48 @@ def _live_pick_monitor_text(user_id):
             continue
         lines.extend([title, ""])
         for sport, row, payload, pick_state in rows:
-            lines.append(f"🎯 {row['selection']}")
-            lines.append(f"🏟️ {row['away']} vs {row['home']}")
+            lines.append("━━━━━━━━━━━━━━━━━━")
+            lines.append(f"🎯 SELECCIÓN: {row['selection']}")
+            lines.append(f"🏟️ PARTIDO: {row['away']} vs {row['home']}")
+
             if payload:
-                if payload.get("state") == "pre":
+                state = payload.get("state")
+                if state == "pre":
                     start_dt = _pick_start_local(sport, row)
                     if start_dt:
-                        lines.append(f"🕐 Inicio: {start_dt.strftime('%I:%M %p').lstrip('0')}")
+                        lines.append(
+                            f"⏱️ JUEGO: inicia {start_dt.strftime('%I:%M %p').lstrip('0')} ({AUTO_TZ})"
+                        )
                     elif payload.get("detail"):
-                        lines.append(f"🕐 {payload.get('detail')}")
+                        lines.append(f"⏱️ JUEGO: {payload.get('detail')}")
+                    lines.append("📊 MARCADOR: 0–0")
                 else:
                     lines.append(
-                        f"📊 {_format_score(payload['away_score'])}–{_format_score(payload['home_score'])} · {payload.get('detail') or ('Final' if payload.get('state') == 'post' else 'En curso')}"
+                        f"📊 MARCADOR: {_format_score(payload['away_score'])}–{_format_score(payload['home_score'])}"
                     )
+                    game_detail = payload.get("detail") or (
+                        "Final" if state == "post" else "En curso"
+                    )
+                    lines.append(f"⏱️ JUEGO: {game_detail}")
             else:
                 start_dt = _pick_start_local(sport, row)
+                lines.append("📊 MARCADOR: no disponible")
                 if start_dt:
-                    lines.append(f"🕐 Inicio: {start_dt.strftime('%I:%M %p').lstrip('0')}")
-            lines.append(pick_state)
+                    lines.append(
+                        f"⏱️ JUEGO: inicia {start_dt.strftime('%I:%M %p').lstrip('0')} ({AUTO_TZ})"
+                    )
+                else:
+                    lines.append("⏱️ JUEGO: horario/marcador pendiente")
+
+            lines.append(f"📈 PROGRESO: {pick_state}")
             lines.append("")
-            if sum(len(x) + 1 for x in lines) > 3650:
-                lines.append("… Hay más picks publicados. Pulsa 🔄 Actualizar todos para volver a consultar.")
+
+            # Telegram messages are capped at 4096 characters. Leave a margin
+            # for the timestamp/footer so refreshes remain safe.
+            if sum(len(x) + 1 for x in lines) > 3550:
+                lines.append("… Hay más picks publicados. Pulsa 🔄 Actualizar todos para consultar nuevamente.")
                 break
-        if sum(len(x) + 1 for x in lines) > 3650:
+        if sum(len(x) + 1 for x in lines) > 3550:
             break
 
     lines.extend(["", f"🔄 Actualizado: {_format_live_stamp()}"])

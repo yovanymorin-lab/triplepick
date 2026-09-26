@@ -88,7 +88,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.5.24"
+BOT_VERSION = "3.5.25"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -121,6 +121,82 @@ SUBSCRIPTION_ADMIN_IDS = {
     if x.strip().lstrip("-").isdigit()
 }
 PLAN_RANK = {"FREE": 0, "PREMIUM": 1, "PRO": 2}
+
+# v3.5.25 — Per-user bilingual UI (Spanish / English).
+LANG_DEFAULT = "es"
+LANG_CHOICES = {"es", "en"}
+
+_UI = {
+    "es": {
+        "select": "Selecciona un deporte o una opción",
+        "menu_intro": "Selecciona tu deporte. No necesitas escribir comandos.",
+        "daily": "🎯 Picks del día", "live": "📡 Picks en vivo",
+        "alerts": "🔔 Alertas", "account": "👤 Mi cuenta",
+        "manual": "📘 Manual de usuario", "subscription": "⭐ Suscripción",
+        "language": "🌐 Idioma / Language", "back": "⬅️ Menú principal",
+        "more": "🧪 Más opciones",
+    },
+    "en": {
+        "select": "Choose a sport or option",
+        "menu_intro": "Choose your sport. You do not need to type commands.",
+        "daily": "🎯 Today's Picks", "live": "📡 Live Picks",
+        "alerts": "🔔 Alerts", "account": "👤 My Account",
+        "manual": "📘 User Guide", "subscription": "⭐ Subscription",
+        "language": "🌐 Language / Idioma", "back": "⬅️ Main Menu",
+        "more": "🧪 More Options",
+    },
+}
+
+
+def _normalize_lang(value):
+    value = (value or "").lower().strip()
+    return "en" if value.startswith("en") else "es"
+
+
+def _get_user_language(user_id, telegram_language_code=None):
+    """Return the saved UI language; default from Telegram only on first contact."""
+    if user_id is None:
+        return _normalize_lang(telegram_language_code or LANG_DEFAULT)
+    try:
+        with _tracking_connection() as conn:
+            row = conn.execute(
+                "SELECT language_code FROM membership_users WHERE user_id=?",
+                (int(user_id),),
+            ).fetchone()
+        if row and row["language_code"] in LANG_CHOICES:
+            return row["language_code"]
+    except Exception:
+        pass
+    return _normalize_lang(telegram_language_code or LANG_DEFAULT)
+
+
+def _set_user_language(user_id, lang):
+    lang = _normalize_lang(lang)
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    if user_id is None:
+        return lang
+    with _tracking_connection() as conn:
+        # Ensure there is a membership row before storing the language.
+        row = conn.execute("SELECT user_id FROM membership_users WHERE user_id=?", (int(user_id),)).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE membership_users SET language_code=?, updated_at=? WHERE user_id=?",
+                (lang, now_ts, int(user_id)),
+            )
+    return lang
+
+
+def _lang_for_update(update):
+    user = update.effective_user if update else None
+    return _get_user_language(
+        user.id if user else None,
+        getattr(user, "language_code", None) if user else None,
+    )
+
+
+def _ui(lang, key):
+    lang = lang if lang in LANG_CHOICES else LANG_DEFAULT
+    return _UI[lang].get(key, _UI[LANG_DEFAULT].get(key, key))
 
 
 # Triple Pick v2.9.7 — Telegram pregame alerts + optional Twilio SMS channel.
@@ -3253,36 +3329,66 @@ SMS_MENU_KEYBOARD = ReplyKeyboardMarkup(
 )
 
 
+def _alert_menu_keyboard_for(lang="es"):
+    if lang == "en":
+        rows = [["✅ Enable Alerts", "⛔ Disable Alerts"], ["📋 Upcoming Alerts", "📱 SMS"], ["⬅️ Main Menu"]]
+        placeholder = "Triple Pick Alerts"
+    else:
+        rows = [["✅ Activar alertas", "⛔ Desactivar alertas"], ["📋 Próximas alertas", "📱 SMS"], ["⬅️ Menú principal"]]
+        placeholder = "Alertas Triple Pick"
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True, input_field_placeholder=placeholder)
+
+
+def _sms_menu_keyboard_for(lang="es"):
+    if lang == "en":
+        rows = [["✅ Enable SMS", "⛔ Disable SMS"], ["📱 SMS Status", "⬅️ Alerts"]]
+    else:
+        rows = [["✅ Activar SMS", "⛔ Desactivar SMS"], ["📱 Estado SMS", "⬅️ Alertas"]]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True, input_field_placeholder="SMS Triple Pick")
+
+
 async def alerts_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    lang = _lang_for_update(update)
     sub = await asyncio.to_thread(_get_alert_subscription, chat_id)
-    state = "ACTIVAS" if sub["enabled"] else "DESACTIVADAS"
     sms_sub = await asyncio.to_thread(_get_sms_subscription, chat_id)
-    sms_state = "ACTIVO" if sms_sub.get("enabled") else "DESACTIVADO"
-    await update.message.reply_text(
-        "🔔 ALERTAS TRIPLE PICK\n\n"
-        f"Telegram: {state}\n"
-        f"SMS: {sms_state}\n"
-        f"Aviso: {sub['lead_minutes']} minutos antes de cada juego del Triple Pick.\n\n"
-        "Usa los botones para administrar Telegram, SMS o revisar las próximas alertas.",
-        reply_markup=ALERT_MENU_KEYBOARD,
-    )
+    if lang == "en":
+        state = "ON" if sub["enabled"] else "OFF"
+        sms_state = "ON" if sms_sub.get("enabled") else "OFF"
+        text = (
+            "🔔 TRIPLE PICK ALERTS\n\n"
+            f"Telegram: {state}\nSMS: {sms_state}\n"
+            f"Notice: {sub['lead_minutes']} minutes before each Triple Pick game.\n\n"
+            "Use the buttons to manage Telegram/SMS alerts or review upcoming alerts."
+        )
+    else:
+        state = "ACTIVAS" if sub["enabled"] else "DESACTIVADAS"
+        sms_state = "ACTIVO" if sms_sub.get("enabled") else "DESACTIVADO"
+        text = (
+            "🔔 ALERTAS TRIPLE PICK\n\n"
+            f"Telegram: {state}\nSMS: {sms_state}\n"
+            f"Aviso: {sub['lead_minutes']} minutos antes de cada juego del Triple Pick.\n\n"
+            "Usa los botones para administrar Telegram, SMS o revisar las próximas alertas."
+        )
+    await update.message.reply_text(text, reply_markup=_alert_menu_keyboard_for(lang))
 
 
 async def alerts_enable(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    lang = _lang_for_update(update)
     await asyncio.to_thread(_set_alert_subscription, chat_id, True, ALERT_LEAD_MINUTES)
     info = await schedule_alert_jobs(context.application)
-    await update.message.reply_text(
-        "✅ Alertas activadas.\n"
-        f"Recibirás un aviso {ALERT_LEAD_MINUTES} minutos antes de cada juego registrado en Triple Pick.\n"
-        f"Alertas programadas ahora: {info['scheduled']}.",
-        reply_markup=ALERT_MENU_KEYBOARD,
+    text = (
+        f"✅ Alerts enabled.\nYou will receive a notice {ALERT_LEAD_MINUTES} minutes before each registered Triple Pick game.\nAlerts scheduled now: {info['scheduled']}."
+        if lang == "en" else
+        f"✅ Alertas activadas.\nRecibirás un aviso {ALERT_LEAD_MINUTES} minutos antes de cada juego registrado en Triple Pick.\nAlertas programadas ahora: {info['scheduled']}."
     )
+    await update.message.reply_text(text, reply_markup=_alert_menu_keyboard_for(lang))
 
 
 async def alerts_disable(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    lang = _lang_for_update(update)
     await asyncio.to_thread(_set_alert_subscription, chat_id, False, ALERT_LEAD_MINUTES)
     if context.application.job_queue is not None:
         prefix = f"tp_alert_{chat_id}_"
@@ -3290,8 +3396,8 @@ async def alerts_disable(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if job.name and job.name.startswith(prefix):
                 job.schedule_removal()
     await update.message.reply_text(
-        "⛔ Alertas desactivadas para este chat.",
-        reply_markup=ALERT_MENU_KEYBOARD,
+        "⛔ Alerts disabled for this chat." if lang == "en" else "⛔ Alertas desactivadas para este chat.",
+        reply_markup=_alert_menu_keyboard_for(lang),
     )
 
 
@@ -3309,7 +3415,7 @@ async def sms_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Para registrar/cambiar el número usa:\n"
         "/smsset +1XXXXXXXXXX\n\n"
         "El número debe estar en formato internacional E.164.",
-        reply_markup=SMS_MENU_KEYBOARD,
+        reply_markup=_sms_menu_keyboard_for(_lang_for_update(update)),
     )
 
 
@@ -3318,21 +3424,21 @@ async def sms_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
             "Uso: /smsset +1XXXXXXXXXX\nEjemplo de formato: +17865551234",
-            reply_markup=SMS_MENU_KEYBOARD,
+            reply_markup=_sms_menu_keyboard_for(_lang_for_update(update)),
         )
         return
     phone = _normalize_e164(context.args[0])
     if not phone:
         await update.message.reply_text(
             "❌ Número inválido. Usa formato E.164, comenzando con + y código de país.",
-            reply_markup=SMS_MENU_KEYBOARD,
+            reply_markup=_sms_menu_keyboard_for(_lang_for_update(update)),
         )
         return
     await asyncio.to_thread(_set_sms_subscription, chat_id, None, phone)
     await update.message.reply_text(
         f"✅ Número SMS guardado: {_mask_phone(phone)}\n"
         "Ahora puedes pulsar ✅ Activar SMS.",
-        reply_markup=SMS_MENU_KEYBOARD,
+        reply_markup=_sms_menu_keyboard_for(_lang_for_update(update)),
     )
 
 
@@ -3342,7 +3448,7 @@ async def sms_enable(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not sub.get("phone_number"):
         await update.message.reply_text(
             "⚠️ Primero registra el número con /smsset +1XXXXXXXXXX.",
-            reply_markup=SMS_MENU_KEYBOARD,
+            reply_markup=_sms_menu_keyboard_for(_lang_for_update(update)),
         )
         return
     if not _twilio_configured():
@@ -3350,14 +3456,14 @@ async def sms_enable(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⚠️ Twilio todavía no está configurado en Railway.\n"
             "Necesitas TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN y TWILIO_FROM_NUMBER "
             "o TWILIO_MESSAGING_SERVICE_SID.",
-            reply_markup=SMS_MENU_KEYBOARD,
+            reply_markup=_sms_menu_keyboard_for(_lang_for_update(update)),
         )
         return
     await asyncio.to_thread(_set_sms_subscription, chat_id, True, None)
     await update.message.reply_text(
         f"✅ SMS activado para {_mask_phone(sub.get('phone_number'))}.\n"
         "Se enviará junto con la alerta de Telegram.",
-        reply_markup=SMS_MENU_KEYBOARD,
+        reply_markup=_sms_menu_keyboard_for(_lang_for_update(update)),
     )
 
 
@@ -3366,7 +3472,7 @@ async def sms_disable(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await asyncio.to_thread(_set_sms_subscription, chat_id, False, None)
     await update.message.reply_text(
         "⛔ SMS desactivado. Las alertas de Telegram no cambian.",
-        reply_markup=SMS_MENU_KEYBOARD,
+        reply_markup=_sms_menu_keyboard_for(_lang_for_update(update)),
     )
 
 
@@ -3663,7 +3769,8 @@ def init_membership_db():
                 trial_started_at INTEGER NOT NULL,
                 trial_expires_at INTEGER NOT NULL,
                 created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
+                updated_at INTEGER NOT NULL,
+                language_code TEXT NOT NULL DEFAULT 'es'
             );
 
             CREATE INDEX IF NOT EXISTS idx_membership_trial_expiry
@@ -3675,6 +3782,10 @@ def init_membership_db():
             );
             """
         )
+        try:
+            conn.execute("ALTER TABLE membership_users ADD COLUMN language_code TEXT NOT NULL DEFAULT 'es'")
+        except sqlite3.OperationalError:
+            pass
 
 
 def migrate_legacy_free_trials_to_30_days():
@@ -5533,19 +5644,34 @@ def _format_soccer_rows(rows, title="⚽ TRIPLE PICK — FÚTBOL"):
     return "\n".join(lines).rstrip()
 
 
+def _mlb_menu_keyboard_for(lang="es"):
+    if lang == "en":
+        rows = [["⚾ MLB Games", "🔴 MLB Live"], ["🔥 MLB Picks", "📊 MLB Results"], ["🧮 MLB Market", "📐 MLB Lines"], ["📈 MLB Performance", "📋 MLB History"], ["🧪 More Options"], ["📋 MLB Lineups", "🌦️ MLB Weather"], ["🏟️ MLB Ballpark Dimensions", "📈 MLB Last 10"], ["📡 Live Picks"], ["⬅️ Main Menu"]]
+    else:
+        rows = [["⚾ Juegos MLB", "🔴 En vivo MLB"], ["🔥 Picks MLB", "📊 Resultados MLB"], ["🧮 Mercado MLB", "📐 Líneas MLB"], ["📈 Rendimiento MLB", "📋 Historial MLB"], ["🧪 Más opciones"], ["📋 Alineaciones MLB", "🌦️ Clima MLB"], ["🏟️ Dimensiones MLB", "📈 Últimos 10 MLB"], ["📡 Picks en vivo"], ["⬅️ Menú principal"]]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True, input_field_placeholder="Triple Pick MLB")
+
+
+def _soccer_menu_keyboard_for(lang="es"):
+    if lang == "en":
+        rows = [["⚽ Soccer Games", "🔴 Soccer Live"], ["🔥 Soccer Picks", "📊 Soccer Results"], ["🛡️ Soccer Survival", "⭐ Soccer Top Picks"], ["🎯 Soccer Player Props", "🏆 Soccer Leagues"], ["📋 Soccer Lineups", "🌦️ Soccer Weather"], ["📈 Soccer Last 10"], ["📡 Live Picks"], ["⬅️ Main Menu"]]
+    else:
+        rows = [["⚽ Partidos Fútbol", "🔴 En vivo Fútbol"], ["🔥 Picks Fútbol", "📊 Resultados Fútbol"], ["🛡️ Survival Fútbol", "⭐ Top Picks Fútbol"], ["🎯 Player Props Fútbol", "🏆 Ligas Fútbol"], ["📋 Alineaciones Fútbol", "🌦️ Clima Fútbol"], ["📈 Últimos 10 Fútbol"], ["📡 Picks en vivo"], ["⬅️ Menú principal"]]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True, input_field_placeholder="Triple Pick Soccer" if lang == "en" else "Triple Pick Fútbol")
+
+
 async def mlb_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = _lang_for_update(update)
     await update.effective_message.reply_text(
-        "⚾ TRIPLE PICK — MLB\n\nSelecciona una opción.",
-        reply_markup=MLB_MENU_KEYBOARD,
+        "⚾ TRIPLE PICK — MLB\n\nChoose an option." if lang == "en" else "⚾ TRIPLE PICK — MLB\n\nSelecciona una opción.",
+        reply_markup=_mlb_menu_keyboard_for(lang),
     )
 
 
 async def soccer_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "⚽ TRIPLE PICK — FÚTBOL\n\n"
-        "Los picks publicados aquí provienen de la selección final aprobada para fútbol.",
-        reply_markup=SOCCER_MENU_KEYBOARD,
-    )
+    lang = _lang_for_update(update)
+    text = ("⚽ TRIPLE PICK — SOCCER\n\nPublished picks come from the final approved soccer selection." if lang == "en" else "⚽ TRIPLE PICK — FÚTBOL\n\nLos picks publicados aquí provienen de la selección final aprobada para fútbol.")
+    await update.effective_message.reply_text(text, reply_markup=_soccer_menu_keyboard_for(lang))
 
 
 async def soccer_picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5555,7 +5681,7 @@ async def soccer_picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = await asyncio.to_thread(_soccer_visible_rows, user_id)
     await update.effective_message.reply_text(
         _format_soccer_rows(rows, "🔥 PICKS DE HOY — FÚTBOL"),
-        reply_markup=SOCCER_MENU_KEYBOARD,
+        reply_markup=_soccer_menu_keyboard_for(_lang_for_update(update)),
     )
 
 
@@ -5566,7 +5692,7 @@ async def soccer_survival(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = await asyncio.to_thread(_soccer_visible_rows, user_id, None, "SURVIVAL")
     await update.effective_message.reply_text(
         _format_soccer_rows(rows, "🛡️ SURVIVAL — FÚTBOL"),
-        reply_markup=SOCCER_MENU_KEYBOARD,
+        reply_markup=_soccer_menu_keyboard_for(_lang_for_update(update)),
     )
 
 
@@ -5578,7 +5704,7 @@ async def soccer_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = [r for r in rows if r["product"].upper() in {"TOP PICK", "CORE", "VALUE", "HYBRID"}]
     await update.effective_message.reply_text(
         _format_soccer_rows(rows, "⭐ TOP PICKS — FÚTBOL"),
-        reply_markup=SOCCER_MENU_KEYBOARD,
+        reply_markup=_soccer_menu_keyboard_for(_lang_for_update(update)),
     )
 
 
@@ -5589,7 +5715,7 @@ async def soccer_player_props(update: Update, context: ContextTypes.DEFAULT_TYPE
     rows = await asyncio.to_thread(_soccer_visible_rows, user_id, None, "PLAYER")
     await update.effective_message.reply_text(
         _format_soccer_rows(rows, "🎯 PLAYER PROPS — FÚTBOL"),
-        reply_markup=SOCCER_MENU_KEYBOARD,
+        reply_markup=_soccer_menu_keyboard_for(_lang_for_update(update)),
     )
 
 
@@ -5597,7 +5723,7 @@ async def soccer_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = await asyncio.to_thread(_soccer_pick_rows)
     leagues = sorted({r["league"] for r in rows})
     text = "🏆 LIGAS — FÚTBOL\n\n" + ("\n".join(f"• {x}" for x in leagues) if leagues else "No hay ligas con picks publicados hoy.")
-    await update.effective_message.reply_text(text, reply_markup=SOCCER_MENU_KEYBOARD)
+    await update.effective_message.reply_text(text, reply_markup=_soccer_menu_keyboard_for(_lang_for_update(update)))
 
 
 async def soccer_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5614,7 +5740,7 @@ async def soccer_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
             icon = "✅" if r["result"] == "WIN" else ("❌" if r["result"] == "LOSS" else "➖")
             lines.append(f"{icon} {r['pick_date']} | {r['selection']} | {r['away']} vs {r['home']}")
         text = "\n".join(lines)
-    await update.effective_message.reply_text(text, reply_markup=SOCCER_MENU_KEYBOARD)
+    await update.effective_message.reply_text(text, reply_markup=_soccer_menu_keyboard_for(_lang_for_update(update)))
 
 
 def _parse_soccer_kickoff(value):
@@ -5907,7 +6033,7 @@ async def mlb_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 """
             ).fetchall()
     except Exception as exc:
-        await update.effective_message.reply_text(f"❌ Tracking DB error: {exc}", reply_markup=MLB_MENU_KEYBOARD)
+        await update.effective_message.reply_text(f"❌ Tracking DB error: {exc}", reply_markup=_mlb_menu_keyboard_for(_lang_for_update(update)))
         return
     if not rows:
         text = "📊 RESULTADOS — MLB\n\nAún no hay resultados oficiales liquidados."
@@ -5921,7 +6047,7 @@ async def mlb_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"   {r['away']} vs {r['home']} | {_format_units(r['units_won_lost'])}"
             )
         text = "\n\n".join(lines)
-    await update.effective_message.reply_text(text, reply_markup=MLB_MENU_KEYBOARD)
+    await update.effective_message.reply_text(text, reply_markup=_mlb_menu_keyboard_for(_lang_for_update(update)))
 
 
 # ---------------------------------------------------------------------------
@@ -6613,7 +6739,7 @@ async def mlb_lineups(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     fecha = local_now().strftime("%Y-%m-%d")
     text = await asyncio.to_thread(_format_mlb_lineups_for_picks, fecha)
-    await update.effective_message.reply_text(text, reply_markup=MLB_MENU_KEYBOARD)
+    await update.effective_message.reply_text(text, reply_markup=_mlb_menu_keyboard_for(_lang_for_update(update)))
 
 
 async def soccer_lineups(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6622,7 +6748,7 @@ async def soccer_lineups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else 0
     fecha = local_now().strftime("%Y-%m-%d")
     text = await asyncio.to_thread(_format_soccer_lineups_for_picks, user_id, fecha)
-    await update.effective_message.reply_text(text, reply_markup=SOCCER_MENU_KEYBOARD)
+    await update.effective_message.reply_text(text, reply_markup=_soccer_menu_keyboard_for(_lang_for_update(update)))
 
 
 async def nba_lineups(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6631,7 +6757,7 @@ async def nba_lineups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else 0
     fecha = local_now().strftime("%Y-%m-%d")
     text = await asyncio.to_thread(_format_nba_lineups_for_picks, user_id, fecha)
-    await update.effective_message.reply_text(text, reply_markup=NBA_MENU_KEYBOARD)
+    await update.effective_message.reply_text(text, reply_markup=_nba_menu_keyboard_for(_lang_for_update(update)))
 
 
 # ---------------------------------------------------------------------------
@@ -6978,7 +7104,7 @@ async def mlb_weather(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     fecha = local_now().strftime("%Y-%m-%d")
     text = await asyncio.to_thread(_format_mlb_weather_for_picks, fecha)
-    await update.effective_message.reply_text(text, reply_markup=MLB_MENU_KEYBOARD)
+    await update.effective_message.reply_text(text, reply_markup=_mlb_menu_keyboard_for(_lang_for_update(update)))
 
 
 async def soccer_weather(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6987,7 +7113,7 @@ async def soccer_weather(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else 0
     fecha = local_now().strftime("%Y-%m-%d")
     text = await asyncio.to_thread(_format_soccer_weather_for_picks, user_id, fecha)
-    await update.effective_message.reply_text(text, reply_markup=SOCCER_MENU_KEYBOARD)
+    await update.effective_message.reply_text(text, reply_markup=_soccer_menu_keyboard_for(_lang_for_update(update)))
 
 
 # ---------------------------------------------------------------------------
@@ -7296,7 +7422,7 @@ async def mlb_dimensions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     fecha = local_now().strftime("%Y-%m-%d")
     text = await asyncio.to_thread(_format_mlb_dimensions_for_picks, fecha)
-    await update.effective_message.reply_text(text, reply_markup=MLB_MENU_KEYBOARD)
+    await update.effective_message.reply_text(text, reply_markup=_mlb_menu_keyboard_for(_lang_for_update(update)))
 
 
 async def mlb_last10(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7304,7 +7430,7 @@ async def mlb_last10(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     fecha = local_now().strftime("%Y-%m-%d")
     text = await asyncio.to_thread(_format_mlb_last10_for_picks, fecha)
-    await update.effective_message.reply_text(text, reply_markup=MLB_MENU_KEYBOARD)
+    await update.effective_message.reply_text(text, reply_markup=_mlb_menu_keyboard_for(_lang_for_update(update)))
 
 
 async def soccer_last10(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7313,7 +7439,7 @@ async def soccer_last10(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else 0
     fecha = local_now().strftime("%Y-%m-%d")
     text = await asyncio.to_thread(_format_soccer_last10_for_picks, user_id, fecha)
-    await update.effective_message.reply_text(text, reply_markup=SOCCER_MENU_KEYBOARD)
+    await update.effective_message.reply_text(text, reply_markup=_soccer_menu_keyboard_for(_lang_for_update(update)))
 
 
 async def nba_last10(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7322,7 +7448,7 @@ async def nba_last10(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else 0
     fecha = local_now().strftime("%Y-%m-%d")
     text = await asyncio.to_thread(_format_nba_last10_for_picks, user_id, fecha)
-    await update.effective_message.reply_text(text, reply_markup=NBA_MENU_KEYBOARD)
+    await update.effective_message.reply_text(text, reply_markup=_nba_menu_keyboard_for(_lang_for_update(update)))
 
 
 # ---------------------------------------------------------------------------
@@ -7610,7 +7736,7 @@ def _soccer_games_text():
 
 async def soccer_games(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = await asyncio.to_thread(_soccer_games_text)
-    await update.effective_message.reply_text(text, reply_markup=SOCCER_MENU_KEYBOARD)
+    await update.effective_message.reply_text(text, reply_markup=_soccer_menu_keyboard_for(_lang_for_update(update)))
 
 
 def _soccer_live_text():
@@ -8611,16 +8737,25 @@ def _format_nba_rows(rows, title="🏀 TRIPLE PICK — NBA"):
     return "\n".join(lines).rstrip()
 
 
+def _nba_menu_keyboard_for(lang="es"):
+    if lang == "en":
+        rows = [["🏀 NBA Games", "🔴 NBA Live"], ["🔥 NBA Picks", "📊 NBA Results"], ["🛡️ NBA Survival", "⭐ NBA Top Picks"], ["🎯 NBA Player Props"], ["📋 NBA Lineups", "📈 NBA Last 10"], ["📡 Live Picks"], ["⬅️ Main Menu"]]
+    else:
+        rows = [["🏀 Juegos NBA", "🔴 En vivo NBA"], ["🔥 Picks NBA", "📊 Resultados NBA"], ["🛡️ Survival NBA", "⭐ Top Picks NBA"], ["🎯 Player Props NBA"], ["📋 Alineaciones NBA", "📈 Últimos 10 NBA"], ["📡 Picks en vivo"], ["⬅️ Menú principal"]]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True, input_field_placeholder="Triple Pick NBA")
+
+
 async def nba_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = _lang_for_update(update)
     await update.effective_message.reply_text(
-        "🏀 TRIPLE PICK — NBA\n\nSelecciona una opción.",
-        reply_markup=NBA_MENU_KEYBOARD,
+        "🏀 TRIPLE PICK — NBA\n\nChoose an option." if lang == "en" else "🏀 TRIPLE PICK — NBA\n\nSelecciona una opción.",
+        reply_markup=_nba_menu_keyboard_for(lang),
     )
 
 
 async def nba_games(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = await asyncio.to_thread(_nba_games_text)
-    await update.effective_message.reply_text(text, reply_markup=NBA_MENU_KEYBOARD)
+    await update.effective_message.reply_text(text, reply_markup=_nba_menu_keyboard_for(_lang_for_update(update)))
 
 
 async def nba_picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8628,7 +8763,7 @@ async def nba_picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user_id = update.effective_user.id if update.effective_user else 0
     rows = await asyncio.to_thread(_nba_visible_rows, user_id)
-    await update.effective_message.reply_text(_format_nba_rows(rows, "🔥 PICKS DE HOY — NBA"), reply_markup=NBA_MENU_KEYBOARD)
+    await update.effective_message.reply_text(_format_nba_rows(rows, "🔥 PICKS DE HOY — NBA"), reply_markup=_nba_menu_keyboard_for(_lang_for_update(update)))
 
 
 async def nba_survival(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8636,7 +8771,7 @@ async def nba_survival(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user_id = update.effective_user.id if update.effective_user else 0
     rows = await asyncio.to_thread(_nba_visible_rows, user_id, None, "SURVIVAL")
-    await update.effective_message.reply_text(_format_nba_rows(rows, "🛡️ SURVIVAL — NBA"), reply_markup=NBA_MENU_KEYBOARD)
+    await update.effective_message.reply_text(_format_nba_rows(rows, "🛡️ SURVIVAL — NBA"), reply_markup=_nba_menu_keyboard_for(_lang_for_update(update)))
 
 
 async def nba_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8645,7 +8780,7 @@ async def nba_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else 0
     rows = await asyncio.to_thread(_nba_visible_rows, user_id)
     rows = [r for r in rows if r["product"].upper() in {"TOP PICK", "CORE", "VALUE", "HYBRID", "SURVIVAL"}]
-    await update.effective_message.reply_text(_format_nba_rows(rows, "⭐ TOP PICKS — NBA"), reply_markup=NBA_MENU_KEYBOARD)
+    await update.effective_message.reply_text(_format_nba_rows(rows, "⭐ TOP PICKS — NBA"), reply_markup=_nba_menu_keyboard_for(_lang_for_update(update)))
 
 
 async def nba_player_props(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8653,7 +8788,7 @@ async def nba_player_props(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user_id = update.effective_user.id if update.effective_user else 0
     rows = await asyncio.to_thread(_nba_visible_rows, user_id, None, "PLAYER")
-    await update.effective_message.reply_text(_format_nba_rows(rows, "🎯 PLAYER PROPS — NBA"), reply_markup=NBA_MENU_KEYBOARD)
+    await update.effective_message.reply_text(_format_nba_rows(rows, "🎯 PLAYER PROPS — NBA"), reply_markup=_nba_menu_keyboard_for(_lang_for_update(update)))
 
 
 async def nba_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8670,7 +8805,7 @@ async def nba_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
             icon = "✅" if r["result"] == "WIN" else ("❌" if r["result"] == "LOSS" else "➖")
             lines.append(f"{icon} {r['pick_date']} | {r['selection']} | {r['away']} vs {r['home']}")
         text = "\n".join(lines)
-    await update.effective_message.reply_text(text, reply_markup=NBA_MENU_KEYBOARD)
+    await update.effective_message.reply_text(text, reply_markup=_nba_menu_keyboard_for(_lang_for_update(update)))
 
 
 def _save_nba_picks(rows, created_by, pick_date=None):
@@ -8912,33 +9047,24 @@ async def schedule_nba_alert_jobs(application, pick_date=None):
 # ---------------------------------------------------------------------------
 
 MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
-    [
-        ["⚾ MLB", "⚽ Fútbol", "🏀 NBA"],
-        ["🎯 Picks del día", "📡 Picks en vivo"],
-        ["🔔 Alertas", "👤 Mi cuenta"],
-        ["📘 Manual de usuario", "⭐ Suscripción"],
-    ],
-    resize_keyboard=True,
-    is_persistent=True,
-    input_field_placeholder="Selecciona un deporte o una opción",
+    [["⚾ MLB", "⚽ Fútbol", "🏀 NBA"], ["🎯 Picks del día", "📡 Picks en vivo"], ["🔔 Alertas", "👤 Mi cuenta"], ["📘 Manual de usuario", "⭐ Suscripción"], ["🌐 Idioma / Language"]],
+    resize_keyboard=True, is_persistent=True,
 )
 
 
-def _main_menu_keyboard_for(user_id=None):
+def _main_menu_keyboard_for(user_id=None, lang=None):
+    lang = lang or _get_user_language(user_id)
+    soccer = "⚽ Soccer" if lang == "en" else "⚽ Fútbol"
     rows = [
-        ["⚾ MLB", "⚽ Fútbol", "🏀 NBA"],
-        ["🎯 Picks del día", "📡 Picks en vivo"],
-        ["🔔 Alertas", "👤 Mi cuenta"],
-        ["📘 Manual de usuario", "⭐ Suscripción"],
+        ["⚾ MLB", soccer, "🏀 NBA"],
+        [_ui(lang, "daily"), _ui(lang, "live")],
+        [_ui(lang, "alerts"), _ui(lang, "account")],
+        [_ui(lang, "manual"), _ui(lang, "subscription")],
+        [_ui(lang, "language")],
     ]
     if user_id is not None and int(user_id) in SUBSCRIPTION_ADMIN_IDS:
-        rows.append(["🛡️ Panel Admin"])
-    return ReplyKeyboardMarkup(
-        rows,
-        resize_keyboard=True,
-        is_persistent=True,
-        input_field_placeholder="Selecciona un deporte o una opción",
-    )
+        rows.append(["🛡️ Admin Panel" if lang == "en" else "🛡️ Panel Admin"])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True, input_field_placeholder=_ui(lang, "select"))
 
 MORE_MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
@@ -8953,7 +9079,22 @@ MORE_MENU_KEYBOARD = ReplyKeyboardMarkup(
 )
 
 
-def _menu_text():
+def _menu_text(lang="es"):
+    if lang == "en":
+        return (
+            f"🏆 TRIPLE PICK v{BOT_VERSION} — MULTI-SPORT\n\n"
+            "Choose your sport. You do not need to type commands.\n\n"
+            "⚾ MLB — model, market, tracking and MLB picks\n"
+            "⚽ Soccer — approved picks, Survival, Top Picks and Player Props\n"
+            "🏀 NBA — games, picks, props and live scores\n"
+            "🔔 Alerts — pregame notifications\n"
+            "👤 My Account — membership and alert status\n"
+            "🎯 Today's Picks — MLB, Soccer and NBA summary\n"
+            "📡 Live Picks — monitor all published picks\n"
+            "📘 User Guide — guide to each button and sport\n"
+            "⭐ Subscription — FREE, PREMIUM and PRO\n"
+            "🌐 Language / Idioma — switch English / Spanish"
+        )
     return (
         f"🏆 TRIPLE PICK v{BOT_VERSION} — MULTI-SPORT\n\n"
         "Selecciona tu deporte. No necesitas escribir comandos.\n\n"
@@ -8965,48 +9106,72 @@ def _menu_text():
         "🎯 Picks del día — resumen de MLB, Fútbol y NBA\n"
         "📡 Picks en vivo — seguimiento de todos los picks publicados\n"
         "📘 Manual de usuario — guía de cada botón y deporte\n"
-        "⭐ Suscripción — FREE, PREMIUM y PRO"
+        "⭐ Suscripción — FREE, PREMIUM y PRO\n"
+        "🌐 Idioma / Language — cambiar Español / English"
     )
+
+
+async def language_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🇪🇸 Español", callback_data="lang|es"), InlineKeyboardButton("🇺🇸 English", callback_data="lang|en")]
+    ])
+    lang = _lang_for_update(update)
+    text = "🌐 Elige el idioma del bot / Choose your bot language."
+    await update.effective_message.reply_text(text, reply_markup=keyboard)
+
+
+async def language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    lang = (query.data or "lang|es").split("|", 1)[1]
+    _set_user_language(query.from_user.id, lang)
+    if lang == "en":
+        text = "✅ Language changed to English."
+    else:
+        text = "✅ Idioma cambiado a Español."
+    await query.message.reply_text(text + "\n\n" + _menu_text(lang), reply_markup=_main_menu_keyboard_for(query.from_user.id, lang))
+
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(_menu_text(), reply_markup=_main_menu_keyboard_for(update.effective_user.id if update.effective_user else None))
+    lang = _lang_for_update(update)
+    await update.message.reply_text(_menu_text(lang), reply_markup=_main_menu_keyboard_for(update.effective_user.id if update.effective_user else None, lang))
 
 
 
 
-def _manual_keyboard_for(user_id=None):
-    rows = [
-        ["📗 Guía general", "⚾ Manual MLB"],
-        ["⚽ Manual Fútbol", "🏀 Manual NBA"],
-        ["📡 Manual Picks en vivo", "🔔 Manual Alertas"],
-        ["👤 Manual Mi cuenta", "⭐ Manual Suscripción"],
-    ]
-    if user_id is not None and int(user_id) in SUBSCRIPTION_ADMIN_IDS:
-        rows.append(["🛡️ Guía Admin"])
-    rows.append(["⬅️ Menú principal"])
-    return ReplyKeyboardMarkup(
-        rows,
-        resize_keyboard=True,
-        is_persistent=True,
-        input_field_placeholder="Manual Triple Pick",
-    )
+def _manual_keyboard_for(user_id=None, lang=None):
+    lang = lang or _get_user_language(user_id)
+    if lang == "en":
+        rows = [["📗 General Guide", "⚾ MLB Guide"], ["⚽ Soccer Guide", "🏀 NBA Guide"], ["📡 Live Picks Guide", "🔔 Alerts Guide"], ["👤 My Account Guide", "⭐ Subscription Guide"]]
+        if user_id is not None and int(user_id) in SUBSCRIPTION_ADMIN_IDS: rows.append(["🛡️ Admin Guide"])
+        rows.append(["⬅️ Main Menu"])
+    else:
+        rows = [["📗 Guía general", "⚾ Manual MLB"], ["⚽ Manual Fútbol", "🏀 Manual NBA"], ["📡 Manual Picks en vivo", "🔔 Manual Alertas"], ["👤 Manual Mi cuenta", "⭐ Manual Suscripción"]]
+        if user_id is not None and int(user_id) in SUBSCRIPTION_ADMIN_IDS: rows.append(["🛡️ Guía Admin"])
+        rows.append(["⬅️ Menú principal"])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True, input_field_placeholder="Triple Pick Guide" if lang == "en" else "Manual Triple Pick")
 
 
 async def manual_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else None
-    await update.effective_message.reply_text(
-        "📘 MANUAL DE USUARIO — TRIPLE PICK\n\n"
-        "Selecciona la sección que deseas consultar.\n\n"
-        "📗 Guía general — cómo usar el bot\n"
-        "⚾ MLB — botones y funciones MLB\n"
-        "⚽ Fútbol — botones y funciones de fútbol\n"
-        "🏀 NBA — botones y funciones NBA\n"
-        "📡 Picks en vivo — seguimiento y estados\n"
-        "🔔 Alertas — avisos pregame y SMS\n"
-        "👤 Mi cuenta — plan y vigencia\n"
-        "⭐ Suscripción — FREE, PREMIUM y PRO",
-        reply_markup=_manual_keyboard_for(user_id),
-    )
+    lang = _lang_for_update(update)
+    if lang == "en":
+        text = (
+            "📘 USER GUIDE — TRIPLE PICK\n\nChoose the section you want to review.\n\n"
+            "📗 General Guide — how to use the bot\n⚾ MLB — MLB buttons and functions\n"
+            "⚽ Soccer — soccer buttons and functions\n🏀 NBA — NBA buttons and functions\n"
+            "📡 Live Picks — monitoring and pick states\n🔔 Alerts — pregame and SMS notifications\n"
+            "👤 My Account — plan and expiration\n⭐ Subscription — FREE, PREMIUM and PRO"
+        )
+    else:
+        text = (
+            "📘 MANUAL DE USUARIO — TRIPLE PICK\n\nSelecciona la sección que deseas consultar.\n\n"
+            "📗 Guía general — cómo usar el bot\n⚾ MLB — botones y funciones MLB\n"
+            "⚽ Fútbol — botones y funciones de fútbol\n🏀 NBA — botones y funciones NBA\n"
+            "📡 Picks en vivo — seguimiento y estados\n🔔 Alertas — avisos pregame y SMS\n"
+            "👤 Mi cuenta — plan y vigencia\n⭐ Suscripción — FREE, PREMIUM y PRO"
+        )
+    await update.effective_message.reply_text(text, reply_markup=_manual_keyboard_for(user_id, lang))
 
 
 async def manual_general(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9180,7 +9345,8 @@ async def daily_picks_hub(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = user.id if user else None
     fecha = local_now().strftime("%Y-%m-%d")
 
-    sections = [f"🎯 PICKS DEL DÍA — {fecha}"]
+    lang = _lang_for_update(update)
+    sections = [f"🎯 TODAY\'S PICKS — {fecha}" if lang == "en" else f"🎯 PICKS DEL DÍA — {fecha}"]
     total = 0
 
     # MLB official picks are the canonical picks shown to the channel.
@@ -9189,24 +9355,24 @@ async def daily_picks_hub(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total += len(mlb_rows)
         sections.append("\n⚾ MLB\n" + _format_official_picks_text(mlb_rows, title="").strip())
     else:
-        sections.append("\n⚾ MLB\nℹ️ Sin picks publicados.")
+        sections.append("\n⚾ MLB\nℹ️ No picks published." if lang == "en" else "\n⚾ MLB\nℹ️ Sin picks publicados.")
 
     soccer_rows = await asyncio.to_thread(_soccer_visible_rows, user_id, fecha, None) if user_id is not None else []
     if soccer_rows:
         total += len(soccer_rows)
         sections.append("\n⚽ FÚTBOL\n" + _format_soccer_rows(soccer_rows, title="").strip())
     else:
-        sections.append("\n⚽ FÚTBOL\nℹ️ Sin picks publicados o sin acceso para tu plan.")
+        sections.append("\n⚽ SOCCER\nℹ️ No picks published or unavailable for your plan." if lang == "en" else "\n⚽ FÚTBOL\nℹ️ Sin picks publicados o sin acceso para tu plan.")
 
     nba_rows = await asyncio.to_thread(_nba_visible_rows, user_id, fecha, None) if user_id is not None else []
     if nba_rows:
         total += len(nba_rows)
         sections.append("\n🏀 NBA\n" + _format_nba_rows(nba_rows, title="").strip())
     else:
-        sections.append("\n🏀 NBA\nℹ️ Sin picks publicados o sin acceso para tu plan.")
+        sections.append("\n🏀 NBA\nℹ️ No picks published or unavailable for your plan." if lang == "en" else "\n🏀 NBA\nℹ️ Sin picks publicados o sin acceso para tu plan.")
 
     if total == 0:
-        sections.append("\n📭 Aún no hay picks disponibles para hoy.")
+        sections.append("\n📭 No picks are available for today yet." if lang == "en" else "\n📭 Aún no hay picks disponibles para hoy.")
 
     await update.effective_message.reply_text(
         "\n".join(sections),
@@ -9235,7 +9401,10 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "⬅️ Menú principal": menu,
         "⚾ MLB": mlb_menu,
         "⚽ Fútbol": soccer_menu,
+        "⚽ Soccer": soccer_menu,
         "🏀 NBA": nba_menu,
+        "🌐 Idioma / Language": language_menu,
+        "🌐 Language / Idioma": language_menu,
     }
     priority_handler = priority_routes.get(text)
     if priority_handler is not None:
@@ -9305,6 +9474,15 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "📋 Historial": history,
         "📘 Manual de usuario": manual_menu,
         "📗 Guía general": manual_general,
+        "📗 General Guide": manual_general,
+        "⚾ MLB Guide": manual_mlb,
+        "⚽ Soccer Guide": manual_soccer,
+        "🏀 NBA Guide": manual_nba,
+        "📡 Live Picks Guide": manual_live,
+        "🔔 Alerts Guide": manual_alerts,
+        "👤 My Account Guide": manual_account,
+        "⭐ Subscription Guide": manual_subscription,
+        "🛡️ Admin Guide": manual_admin,
         "⚾ Manual MLB": manual_mlb,
         "⚽ Manual Fútbol": manual_soccer,
         "🏀 Manual NBA": manual_nba,
@@ -9317,6 +9495,13 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "👤 Mi cuenta": account_command,
         "⭐ Suscripción": subscription_command,
         "✅ Activar alertas": alerts_enable,
+        "✅ Enable Alerts": alerts_enable,
+        "⛔ Disable Alerts": alerts_disable,
+        "📋 Upcoming Alerts": alerts_upcoming,
+        "✅ Enable SMS": sms_enable,
+        "⛔ Disable SMS": sms_disable,
+        "📱 SMS Status": sms_status,
+        "⬅️ Alerts": alerts_menu,
         "⛔ Desactivar alertas": alerts_disable,
         "📋 Próximas alertas": alerts_upcoming,
         "📱 SMS": sms_menu,
@@ -9325,6 +9510,46 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "📱 Estado SMS": sms_status,
         "⬅️ Alertas": alerts_menu,
         "⬅️ Menú principal": menu,
+        "⬅️ Main Menu": menu,
+        "🎯 Today's Picks": daily_picks_hub,
+        "📡 Live Picks": live_pick_monitor,
+        "🔔 Alerts": alerts_menu,
+        "👤 My Account": account_command,
+        "📘 User Guide": manual_menu,
+        "⭐ Subscription": subscription_command,
+        "🧪 More Options": menu_more,
+        "⚾ MLB Games": mlb,
+        "🔴 MLB Live": mlb_live,
+        "🔥 MLB Picks": picks,
+        "📊 MLB Results": mlb_results,
+        "🧮 MLB Market": market,
+        "📐 MLB Lines": mlb_lines,
+        "📈 MLB Performance": performance,
+        "📋 MLB History": history,
+        "📋 MLB Lineups": mlb_lineups,
+        "🌦️ MLB Weather": mlb_weather,
+        "🏟️ MLB Ballpark Dimensions": mlb_dimensions,
+        "📈 MLB Last 10": mlb_last10,
+        "⚽ Soccer Games": soccer_games,
+        "🔴 Soccer Live": soccer_live,
+        "🔥 Soccer Picks": soccer_picks,
+        "📊 Soccer Results": soccer_results,
+        "🛡️ Soccer Survival": soccer_survival,
+        "⭐ Soccer Top Picks": soccer_top,
+        "🎯 Soccer Player Props": soccer_player_props,
+        "🏆 Soccer Leagues": soccer_leagues,
+        "📋 Soccer Lineups": soccer_lineups,
+        "🌦️ Soccer Weather": soccer_weather,
+        "📈 Soccer Last 10": soccer_last10,
+        "🏀 NBA Games": nba_games,
+        "🔴 NBA Live": nba_live,
+        "🔥 NBA Picks": nba_picks,
+        "📊 NBA Results": nba_results,
+        "🛡️ NBA Survival": nba_survival,
+        "⭐ NBA Top Picks": nba_top,
+        "🎯 NBA Player Props": nba_player_props,
+        "📋 NBA Lineups": nba_lineups,
+        "📈 NBA Last 10": nba_last10,
         "⚾ Juegos MLB": mlb,
         "🧪 Más opciones": menu_more,
         "🔎 Candidate Pool": pool,
@@ -9363,23 +9588,30 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    plan, row = await asyncio.to_thread(_best_active_plan, update.effective_user.id)
-    if plan == "NONE":
-        membership = "⚪ Aún no tienes suscripción. Pulsa ⭐ Suscripción para activar FREE por 30 días."
-    elif plan == "FREE":
-        membership = (
-            f"🆓 FREE activo — {_remaining_trial_text(row['trial_expires_at'])} restantes.\n"
-            "Después: ⭐ PREMIUM $10/mes | 🔥 PRO $20/mes"
-        )
-    elif plan == "EXPIRED":
-        membership = "🔴 Tu prueba FREE finalizó. Usa ⭐ Suscripción para continuar."
-    else:
-        membership = f"💎 Membresía activa: {plan}"
+    user = update.effective_user
+    # Ensure membership row exists, then use saved language. New users inherit Telegram EN/ES.
+    await asyncio.to_thread(_ensure_trial_user, user)
+    lang = _get_user_language(user.id, getattr(user, "language_code", None))
+    # If the row is still at default ES but Telegram is English and this is first contact,
+    # let the Telegram language initialize English automatically.
+    if getattr(user, "language_code", "").lower().startswith("en"):
+        row_lang = _get_user_language(user.id)
+        if row_lang == "es":
+            _set_user_language(user.id, "en")
+            lang = "en"
 
-    await update.message.reply_text(
-        _menu_text() + "\n\n" + membership,
-        reply_markup=_main_menu_keyboard_for(update.effective_user.id if update.effective_user else None),
-    )
+    plan, row = await asyncio.to_thread(_best_active_plan, user.id)
+    if lang == "en":
+        if plan == "NONE": membership = "⚪ No subscription yet. Tap ⭐ Subscription to activate the 30-day FREE trial."
+        elif plan == "FREE": membership = f"🆓 FREE active — {_remaining_trial_text(row['trial_expires_at'])} remaining.\nThen: ⭐ PREMIUM $10/month | 🔥 PRO $20/month"
+        elif plan == "EXPIRED": membership = "🔴 Your FREE trial ended. Use ⭐ Subscription to continue."
+        else: membership = f"💎 Active membership: {plan}"
+    else:
+        if plan == "NONE": membership = "⚪ Aún no tienes suscripción. Pulsa ⭐ Suscripción para activar FREE por 30 días."
+        elif plan == "FREE": membership = f"🆓 FREE activo — {_remaining_trial_text(row['trial_expires_at'])} restantes.\nDespués: ⭐ PREMIUM $10/mes | 🔥 PRO $20/mes"
+        elif plan == "EXPIRED": membership = "🔴 Tu prueba FREE finalizó. Usa ⭐ Suscripción para continuar."
+        else: membership = f"💎 Membresía activa: {plan}"
+    await update.message.reply_text(_menu_text(lang) + "\n\n" + membership, reply_markup=_main_menu_keyboard_for(user.id, lang))
 
 
 async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9535,7 +9767,7 @@ async def mlb_lines(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await update.effective_message.reply_text(
             "📐 LÍNEAS MLB\n\nNo hay picks oficiales cargados para hoy.",
-            reply_markup=MLB_MENU_KEYBOARD,
+            reply_markup=_mlb_menu_keyboard_for(_lang_for_update(update)),
         )
         return
 
@@ -9544,7 +9776,7 @@ async def mlb_lines(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(
             "📐 LÍNEAS MLB\n\nNo pude consultar las líneas actuales. "
             f"Detalle: {_ODDS_LAST_META.get('error') or status}",
-            reply_markup=MLB_MENU_KEYBOARD,
+            reply_markup=_mlb_menu_keyboard_for(_lang_for_update(update)),
         )
         return
 
@@ -9952,6 +10184,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu))
+    app.add_handler(CommandHandler("language", language_menu))
     app.add_handler(CommandHandler("subscribe", subscription_command))
     app.add_handler(CommandHandler("account", account_command))
     app.add_handler(CommandHandler("adminstats", adminstats_command))
@@ -9962,6 +10195,7 @@ def main():
     app.add_handler(CommandHandler("official", admin_official_picks_panel))
     app.add_handler(CommandHandler("mlbimport", admin_mlb_master_start))
     app.add_handler(CallbackQueryHandler(membership_callback, pattern=r"^tp_"))
+    app.add_handler(CallbackQueryHandler(language_callback, pattern=r"^lang\|"))
     app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
     app.add_handler(CommandHandler("mlb", mlb))

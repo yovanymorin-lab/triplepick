@@ -1,6 +1,7 @@
-from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
+from telegram import Update, Message, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
 from telegram.ext import (ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, PreCheckoutQueryHandler, filters)
 import asyncio
+from contextvars import ContextVar
 import math
 import os
 import re
@@ -88,7 +89,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.5.28"
+BOT_VERSION = "3.5.29"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -197,6 +198,140 @@ def _lang_for_update(update):
 def _ui(lang, key):
     lang = lang if lang in LANG_CHOICES else LANG_DEFAULT
     return _UI[lang].get(key, _UI[LANG_DEFAULT].get(key, key))
+
+
+# v3.5.29 — Full content localization for visual-menu interactions.
+# Existing analytical engines keep their native data output, while this layer
+# translates the user-facing Spanish labels/messages when the saved language is English.
+_OUTPUT_LANG = ContextVar("triple_pick_output_lang", default="es")
+
+_EN_REPLACEMENTS = [
+    ("MANUAL DE USUARIO", "USER GUIDE"),
+    ("GUÍA GENERAL", "GENERAL GUIDE"),
+    ("MANUAL FÚTBOL", "SOCCER GUIDE"),
+    ("MANUAL — PICKS EN VIVO", "GUIDE — LIVE PICKS"),
+    ("MANUAL — ALERTAS", "GUIDE — ALERTS"),
+    ("MANUAL — MI CUENTA", "GUIDE — MY ACCOUNT"),
+    ("MANUAL — SUSCRIPCIÓN", "GUIDE — SUBSCRIPTION"),
+    ("GUÍA ADMIN", "ADMIN GUIDE"),
+    ("PICKS DEL DÍA", "TODAY'S PICKS"),
+    ("PICKS DE HOY", "TODAY'S PICKS"),
+    ("JUEGOS DE HOY", "TODAY'S GAMES"),
+    ("JUEGOS MLB", "MLB GAMES"),
+    ("JUEGOS NBA", "NBA GAMES"),
+    ("PARTIDOS FÚTBOL", "SOCCER GAMES"),
+    ("EN VIVO FÚTBOL", "SOCCER LIVE"),
+    ("EN VIVO MLB", "MLB LIVE"),
+    ("EN VIVO NBA", "NBA LIVE"),
+    ("RESULTADOS FÚTBOL", "SOCCER RESULTS"),
+    ("RESULTADOS MLB", "MLB RESULTS"),
+    ("RESULTADOS NBA", "NBA RESULTS"),
+    ("ALINEACIONES FÚTBOL", "SOCCER LINEUPS"),
+    ("ALINEACIONES MLB", "MLB LINEUPS"),
+    ("ALINEACIONES NBA", "NBA LINEUPS"),
+    ("CLIMA FÚTBOL", "SOCCER WEATHER"),
+    ("CLIMA MLB", "MLB WEATHER"),
+    ("DIMENSIONES MLB", "MLB BALLPARK DIMENSIONS"),
+    ("ÚLTIMOS 10 FÚTBOL", "SOCCER LAST 10"),
+    ("ÚLTIMOS 10 MLB", "MLB LAST 10"),
+    ("ÚLTIMOS 10 NBA", "NBA LAST 10"),
+    ("RENDIMIENTO MLB", "MLB PERFORMANCE"),
+    ("PANEL DE RENDIMIENTO", "PERFORMANCE DASHBOARD"),
+    ("POR DEPORTE", "BY SPORT"),
+    ("POR TIPO DE MERCADO", "BY MARKET"),
+    ("ESTADO MERCADO", "MARKET STATUS"),
+    ("MERCADO MLB", "MLB MARKET"),
+    ("LÍNEAS MLB", "MLB LINES"),
+    ("HISTORIAL MLB", "MLB HISTORY"),
+    ("PICKS EN VIVO", "LIVE PICKS"),
+    ("MI CUENTA", "MY ACCOUNT"),
+    ("SUSCRIPCIÓN", "SUBSCRIPTION"),
+    ("PRÓXIMAS ALERTAS", "UPCOMING ALERTS"),
+    ("ALERTAS TRIPLE PICK", "TRIPLE PICK ALERTS"),
+    ("ALERTAS", "ALERTS"),
+    ("FÚTBOL", "SOCCER"),
+    ("Selecciona una opción.", "Choose an option."),
+    ("Selecciona una herramienta. No necesitas escribir comandos.", "Choose a tool. You do not need to type commands."),
+    ("Aún no hay resultados liquidados.", "No settled results yet."),
+    ("Aún no hay picks disponibles para hoy.", "No picks are available for today yet."),
+    ("Aún no hay picks disponibles para hoy", "No picks are available for today yet"),
+    ("Sin picks publicados.", "No picks published."),
+    ("Sin picks publicados o sin acceso para tu plan.", "No picks published or unavailable for your plan."),
+    ("No hay juegos de MLB programados para hoy.", "There are no MLB games scheduled for today."),
+    ("No pude conectar con la API de MLB.", "I could not connect to the MLB API."),
+    ("No hay ligas con picks publicados hoy.", "There are no leagues with published picks today."),
+    ("Por confirmar", "TBD"),
+    ("Pendiente", "Pending"),
+    ("PENDIENTE", "PENDING"),
+    ("GANANDO", "WINNING"),
+    ("PERDIENDO", "LOSING"),
+    ("EN RIESGO", "AT RISK"),
+    ("FINALIZADO", "FINAL"),
+    ("Marcador", "Score"),
+    ("MARCADOR", "SCORE"),
+    ("Partido", "Game"),
+    ("PARTIDO", "GAME"),
+    ("Hora del juego", "Game time"),
+    ("HORA DEL JUEGO", "GAME TIME"),
+    ("Lanzadores", "Pitchers"),
+    ("LANZADORES", "PITCHERS"),
+    ("Visitante", "Away"),
+    ("VISITANTE", "AWAY"),
+    ("Local", "Home"),
+    ("LOCAL", "HOME"),
+    ("RÉCORD", "RECORD"),
+    ("Récord", "Record"),
+    ("Victorias", "Wins"),
+    ("victorias", "wins"),
+    ("Derrotas", "Losses"),
+    ("derrotas", "losses"),
+    ("Empates", "Draws"),
+    ("empates", "draws"),
+    ("Racha", "Streak"),
+    ("racha", "streak"),
+    ("Techo", "Roof"),
+    ("techo", "roof"),
+    ("Superficie", "Surface"),
+    ("superficie", "surface"),
+    ("Abierto", "Open"),
+    ("Cerrado", "Closed"),
+    ("ACTIVADAS", "ENABLED"),
+    ("DESACTIVADAS", "DISABLED"),
+    ("ACTIVO", "ACTIVE"),
+    ("NO ACTIVADO", "NOT ACTIVATED"),
+    ("PRUEBA FINALIZADA", "TRIAL ENDED"),
+    ("Tiempo restante", "Time remaining"),
+    ("Finaliza", "Ends"),
+    ("Válido hasta", "Valid until"),
+    ("Aviso", "Notice"),
+    ("min antes", "min before"),
+    ("Juega responsablemente", "Play responsibly"),
+    ("JUEGA RESPONSABLEMENTE", "PLAY RESPONSIBLY"),
+]
+
+
+def _englishize_ui_text(text):
+    if not isinstance(text, str) or not text:
+        return text
+    result = text
+    for es, en in _EN_REPLACEMENTS:
+        result = result.replace(es, en)
+    return result
+
+
+_original_message_reply_text = Message.reply_text
+
+
+async def _localized_message_reply_text(self, text, *args, **kwargs):
+    """Translate legacy Spanish handler output for English visual-menu sessions."""
+    if _OUTPUT_LANG.get() == "en":
+        text = _englishize_ui_text(text)
+    return await _original_message_reply_text(self, text, *args, **kwargs)
+
+
+# Centralized compatibility layer: this lets legacy handlers become bilingual
+# without duplicating the analytical logic or the database layer.
+Message.reply_text = _localized_message_reply_text
 
 
 # Triple Pick v2.9.7 — Telegram pregame alerts + optional Twilio SMS channel.
@@ -3348,6 +3483,7 @@ def _sms_menu_keyboard_for(lang="es"):
 
 
 async def alerts_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _OUTPUT_LANG.set(_lang_for_update(update))
     chat_id = update.effective_chat.id
     lang = _lang_for_update(update)
     sub = await asyncio.to_thread(_get_alert_subscription, chat_id)
@@ -3792,6 +3928,7 @@ def _perf_line(label, bucket):
 
 
 async def performance_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _OUTPUT_LANG.set(_lang_for_update(update))
     lang = _lang_for_update(update)
     try:
         sports, markets, confidence = await asyncio.to_thread(multi_sport_performance_snapshot)
@@ -5614,6 +5751,7 @@ async def _send_plans(chat_id, context):
 
 
 async def subscription_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _OUTPUT_LANG.set(_lang_for_update(update))
     await _send_plans(update.effective_chat.id, context)
 
 
@@ -5667,6 +5805,7 @@ async def _build_account_panel_text(user_id, chat_id):
 
 
 async def account_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _OUTPUT_LANG.set(_lang_for_update(update))
     user = update.effective_user
     chat = update.effective_chat
     text = await _build_account_panel_text(user.id, chat.id)
@@ -5969,6 +6108,7 @@ def _soccer_menu_keyboard_for(lang="es"):
 
 
 async def mlb_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _OUTPUT_LANG.set(_lang_for_update(update))
     lang = _lang_for_update(update)
     await update.effective_message.reply_text(
         "⚾ TRIPLE PICK — MLB\n\nChoose an option." if lang == "en" else "⚾ TRIPLE PICK — MLB\n\nSelecciona una opción.",
@@ -5977,6 +6117,7 @@ async def mlb_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def soccer_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _OUTPUT_LANG.set(_lang_for_update(update))
     lang = _lang_for_update(update)
     text = ("⚽ TRIPLE PICK — SOCCER\n\nPublished picks come from the final approved soccer selection." if lang == "en" else "⚽ TRIPLE PICK — FÚTBOL\n\nLos picks publicados aquí provienen de la selección final aprobada para fútbol.")
     await update.effective_message.reply_text(text, reply_markup=_soccer_menu_keyboard_for(lang))
@@ -8561,6 +8702,7 @@ def _live_pick_monitor_markup():
 
 
 async def live_pick_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _OUTPUT_LANG.set(_lang_for_update(update))
     """Always answer the live-picks button, even if one live feed is unavailable."""
     if not await _premium_gate(update, "FREE"):
         return
@@ -9146,6 +9288,7 @@ def _nba_menu_keyboard_for(lang="es"):
 
 
 async def nba_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _OUTPUT_LANG.set(_lang_for_update(update))
     lang = _lang_for_update(update)
     await update.effective_message.reply_text(
         "🏀 TRIPLE PICK — NBA\n\nChoose an option." if lang == "en" else "🏀 TRIPLE PICK — NBA\n\nSelecciona una opción.",
@@ -9534,6 +9677,7 @@ async def language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _OUTPUT_LANG.set(_lang_for_update(update))
     lang = _lang_for_update(update)
     await update.message.reply_text(_menu_text(lang), reply_markup=_main_menu_keyboard_for(update.effective_user.id if update.effective_user else None, lang))
 
@@ -9554,6 +9698,7 @@ def _manual_keyboard_for(user_id=None, lang=None):
 
 
 async def manual_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _OUTPUT_LANG.set(_lang_for_update(update))
     user_id = update.effective_user.id if update.effective_user else None
     lang = _lang_for_update(update)
     if lang == "en":
@@ -9577,170 +9722,258 @@ async def manual_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def manual_general(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else None
-    await update.effective_message.reply_text(
-        "📗 GUÍA GENERAL\n\n"
-        "1️⃣ Consulta 🎯 Picks del día para ver el resumen de MLB, Fútbol y NBA.\n"
-        "2️⃣ Entra al deporte correspondiente para ver funciones específicas.\n"
-        "3️⃣ Activa 🔔 Alertas si deseas avisos antes de los partidos.\n"
-        "4️⃣ Durante los juegos usa 📡 Picks en vivo para seguir marcador, estado y progreso.\n"
-        "5️⃣ Consulta 📊 Resultados después de que los picks sean liquidados.\n\n"
-        "El bot está diseñado para utilizarse con botones; no necesitas memorizar comandos.",
-        reply_markup=_manual_keyboard_for(user_id),
-    )
+    lang = _lang_for_update(update)
+    if lang == "en":
+        text = (
+            "📗 GENERAL GUIDE\n\n"
+            "1️⃣ Open 🎯 Today's Picks for the MLB, Soccer and NBA summary.\n"
+            "2️⃣ Open the sport you want for its specific tools.\n"
+            "3️⃣ Enable 🔔 Alerts if you want notifications before games.\n"
+            "4️⃣ During games, use 📡 Live Picks to follow score, status and progress.\n"
+            "5️⃣ Open 📊 Results after picks have been settled.\n\n"
+            "The bot is designed to be used with buttons; you do not need to memorize commands."
+        )
+    else:
+        text = (
+            "📗 GUÍA GENERAL\n\n"
+            "1️⃣ Consulta 🎯 Picks del día para ver el resumen de MLB, Fútbol y NBA.\n"
+            "2️⃣ Entra al deporte correspondiente para ver funciones específicas.\n"
+            "3️⃣ Activa 🔔 Alertas si deseas avisos antes de los partidos.\n"
+            "4️⃣ Durante los juegos usa 📡 Picks en vivo para seguir marcador, estado y progreso.\n"
+            "5️⃣ Consulta 📊 Resultados después de que los picks sean liquidados.\n\n"
+            "El bot está diseñado para utilizarse con botones; no necesitas memorizar comandos."
+        )
+    await update.effective_message.reply_text(text, reply_markup=_manual_keyboard_for(user_id, lang))
 
 
 async def manual_mlb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else None
-    await update.effective_message.reply_text(
-        "⚾ MANUAL MLB\n\n"
-        "⚾ Juegos MLB — cartelera y horarios del día.\n"
-        "🔴 En vivo MLB — marcadores MLB en curso.\n"
-        "🔥 Picks MLB — picks oficiales publicados.\n"
-        "📊 Resultados MLB — picks ya liquidados.\n"
-        "🧮 Mercado MLB — comparación mercado/modelo.\n"
-        "📈 Rendimiento MLB — W-L, hit rate, unidades y ROI cuando aplica.\n"
-        "📋 Historial MLB — registros recientes del tracking.\n"
-        "📋 Alineaciones MLB — titulares de los juegos donde hay picks publicados.\n"
-        "🌦️ Clima MLB — pronóstico a la hora del juego, techo e impacto climático de nuestros picks.\n"
-        "🏟️ Dimensiones MLB — LF/LCF/CF/RCF/RF, superficie y techo del parque de nuestros picks.\n"
-        "📈 Últimos 10 MLB — récord, porcentaje de victorias, secuencia y racha reciente.\n"
-        "🧪 Más opciones — Candidate Pool, Value Board y auditorías avanzadas.\n"
-        "📡 Picks en vivo — seguimiento de los picks publicados durante el juego.",
-        reply_markup=_manual_keyboard_for(user_id),
-    )
+    lang = _lang_for_update(update)
+    if lang == "en":
+        text = (
+            "⚾ MLB GUIDE\n\n"
+            "⚾ MLB Games — today's schedule and start times.\n"
+            "🔴 MLB Live — live MLB scores.\n"
+            "🔥 MLB Picks — published official picks.\n"
+            "📊 MLB Results — settled picks.\n"
+            "🧮 MLB Market — market vs. model comparison.\n"
+            "📈 MLB Performance — W-L, hit rate, units and ROI when available.\n"
+            "📋 MLB History — recent tracking records.\n"
+            "📋 MLB Lineups — starters for games with published picks.\n"
+            "🌦️ MLB Weather — game-time forecast, roof and weather impact for our picks.\n"
+            "🏟️ MLB Ballpark Dimensions — LF/LCF/CF/RCF/RF, surface and roof information.\n"
+            "📈 MLB Last 10 — record, win rate, sequence and current streak.\n"
+            "🧪 More Options — Candidate Pool, Value Board and advanced audits.\n"
+            "📡 Live Picks — track published picks while the game is being played."
+        )
+    else:
+        text = (
+            "⚾ MANUAL MLB\n\n"
+            "⚾ Juegos MLB — cartelera y horarios del día.\n"
+            "🔴 En vivo MLB — marcadores MLB en curso.\n"
+            "🔥 Picks MLB — picks oficiales publicados.\n"
+            "📊 Resultados MLB — picks ya liquidados.\n"
+            "🧮 Mercado MLB — comparación mercado/modelo.\n"
+            "📈 Rendimiento MLB — W-L, hit rate, unidades y ROI cuando aplica.\n"
+            "📋 Historial MLB — registros recientes del tracking.\n"
+            "📋 Alineaciones MLB — titulares de los juegos donde hay picks publicados.\n"
+            "🌦️ Clima MLB — pronóstico a la hora del juego, techo e impacto climático de nuestros picks.\n"
+            "🏟️ Dimensiones MLB — LF/LCF/CF/RCF/RF, superficie y techo del parque de nuestros picks.\n"
+            "📈 Últimos 10 MLB — récord, porcentaje de victorias, secuencia y racha reciente.\n"
+            "🧪 Más opciones — Candidate Pool, Value Board y auditorías avanzadas.\n"
+            "📡 Picks en vivo — seguimiento de los picks publicados durante el juego."
+        )
+    await update.effective_message.reply_text(text, reply_markup=_manual_keyboard_for(user_id, lang))
 
 
 async def manual_soccer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else None
-    await update.effective_message.reply_text(
-        "⚽ MANUAL FÚTBOL\n\n"
-        "⚽ Partidos Fútbol — partidos programados y horarios.\n"
-        "🔴 En vivo Fútbol — marcadores y estado de los partidos.\n"
-        "🔥 Picks Fútbol — todos los picks visibles para tu plan.\n"
-        "📊 Resultados Fútbol — picks ya liquidados.\n"
-        "🛡️ Survival Fútbol — selecciones del producto Survival.\n"
-        "⭐ Top Picks Fútbol — selecciones principales publicadas.\n"
-        "🎯 Player Props Fútbol — props individuales de jugadores.\n"
-        "🏆 Ligas Fútbol — ligas con picks disponibles.\n"
-        "📋 Alineaciones Fútbol — onces titulares de los partidos con picks publicados.\n"
-        "🌦️ Clima Fútbol — pronóstico a la hora del partido e impacto climático de nuestros picks.\n"
-        "📈 Últimos 10 Fútbol — W-D-L, porcentaje de victorias, secuencia y racha reciente.\n"
-        "📡 Picks en vivo — seguimiento de picks durante los partidos.",
-        reply_markup=_manual_keyboard_for(user_id),
-    )
+    lang = _lang_for_update(update)
+    if lang == "en":
+        text = (
+            "⚽ SOCCER GUIDE\n\n"
+            "⚽ Soccer Games — scheduled matches and kickoff times.\n"
+            "🔴 Soccer Live — live scores and match status.\n"
+            "🔥 Soccer Picks — all picks visible for your plan.\n"
+            "📊 Soccer Results — settled picks.\n"
+            "🛡️ Soccer Survival — Survival product selections.\n"
+            "⭐ Soccer Top Picks — primary published selections.\n"
+            "🎯 Soccer Player Props — individual player props.\n"
+            "🏆 Soccer Leagues — leagues with available picks.\n"
+            "📋 Soccer Lineups — starting XIs for matches with published picks.\n"
+            "🌦️ Soccer Weather — match-time forecast and weather impact.\n"
+            "📈 Soccer Last 10 — W-D-L, win rate, sequence and current streak.\n"
+            "📡 Live Picks — follow published picks during matches."
+        )
+    else:
+        text = (
+            "⚽ MANUAL FÚTBOL\n\n"
+            "⚽ Partidos Fútbol — partidos programados y horarios.\n"
+            "🔴 En vivo Fútbol — marcadores y estado de los partidos.\n"
+            "🔥 Picks Fútbol — todos los picks visibles para tu plan.\n"
+            "📊 Resultados Fútbol — picks ya liquidados.\n"
+            "🛡️ Survival Fútbol — selecciones del producto Survival.\n"
+            "⭐ Top Picks Fútbol — selecciones principales publicadas.\n"
+            "🎯 Player Props Fútbol — props individuales de jugadores.\n"
+            "🏆 Ligas Fútbol — ligas con picks disponibles.\n"
+            "📋 Alineaciones Fútbol — onces titulares de los partidos con picks publicados.\n"
+            "🌦️ Clima Fútbol — pronóstico a la hora del partido e impacto climático de nuestros picks.\n"
+            "📈 Últimos 10 Fútbol — W-D-L, porcentaje de victorias, secuencia y racha reciente.\n"
+            "📡 Picks en vivo — seguimiento de picks durante los partidos."
+        )
+    await update.effective_message.reply_text(text, reply_markup=_manual_keyboard_for(user_id, lang))
 
 
 async def manual_nba(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else None
-    await update.effective_message.reply_text(
-        "🏀 MANUAL NBA\n\n"
-        "🏀 Juegos NBA — cartelera y horarios.\n"
-        "🔴 En vivo NBA — marcadores en curso.\n"
-        "🔥 Picks NBA — picks visibles para tu plan.\n"
-        "📊 Resultados NBA — picks ya liquidados.\n"
-        "🛡️ Survival NBA — selecciones Survival.\n"
-        "⭐ Top Picks NBA — picks principales.\n"
-        "🎯 Player Props NBA — props de jugadores.\n"
-        "📋 Alineaciones NBA — quintetos titulares de los partidos con picks publicados.\n"
-        "📈 Últimos 10 NBA — récord, porcentaje de victorias, secuencia y racha reciente.\n"
-        "📡 Picks en vivo — seguimiento de los picks publicados.",
-        reply_markup=_manual_keyboard_for(user_id),
-    )
+    lang = _lang_for_update(update)
+    if lang == "en":
+        text = (
+            "🏀 NBA GUIDE\n\n"
+            "🏀 NBA Games — schedule and start times.\n"
+            "🔴 NBA Live — live scores.\n"
+            "🔥 NBA Picks — picks visible for your plan.\n"
+            "📊 NBA Results — settled picks.\n"
+            "🛡️ NBA Survival — Survival selections.\n"
+            "⭐ NBA Top Picks — primary picks.\n"
+            "🎯 NBA Player Props — player props.\n"
+            "📋 NBA Lineups — starting lineups for games with published picks.\n"
+            "📈 NBA Last 10 — record, win rate, sequence and current streak.\n"
+            "📡 Live Picks — track published picks."
+        )
+    else:
+        text = (
+            "🏀 MANUAL NBA\n\n"
+            "🏀 Juegos NBA — cartelera y horarios.\n"
+            "🔴 En vivo NBA — marcadores en curso.\n"
+            "🔥 Picks NBA — picks visibles para tu plan.\n"
+            "📊 Resultados NBA — picks ya liquidados.\n"
+            "🛡️ Survival NBA — selecciones Survival.\n"
+            "⭐ Top Picks NBA — picks principales.\n"
+            "🎯 Player Props NBA — props de jugadores.\n"
+            "📋 Alineaciones NBA — quintetos titulares de los partidos con picks publicados.\n"
+            "📈 Últimos 10 NBA — récord, porcentaje de victorias, secuencia y racha reciente.\n"
+            "📡 Picks en vivo — seguimiento de los picks publicados."
+        )
+    await update.effective_message.reply_text(text, reply_markup=_manual_keyboard_for(user_id, lang))
 
 
 async def manual_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else None
-    await update.effective_message.reply_text(
-        "📡 MANUAL — PICKS EN VIVO\n\n"
-        "El monitor muestra:\n"
-        "🏟️ Partido\n"
-        "🎯 Pick publicado\n"
-        "📊 Marcador actual\n"
-        "⏱️ Momento del juego\n"
-        "📈 Estado del pick\n"
-        "📐 Progreso del mercado cuando puede calcularse\n\n"
-        "Estados habituales:\n"
-        "⏳ Pendiente — aún no comenzó.\n"
-        "✅ GANANDO — el pick cubre actualmente.\n"
-        "❌ PERDIENDO — no cubre actualmente.\n"
-        "⚠️ EN RIESGO — sigue abierto o cercano a la línea.\n"
-        "🏁 FINAL — resultado definitivo.\n\n"
-        "🔄 Actualizar todos vuelve a consultar todos los picks en vivo.",
-        reply_markup=_manual_keyboard_for(user_id),
-    )
+    lang = _lang_for_update(update)
+    if lang == "en":
+        text = (
+            "📡 GUIDE — LIVE PICKS\n\n"
+            "The monitor shows:\n🏟️ Game\n🎯 Published pick\n📊 Current score\n⏱️ Game situation\n📈 Pick status\n📐 Market progress when calculable\n\n"
+            "Common states:\n⏳ Pending — game has not started.\n✅ WINNING — the pick is currently covering.\n"
+            "❌ LOSING — the pick is currently not covering.\n⚠️ AT RISK — still open or close to the line.\n🏁 FINAL — final result.\n\n"
+            "🔄 Refresh All checks every live pick again."
+        )
+    else:
+        text = (
+            "📡 MANUAL — PICKS EN VIVO\n\nEl monitor muestra:\n🏟️ Partido\n🎯 Pick publicado\n📊 Marcador actual\n"
+            "⏱️ Momento del juego\n📈 Estado del pick\n📐 Progreso del mercado cuando puede calcularse\n\n"
+            "Estados habituales:\n⏳ Pendiente — aún no comenzó.\n✅ GANANDO — el pick cubre actualmente.\n"
+            "❌ PERDIENDO — no cubre actualmente.\n⚠️ EN RIESGO — sigue abierto o cercano a la línea.\n🏁 FINAL — resultado definitivo.\n\n"
+            "🔄 Actualizar todos vuelve a consultar todos los picks en vivo."
+        )
+    await update.effective_message.reply_text(text, reply_markup=_manual_keyboard_for(user_id, lang))
 
 
 async def manual_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else None
-    await update.effective_message.reply_text(
-        "🔔 MANUAL — ALERTAS\n\n"
-        "✅ Activar alertas — activa avisos pregame.\n"
-        "⛔ Desactivar alertas — detiene esos avisos.\n"
-        "📋 Próximas alertas — muestra avisos pendientes o enviados.\n"
-        "📱 SMS — abre la configuración opcional de mensajes de texto.\n\n"
-        f"El aviso pregame está configurado aproximadamente {ALERT_LEAD_MINUTES} minutos antes del juego.\n"
-        "Las alertas en vivo son independientes: se envían cuando cambia el estado de un pick y están habilitadas.",
-        reply_markup=_manual_keyboard_for(user_id),
-    )
+    lang = _lang_for_update(update)
+    if lang == "en":
+        text = (
+            "🔔 GUIDE — ALERTS\n\n✅ Enable Alerts — enables pregame notices.\n⛔ Disable Alerts — stops those notices.\n"
+            "📋 Upcoming Alerts — shows pending or previously sent alerts.\n📱 SMS — opens optional text-message settings.\n\n"
+            f"Pregame notice is configured for approximately {ALERT_LEAD_MINUTES} minutes before the game.\n"
+            "Live alerts are independent and are sent when a pick's state changes while live alerts are enabled."
+        )
+    else:
+        text = (
+            "🔔 MANUAL — ALERTAS\n\n✅ Activar alertas — activa avisos pregame.\n⛔ Desactivar alertas — detiene esos avisos.\n"
+            "📋 Próximas alertas — muestra avisos pendientes o enviados.\n📱 SMS — abre la configuración opcional de mensajes de texto.\n\n"
+            f"El aviso pregame está configurado aproximadamente {ALERT_LEAD_MINUTES} minutos antes del juego.\n"
+            "Las alertas en vivo son independientes: se envían cuando cambia el estado de un pick y están habilitadas."
+        )
+    await update.effective_message.reply_text(text, reply_markup=_manual_keyboard_for(user_id, lang))
 
 
 async def manual_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else None
-    await update.effective_message.reply_text(
-        "👤 MANUAL — MI CUENTA\n\n"
-        "👤 Mi cuenta muestra tu plan, estado de membresía, vigencia y configuración de alertas.\n\n"
-        "Si una función no está disponible, revisa primero esta sección para confirmar que tu plan sigue activo.",
-        reply_markup=_manual_keyboard_for(user_id),
+    lang = _lang_for_update(update)
+    text = (
+        "👤 GUIDE — MY ACCOUNT\n\n👤 My Account shows your plan, membership status, expiration and alert settings.\n\n"
+        "If a feature is unavailable, check this section first to confirm that your plan is still active."
+        if lang == "en" else
+        "👤 MANUAL — MI CUENTA\n\n👤 Mi cuenta muestra tu plan, estado de membresía, vigencia y configuración de alertas.\n\n"
+        "Si una función no está disponible, revisa primero esta sección para confirmar que tu plan sigue activo."
     )
+    await update.effective_message.reply_text(text, reply_markup=_manual_keyboard_for(user_id, lang))
 
 
 async def manual_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else None
-    await update.effective_message.reply_text(
-        "⭐ MANUAL — SUSCRIPCIÓN\n\n"
-        "FREE — prueba inicial configurada en el bot.\n"
+    lang = _lang_for_update(update)
+    text = (
+        "⭐ GUIDE — SUBSCRIPTION\n\nFREE — initial trial configured in the bot.\n"
+        "PREMIUM — access to enabled PREMIUM products and features.\n"
+        "PRO — includes enabled PRO products and features, such as Player Props when applicable.\n\n"
+        "Final access also depends on the level assigned to each published pick."
+        if lang == "en" else
+        "⭐ MANUAL — SUSCRIPCIÓN\n\nFREE — prueba inicial configurada en el bot.\n"
         "PREMIUM — acceso a productos y funciones PREMIUM habilitadas.\n"
         "PRO — incluye productos y funciones PRO habilitadas, como Player Props cuando corresponda.\n\n"
-        "El acceso final también depende del nivel asignado a cada pick publicado.",
-        reply_markup=_manual_keyboard_for(user_id),
+        "El acceso final también depende del nivel asignado a cada pick publicado."
     )
+    await update.effective_message.reply_text(text, reply_markup=_manual_keyboard_for(user_id, lang))
 
 
 async def manual_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    lang = _lang_for_update(update)
     if user is None or int(user.id) not in SUBSCRIPTION_ADMIN_IDS:
-        await update.effective_message.reply_text("⛔ Acceso exclusivo para administradores.")
+        await update.effective_message.reply_text("⛔ Administrator access only." if lang == "en" else "⛔ Acceso exclusivo para administradores.")
         return
-    await update.effective_message.reply_text(
-        "🛡️ GUÍA ADMIN\n\n"
-        "📊 Estadísticas — conteos generales.\n"
-        "👥 Usuarios — listado de miembros.\n"
-        "🎯 Picks oficiales — administración MLB.\n"
-        "⚽ Admin Fútbol — importar, revisar o borrar picks de fútbol.\n"
-        "🏀 Admin NBA — importar, revisar o borrar picks NBA.\n"
-        "⏳ Vencen pronto — membresías próximas a vencer.\n"
-        "💳 Suscripciones — membresías activas.\n"
-        "🧪 Probar alerta en vivo — simula una transición sin alterar picks reales.",
-        reply_markup=_manual_keyboard_for(user.id),
-    )
+    if lang == "en":
+        text = (
+            "🛡️ ADMIN GUIDE\n\n📊 Statistics — general counts.\n👥 Users — member list.\n🎯 Official Picks — MLB administration.\n"
+            "⚽ Soccer Admin — import, review or delete soccer picks.\n🏀 NBA Admin — import, review or delete NBA picks.\n"
+            "⏳ Expiring Soon — memberships nearing expiration.\n💳 Subscriptions — active memberships.\n"
+            "🧪 Test Live Alert — simulates a transition without changing real picks."
+        )
+    else:
+        text = (
+            "🛡️ GUÍA ADMIN\n\n📊 Estadísticas — conteos generales.\n👥 Usuarios — listado de miembros.\n🎯 Picks oficiales — administración MLB.\n"
+            "⚽ Admin Fútbol — importar, revisar o borrar picks de fútbol.\n🏀 Admin NBA — importar, revisar o borrar picks NBA.\n"
+            "⏳ Vencen pronto — membresías próximas a vencer.\n💳 Suscripciones — membresías activas.\n"
+            "🧪 Probar alerta en vivo — simula una transición sin alterar picks reales."
+        )
+    await update.effective_message.reply_text(text, reply_markup=_manual_keyboard_for(user.id, lang))
 
 
 async def menu_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🧪 HERRAMIENTAS AVANZADAS\n\n"
-        "Selecciona una herramienta. No necesitas escribir comandos.\n\n"
-        "🔎 Candidate Pool — auditoría completa del slate\n"
-        "🟣 Value Board — candidatos de valor\n"
-        "💵 Estado mercado — estado de cuotas/API\n"
-        "🧪 Diagnóstico odds — revisión de bookmakers\n"
-        "🧾 Liquidar picks — actualizar resultados\n"
-        "🎯 Calibración — predicted vs actual\n"
-        "🆔 Mi ID — identificador del chat",
-        reply_markup=MORE_MENU_KEYBOARD,
-    )
+    lang = _lang_for_update(update)
+    if lang == "en":
+        text = (
+            "🧪 ADVANCED TOOLS\n\nChoose a tool. You do not need to type commands.\n\n"
+            "🔎 Candidate Pool — full slate audit\n🟣 Value Board — value candidates\n"
+            "💵 Market Status — odds/API status\n🧪 Odds Diagnostics — bookmaker review\n"
+            "🧾 Settle Picks — update results\n🎯 Calibration — predicted vs actual\n🆔 My ID — chat identifier"
+        )
+    else:
+        text = (
+            "🧪 HERRAMIENTAS AVANZADAS\n\nSelecciona una herramienta. No necesitas escribir comandos.\n\n"
+            "🔎 Candidate Pool — auditoría completa del slate\n🟣 Value Board — candidatos de valor\n"
+            "💵 Estado mercado — estado de cuotas/API\n🧪 Diagnóstico odds — revisión de bookmakers\n"
+            "🧾 Liquidar picks — actualizar resultados\n🎯 Calibración — predicted vs actual\n🆔 Mi ID — identificador del chat"
+        )
+    await update.message.reply_text(text, reply_markup=MORE_MENU_KEYBOARD)
 
 
 async def daily_picks_hub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _OUTPUT_LANG.set(_lang_for_update(update))
     """Show today's published Triple Pick selections across MLB, Soccer and NBA."""
     user = update.effective_user
     user_id = user.id if user else None
@@ -9777,7 +10010,7 @@ async def daily_picks_hub(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.effective_message.reply_text(
         "\n".join(sections),
-        reply_markup=_main_menu_keyboard_for(user_id),
+        reply_markup=_main_menu_keyboard_for(user_id, lang),
     )
 
 
@@ -9788,6 +10021,7 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
     import session can never make the visual menu appear unresponsive.
     """
     text = (update.message.text or "").strip()
+    _OUTPUT_LANG.set(_lang_for_update(update))
 
     # High-priority navigation. These must always work even when an admin has a
     # stale awaiting_* flag in context.user_data.
@@ -10019,6 +10253,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _OUTPUT_LANG.set(_lang_for_update(update))
     """Triple Pick v2.9.1: market-aware selection plus immutable recommendation tracking."""
     if not await _premium_gate(update, "PREMIUM"):
         return
@@ -10163,6 +10398,7 @@ async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def mlb_lines(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _OUTPUT_LANG.set(_lang_for_update(update))
     """Audit current Hard Rock line/price for today's official MLB picks."""
     if not await _premium_gate(update, "FREE"):
         return
@@ -10268,6 +10504,7 @@ async def pool(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def market(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _OUTPUT_LANG.set(_lang_for_update(update))
     """Audit Hard Rock/consensus moneyline against the model for every game."""
     now = local_now()
     fecha = now.strftime("%Y-%m-%d")

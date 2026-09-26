@@ -88,7 +88,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.5.26"
+BOT_VERSION = "3.5.27"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -3654,6 +3654,198 @@ async def performance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg += "\n⚠️ No ajustar el modelo por muestras pequeñas; tracking busca calibración, no solo hit rate."
     await _reply_long(update.message, msg)
+
+
+# ---------------------------------------------------------------------------
+# v3.5.27 — MULTI-SPORT PERFORMANCE DASHBOARD
+# ---------------------------------------------------------------------------
+
+def _settled_unit_return(result, odds, risk=1.0):
+    """Net units for a settled pick risking ``risk`` units. None if no usable price."""
+    result = str(result or "").upper()
+    try:
+        risk = float(risk or 1.0)
+    except (TypeError, ValueError):
+        risk = 1.0
+    if result == "PUSH":
+        return 0.0
+    if result not in {"WIN", "LOSS"}:
+        return None
+    if result == "LOSS":
+        return -risk
+    try:
+        price = float(odds)
+    except (TypeError, ValueError):
+        return None
+    if price == 0:
+        return None
+    profit_per_unit = (100.0 / abs(price)) if price < 0 else (price / 100.0)
+    return risk * profit_per_unit
+
+
+def _infer_market_family_from_selection(selection, player=None):
+    """Conservative market label for manually imported Soccer/NBA picks."""
+    s = str(selection or "").upper()
+    if player or any(token in s for token in (" SOT", " SHOT", " POINT", " REBOUND", " ASSIST", " THREES", " 3PM", " RBI", " HIT ")):
+        return "PLAYER_PROP"
+    if any(token in s for token in ("OVER ", "UNDER ", " O ", " U ")):
+        return "TOTAL"
+    if any(token in s for token in ("SPREAD", "HANDICAP", " +", " -")) and "ML" not in s and "MONEYLINE" not in s:
+        return "SPREAD"
+    if "DRAW NO BET" in s or "DNB" in s:
+        return "DNB"
+    if "DOUBLE CHANCE" in s:
+        return "DOUBLE_CHANCE"
+    if "ML" in s or "MONEYLINE" in s or "TO WIN" in s:
+        return "MONEYLINE"
+    return "OTHER"
+
+
+def _performance_bucket_add(bucket, result, odds=None, units=None, risk=1.0):
+    result = str(result or "").upper()
+    bucket["n"] += 1
+    if result == "WIN":
+        bucket["wins"] += 1
+    elif result == "LOSS":
+        bucket["losses"] += 1
+    elif result == "PUSH":
+        bucket["pushes"] += 1
+    if units is None:
+        units = _settled_unit_return(result, odds, risk)
+    if units is not None:
+        bucket["units"] += float(units)
+        bucket["risked"] += float(risk or 1.0)
+        bucket["priced_n"] += 1
+
+
+def _new_perf_bucket():
+    return {"n": 0, "wins": 0, "losses": 0, "pushes": 0, "units": 0.0, "risked": 0.0, "priced_n": 0}
+
+
+def multi_sport_performance_snapshot():
+    """Aggregate official/settled performance by sport, market and confidence grade."""
+    init_tracking_db()
+    sports = {"MLB": _new_perf_bucket(), "SOCCER": _new_perf_bucket(), "NBA": _new_perf_bucket()}
+    markets = {}
+    confidence = {"A": _new_perf_bucket(), "B": _new_perf_bucket(), "C": _new_perf_bucket()}
+
+    with _tracking_connection() as conn:
+        mlb_rows = conn.execute(
+            """
+            SELECT result, odds, units_risked, units_won_lost, market_family,
+                   confidence, data_reliability, starter_reliability
+            FROM tracked_picks
+            WHERE official=1 AND result IN ('WIN','LOSS','PUSH')
+            """
+        ).fetchall()
+        soccer_rows = conn.execute(
+            """
+            SELECT result, odds, selection, player, product
+            FROM soccer_picks
+            WHERE result IN ('WIN','LOSS','PUSH')
+            """
+        ).fetchall()
+        nba_rows = conn.execute(
+            """
+            SELECT result, odds, selection, player, product
+            FROM nba_picks
+            WHERE result IN ('WIN','LOSS','PUSH')
+            """
+        ).fetchall()
+
+    for row in mlb_rows:
+        risk = float(row["units_risked"] or 1.0)
+        _performance_bucket_add(sports["MLB"], row["result"], row["odds"], row["units_won_lost"], risk)
+        family = str(row["market_family"] or "OTHER").upper()
+        key = f"MLB · {family}"
+        markets.setdefault(key, _new_perf_bucket())
+        _performance_bucket_add(markets[key], row["result"], row["odds"], row["units_won_lost"], risk)
+        grade = _confidence_letter(row["confidence"], row["data_reliability"], row["starter_reliability"])
+        grade = str(grade or "").upper()[:1]
+        if grade in confidence:
+            _performance_bucket_add(confidence[grade], row["result"], row["odds"], row["units_won_lost"], risk)
+
+    for sport_name, rows in (("SOCCER", soccer_rows), ("NBA", nba_rows)):
+        for row in rows:
+            _performance_bucket_add(sports[sport_name], row["result"], row["odds"], None, 1.0)
+            family = _infer_market_family_from_selection(row["selection"], row["player"])
+            key = f"{sport_name} · {family}"
+            markets.setdefault(key, _new_perf_bucket())
+            _performance_bucket_add(markets[key], row["result"], row["odds"], None, 1.0)
+
+    return sports, markets, confidence
+
+
+def _perf_line(label, bucket):
+    n = int(bucket.get("n", 0) or 0)
+    wins = int(bucket.get("wins", 0) or 0)
+    losses = int(bucket.get("losses", 0) or 0)
+    pushes = int(bucket.get("pushes", 0) or 0)
+    decided = wins + losses
+    hit = (wins / decided * 100.0) if decided else 0.0
+    risked = float(bucket.get("risked", 0.0) or 0.0)
+    units = float(bucket.get("units", 0.0) or 0.0)
+    roi = (units / risked * 100.0) if risked > 0 else None
+    roi_text = "N/D" if roi is None else f"{roi:+.1f}%"
+    push_text = f"-{pushes}P" if pushes else ""
+    return f"• {label}: {wins}-{losses}{push_text} | HR {hit:.1f}% | {units:+.2f}u | ROI {roi_text} | n={n}"
+
+
+async def performance_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = _lang_for_update(update)
+    try:
+        sports, markets, confidence = await asyncio.to_thread(multi_sport_performance_snapshot)
+    except Exception as exc:
+        await update.effective_message.reply_text(f"❌ Performance DB error: {exc}")
+        return
+
+    total_n = sum(int(v.get("n", 0) or 0) for v in sports.values())
+    if total_n == 0:
+        text = (
+            "📊 PERFORMANCE DASHBOARD\n\nNo settled picks yet." if lang == "en"
+            else "📊 PANEL DE RENDIMIENTO\n\nAún no hay picks liquidados."
+        )
+        await update.effective_message.reply_text(text, reply_markup=_main_menu_keyboard_for(update.effective_user.id if update.effective_user else None, lang))
+        return
+
+    if lang == "en":
+        lines = ["📊 PERFORMANCE DASHBOARD — v3.5.27", "", "BY SPORT"]
+        for name in ("MLB", "SOCCER", "NBA"):
+            if sports[name]["n"]:
+                lines.append(_perf_line(name, sports[name]))
+        lines += ["", "BY MARKET"]
+        for key, bucket in sorted(markets.items(), key=lambda kv: (-kv[1]["n"], kv[0])):
+            lines.append(_perf_line(key, bucket))
+        lines += ["", "MLB CONFIDENCE A/B/C"]
+        any_grade = False
+        for grade in ("A", "B", "C"):
+            if confidence[grade]["n"]:
+                any_grade = True
+                lines.append(_perf_line(f"Grade {grade}", confidence[grade]))
+        if not any_grade:
+            lines.append("• No settled MLB picks with A/B/C grade yet.")
+        lines += ["", "ℹ️ Soccer/NBA confidence grades are not fabricated; they will appear only when those modules store a real grade."]
+    else:
+        lines = ["📊 PANEL DE RENDIMIENTO — v3.5.27", "", "POR DEPORTE"]
+        for name in ("MLB", "SOCCER", "NBA"):
+            if sports[name]["n"]:
+                display = "FÚTBOL" if name == "SOCCER" else name
+                lines.append(_perf_line(display, sports[name]))
+        lines += ["", "POR TIPO DE MERCADO"]
+        for key, bucket in sorted(markets.items(), key=lambda kv: (-kv[1]["n"], kv[0])):
+            display = key.replace("SOCCER", "FÚTBOL")
+            lines.append(_perf_line(display, bucket))
+        lines += ["", "CONFIANZA MLB A/B/C"]
+        any_grade = False
+        for grade in ("A", "B", "C"):
+            if confidence[grade]["n"]:
+                any_grade = True
+                lines.append(_perf_line(f"Grado {grade}", confidence[grade]))
+        if not any_grade:
+            lines.append("• Aún no hay picks MLB liquidados con grado A/B/C.")
+        lines += ["", "ℹ️ En Fútbol/NBA no inventamos grados de confianza: aparecerán cuando esos módulos guarden un grado real."]
+
+    await _reply_long(update.effective_message, "\n".join(lines))
 
 
 async def calibration(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9151,6 +9343,7 @@ def _main_menu_keyboard_for(user_id=None, lang=None):
         ["⚾ MLB", soccer, "🏀 NBA"],
         [_ui(lang, "daily"), _ui(lang, "live")],
         [_ui(lang, "alerts"), _ui(lang, "account")],
+        ["📊 Performance" if lang == "en" else "📊 Rendimiento"],
         [_ui(lang, "manual"), _ui(lang, "subscription")],
         [_ui(lang, "language")],
     ]
@@ -9555,6 +9748,7 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "📊 Estado": trackstatus,
         "📈 Rendimiento MLB": performance,
         "📈 Rendimiento": performance,
+        "📊 Rendimiento": performance_all,
         "🧮 Mercado MLB": market,
         "📐 Líneas MLB": mlb_lines,
         "🧮 Mercado": market,
@@ -9617,6 +9811,7 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "🧮 MLB Market": market,
         "📐 MLB Lines": mlb_lines,
         "📈 MLB Performance": performance,
+        "📊 Performance": performance_all,
         "📋 MLB History": history,
         "📋 MLB Lineups": mlb_lineups,
         "🌦️ MLB Weather": mlb_weather,
@@ -10308,6 +10503,7 @@ def main():
     app.add_handler(CommandHandler("trackstatus", trackstatus))
     app.add_handler(CommandHandler("settle", settle))
     app.add_handler(CommandHandler("performance", performance))
+    app.add_handler(CommandHandler("performanceall", performance_all))
     app.add_handler(CommandHandler("calibration", calibration))
     app.add_handler(CommandHandler("history", history))
     app.add_handler(CommandHandler("myid", myid))

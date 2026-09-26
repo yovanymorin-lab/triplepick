@@ -88,7 +88,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.5.27"
+BOT_VERSION = "3.5.28"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -4537,6 +4537,120 @@ async def adminusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await update.effective_message.reply_text(header + body + footer)
 
+def _admin_dashboard_snapshot():
+    """Compact admin-only operational dashboard across users, picks, alerts and performance."""
+    init_tracking_db()
+    membership = _membership_admin_stats()
+    today = local_now().strftime("%Y-%m-%d")
+
+    with _tracking_connection() as conn:
+        alerts_on = int(conn.execute(
+            "SELECT COUNT(*) FROM alert_subscriptions WHERE enabled=1"
+        ).fetchone()[0])
+        sms_on = int(conn.execute(
+            "SELECT COUNT(*) FROM sms_subscriptions WHERE enabled=1"
+        ).fetchone()[0])
+
+        mlb_today = int(conn.execute(
+            "SELECT COUNT(*) FROM tracked_picks WHERE official=1 AND pick_date=?",
+            (today,),
+        ).fetchone()[0])
+        soccer_today = int(conn.execute(
+            "SELECT COUNT(*) FROM soccer_picks WHERE pick_date=?",
+            (today,),
+        ).fetchone()[0])
+        nba_today = int(conn.execute(
+            "SELECT COUNT(*) FROM nba_picks WHERE pick_date=?",
+            (today,),
+        ).fetchone()[0])
+
+        pending_mlb = int(conn.execute(
+            "SELECT COUNT(*) FROM tracked_picks WHERE official=1 AND result='PENDING'"
+        ).fetchone()[0])
+        pending_soccer = int(conn.execute(
+            "SELECT COUNT(*) FROM soccer_picks WHERE result='PENDING'"
+        ).fetchone()[0])
+        pending_nba = int(conn.execute(
+            "SELECT COUNT(*) FROM nba_picks WHERE result='PENDING'"
+        ).fetchone()[0])
+
+    sports, _markets, _confidence = multi_sport_performance_snapshot()
+    overall = _new_perf_bucket()
+    for bucket in sports.values():
+        overall["n"] += bucket.get("n", 0)
+        overall["wins"] += bucket.get("wins", 0)
+        overall["losses"] += bucket.get("losses", 0)
+        overall["pushes"] += bucket.get("pushes", 0)
+        overall["units"] += bucket.get("units", 0.0)
+        overall["risked"] += bucket.get("risked", 0.0)
+        overall["priced_n"] += bucket.get("priced_n", 0)
+
+    return {
+        **membership,
+        "today": today,
+        "alerts_on": alerts_on,
+        "sms_on": sms_on,
+        "mlb_today": mlb_today,
+        "soccer_today": soccer_today,
+        "nba_today": nba_today,
+        "pending_mlb": pending_mlb,
+        "pending_soccer": pending_soccer,
+        "pending_nba": pending_nba,
+        "overall": overall,
+        "sports": sports,
+    }
+
+
+async def admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Private administrator dashboard with users, subscriptions, picks, alerts and ROI."""
+    user = update.effective_user
+    if user is None or int(user.id) not in SUBSCRIPTION_ADMIN_IDS:
+        await update.effective_message.reply_text("⛔ Acceso exclusivo para administradores.")
+        return
+
+    try:
+        s = await asyncio.to_thread(_admin_dashboard_snapshot)
+    except Exception as exc:
+        await update.effective_message.reply_text(f"❌ Error cargando dashboard: {exc}")
+        return
+
+    overall = s["overall"]
+    wins = int(overall.get("wins", 0) or 0)
+    losses = int(overall.get("losses", 0) or 0)
+    pushes = int(overall.get("pushes", 0) or 0)
+    decided = wins + losses
+    hit = (wins / decided * 100.0) if decided else 0.0
+    units = float(overall.get("units", 0.0) or 0.0)
+    risked = float(overall.get("risked", 0.0) or 0.0)
+    roi = (units / risked * 100.0) if risked > 0 else None
+    roi_text = "N/D" if roi is None else f"{roi:+.1f}%"
+
+    text = (
+        f"🛡️ TRIPLE PICK — DASHBOARD ADMIN v{BOT_VERSION}\n"
+        f"📅 {s['today']}\n\n"
+        "👥 USUARIOS Y PLANES\n"
+        f"• Registrados: {s['total_users']}\n"
+        f"• FREE activos: {s['free_active']} | vencidos: {s['free_expired']}\n"
+        f"• PREMIUM: {s['premium_active']} | PRO: {s['pro_active']}\n"
+        f"• Pagados activos: {s['paid_active']}\n"
+        f"• Altas 24 h: {s['new_today']} | 7 días: {s['new_week']}\n\n"
+        "🎯 PICKS DE HOY\n"
+        f"• MLB: {s['mlb_today']} | Fútbol: {s['soccer_today']} | NBA: {s['nba_today']}\n"
+        f"• Pendientes de liquidar: MLB {s['pending_mlb']} · Fútbol {s['pending_soccer']} · NBA {s['pending_nba']}\n\n"
+        "📈 RENDIMIENTO ACUMULADO\n"
+        f"• W-L-P: {wins}-{losses}-{pushes}\n"
+        f"• Hit Rate: {hit:.1f}%\n"
+        f"• Unidades: {units:+.2f}u\n"
+        f"• ROI: {roi_text}\n\n"
+        "🔔 ALERTAS\n"
+        f"• Telegram activas: {s['alerts_on']}\n"
+        f"• SMS activos: {s['sms_on']}\n"
+        f"• Live Watch: {'ON' if LIVE_PICK_WATCH_ENABLED else 'OFF'}\n\n"
+        "Usa los botones del panel para entrar al detalle de usuarios, suscripciones, picks y rendimiento."
+    )
+    await update.effective_message.reply_text(text, reply_markup=ADMIN_MENU_KEYBOARD)
+
+
 async def adminstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Private membership counter for configured Triple Pick administrators."""
     user = update.effective_user
@@ -5344,10 +5458,11 @@ def _admin_identity(row):
 
 ADMIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
-        ["📊 Estadísticas", "👥 Usuarios"],
+        ["📊 Dashboard", "📊 Estadísticas"],
+        ["👥 Usuarios", "💳 Suscripciones"],
         ["🎯 Picks oficiales", "⚽ Admin Fútbol"],
         ["🏀 Admin NBA", "⏳ Vencen pronto"],
-        ["💳 Suscripciones", "🧪 Probar alerta en vivo"],
+        ["🧪 Probar alerta en vivo"],
         ["⬅️ Menú principal"],
     ],
     resize_keyboard=True,
@@ -5363,6 +5478,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.effective_message.reply_text(
         "🛡️ PANEL ADMIN — TRIPLE PICK\n\n"
+        "📊 Dashboard — usuarios, picks, rendimiento y alertas en una sola vista\n"
         "📊 Estadísticas — conteo general\n"
         "👥 Usuarios — listado de miembros\n"
         "🎯 Picks oficiales — lista maestra del canal y el bot\n"
@@ -9863,6 +9979,7 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "🤖 Usar picks del modelo": admin_official_use_model,
         "🗑️ Borrar picks oficiales": admin_official_clear,
         "⬅️ Panel Admin": admin_panel,
+        "📊 Dashboard": admin_dashboard,
         "📊 Estadísticas": adminstats_command,
         "👥 Usuarios": adminusers_command,
         "⏳ Vencen pronto": admin_expiring_command,
@@ -10474,6 +10591,7 @@ def main():
     app.add_handler(CommandHandler("language", language_menu))
     app.add_handler(CommandHandler("subscribe", subscription_command))
     app.add_handler(CommandHandler("account", account_command))
+    app.add_handler(CommandHandler("admindashboard", admin_dashboard))
     app.add_handler(CommandHandler("adminstats", adminstats_command))
     app.add_handler(CommandHandler("adminusers", adminusers_command))
     app.add_handler(CommandHandler("admin", admin_panel))

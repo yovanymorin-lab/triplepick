@@ -88,7 +88,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.5.25"
+BOT_VERSION = "3.5.26"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -8158,14 +8158,16 @@ def _pick_start_local(sport, row):
 
 
 def _live_pick_monitor_text(user_id):
-    """Render every published pick as a compact live-status card."""
+    """Render every published pick as a compact live-status card with decision status."""
+    lang = _get_user_language(user_id)
+    en = lang == "en"
     pick_date = local_now().strftime("%Y-%m-%d")
     groups = [
         ("⚾ MLB", _mlb_pick_monitor_rows(pick_date)),
         ("⚽ FÚTBOL", _soccer_pick_monitor_rows(user_id, pick_date)),
         ("🏀 NBA", _nba_pick_monitor_rows(user_id, pick_date)),
     ]
-    lines = ["📡 TRIPLE PICK — PICKS EN VIVO", f"📅 {pick_date}", ""]
+    lines = ["📡 TRIPLE PICK — LIVE PICKS" if en else "📡 TRIPLE PICK — PICKS EN VIVO", f"📅 {pick_date}", ""]
 
     all_rows = [item for _title, rows in groups for item in rows]
     if not all_rows:
@@ -8224,7 +8226,10 @@ def _live_pick_monitor_text(user_id):
                 else:
                     lines.append("⏱️ JUEGO: horario/marcador pendiente")
 
-            lines.append(f"📈 PROGRESO: {pick_state}")
+            lines.append(f"📈 {'PROGRESS' if en else 'PROGRESO'}: {pick_state}")
+            decision_label, decision_reason = _live_decision_label(payload, pick_state, lang)
+            lines.append(f"🧭 {'DECISION' if en else 'DECISIÓN'}: {decision_label}")
+            lines.append(f"💬 {decision_reason}")
             progress_detail = _live_pick_progress_detail(row, payload)
             if progress_detail:
                 lines.append(f"📐 MERCADO: {progress_detail}")
@@ -8322,6 +8327,77 @@ def _live_pick_watch_key(sport, row):
             game_id = None
         return f"{game_id or row_id or 'game'}|{row['selection']}"
     return f"{row_id or 'pick'}|{row['selection']}|{row['away']}|{row['home']}"
+
+
+def _live_decision_engine(payload, pick_state):
+    """Conservative live decision layer for already-published picks.
+
+    This is an advisory status only. It never triggers cash-out or alters an
+    official pick. Pregame price/EV decisions remain the responsibility of the
+    Market Engine; once a game is live, the decision is based on the verified
+    pick state and current game context.
+    """
+    state = (payload or {}).get("state") if payload else None
+    text = (pick_state or "").upper()
+
+    if state == "post" or text.startswith("🏁"):
+        return {
+            "code": "CLOSED",
+            "es": "🏁 CERRADO",
+            "en": "🏁 CLOSED",
+            "reason_es": "El evento ya terminó; no hay nueva entrada.",
+            "reason_en": "The event is final; no new entry is available.",
+        }
+
+    if state == "pre" or text.startswith("⏳"):
+        return {
+            "code": "WAIT",
+            "es": "🟡 ESPERAR",
+            "en": "🟡 WAIT",
+            "reason_es": "Aún no inicia. Usa la evaluación de línea/EV antes de entrar.",
+            "reason_en": "Pregame. Use the line/EV evaluation before entering.",
+        }
+
+    if text.startswith("✅") or "GANANDO" in text:
+        return {
+            "code": "HOLD",
+            "es": "🟢 MANTENER",
+            "en": "🟢 HOLD",
+            "reason_es": "El pick está actualmente a favor; no se recomienda perseguir una nueva entrada.",
+            "reason_en": "The pick is currently ahead; do not chase a new entry.",
+        }
+
+    if text.startswith("❌") or "PERDIENDO" in text:
+        return {
+            "code": "PASS",
+            "es": "🔴 PASAR",
+            "en": "🔴 PASS",
+            "reason_es": "El contexto actual va contra el pick; evitar una nueva entrada.",
+            "reason_en": "Current game context is against the pick; avoid a new entry.",
+        }
+
+    if text.startswith("⚠️") or "RIESGO" in text or "EMPATADO" in text:
+        return {
+            "code": "WAIT",
+            "es": "🟡 ESPERAR",
+            "en": "🟡 WAIT",
+            "reason_es": "El pick está en zona neutral/de riesgo; esperar confirmación del juego.",
+            "reason_en": "The pick is neutral/at risk; wait for stronger game confirmation.",
+        }
+
+    return {
+        "code": "WAIT",
+        "es": "🟡 ESPERAR",
+        "en": "🟡 WAIT",
+        "reason_es": "No hay suficiente contexto verificable para cambiar a MANTENER o PASAR.",
+        "reason_en": "There is not enough verified context to switch to HOLD or PASS.",
+    }
+
+
+def _live_decision_label(payload, pick_state, lang="es"):
+    decision = _live_decision_engine(payload, pick_state)
+    lang = "en" if lang == "en" else "es"
+    return decision[lang], decision[f"reason_{lang}"]
 
 
 def _live_pick_state_code(payload, pick_state):
@@ -8538,7 +8614,7 @@ def _live_pick_progress_detail(row, payload):
     return None
 
 
-def _live_pick_watch_message(sport, row, payload, pick_state, previous_code):
+def _live_pick_watch_message(sport, row, payload, pick_state, previous_code, lang="es"):
     """Build a compact, user-facing alert for an actual pick-state transition."""
     sport = (sport or "").upper()
     icons = {"MLB": "⚾", "SOCCER": "⚽", "NBA": "🏀"}
@@ -8584,14 +8660,29 @@ def _live_pick_watch_message(sport, row, payload, pick_state, previous_code):
         if progress_detail:
             lines.append(f"📐 PROGRESO DEL MERCADO: {progress_detail}")
 
-    lines.extend([
-        "",
-        f"↩️ Antes: {previous_text}",
-        f"➡️ Ahora: {pick_state}",
-        "",
-        "🔔 El estado del pick acaba de cambiar.",
-        f"🕒 Actualizado: {_format_live_stamp()}",
-    ])
+    decision_label, decision_reason = _live_decision_label(payload, pick_state, lang)
+    if lang == "en":
+        lines.extend([
+            "",
+            f"↩️ Before: {previous_text}",
+            f"➡️ Now: {pick_state}",
+            f"🧭 DECISION: {decision_label}",
+            f"💬 {decision_reason}",
+            "",
+            "🔔 The pick state has just changed.",
+            f"🕒 Updated: {_format_live_stamp()}",
+        ])
+    else:
+        lines.extend([
+            "",
+            f"↩️ Antes: {previous_text}",
+            f"➡️ Ahora: {pick_state}",
+            f"🧭 DECISIÓN: {decision_label}",
+            f"💬 {decision_reason}",
+            "",
+            "🔔 El estado del pick acaba de cambiar.",
+            f"🕒 Actualizado: {_format_live_stamp()}",
+        ])
     return "\n".join(lines)
 
 
@@ -8646,8 +8737,9 @@ async def automatic_live_pick_watch(context: ContextTypes.DEFAULT_TYPE):
                     )
                     continue
 
+                user_lang = _get_user_language(chat_id)
                 message = _live_pick_watch_message(
-                    sport, row, payload, pick_state, previous_code
+                    sport, row, payload, pick_state, previous_code, user_lang
                 )
                 try:
                     await context.bot.send_message(chat_id=chat_id, text=message)

@@ -88,7 +88,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.5.22"
+BOT_VERSION = "3.5.24"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -1437,25 +1437,46 @@ def _featured_quote_for_official_pick(item, event):
 
 
 def _player_prop_quote(item, event):
-    family = str(item.get("market_family") or "").upper()
-    if not family.startswith("PITCHER_STRIKEOUTS_") or not event:
+    """Return the current primary-book quote for supported MLB player props."""
+    if not event:
         return None
-    status, prop_event = get_mlb_event_odds(event.get("id"), ["pitcher_strikeouts"])
+    family = str(item.get("market_family") or "").upper()
+    prop_map = {
+        "PITCHER_STRIKEOUTS": "pitcher_strikeouts",
+        "PITCHER_HITS_ALLOWED": "pitcher_hits_allowed",
+        "PITCHER_OUTS": "pitcher_outs",
+        "BATTER_HITS": "batter_hits",
+        "BATTER_TOTAL_BASES": "batter_total_bases",
+        "BATTER_HOME_RUNS": "batter_home_runs",
+        "BATTER_RBIS": "batter_rbis",
+    }
+    direction = None
+    base_family = None
+    for prefix in sorted(prop_map, key=len, reverse=True):
+        if family == f"{prefix}_OVER":
+            base_family, direction = prefix, "Over"
+            break
+        if family == f"{prefix}_UNDER":
+            base_family, direction = prefix, "Under"
+            break
+    if not base_family:
+        return None
+    market_key = prop_map[base_family]
+    status, prop_event = get_mlb_event_odds(event.get("id"), [market_key])
     if status != "ok" or not prop_event:
         return None
-    direction = "Over" if family.endswith("OVER") else "Under"
     player = _normalize_team_name(item.get("selection"))
     for book in prop_event.get("bookmakers", []):
         if book.get("key") != ODDS_PRIMARY_BOOKMAKER:
             continue
         for market in book.get("markets", []):
-            if market.get("key") != "pitcher_strikeouts":
+            if market.get("key") != market_key:
                 continue
             for o in market.get("outcomes", []):
                 desc = _normalize_team_name(o.get("description"))
                 if desc == player and str(o.get("name") or "").lower() == direction.lower():
                     return {
-                        "market_key": "pitcher_strikeouts",
+                        "market_key": market_key,
                         "line": o.get("point"),
                         "price": o.get("price"),
                         "book": book.get("key"),
@@ -1593,6 +1614,88 @@ def _price_quality(model_prob, american_price):
     }
 
 
+def _american_profit_per_unit(price):
+    """Net profit returned on a 1-unit stake at American odds."""
+    try:
+        price = float(price)
+    except (TypeError, ValueError):
+        return None
+    if price == 0:
+        return None
+    if price > 0:
+        return price / 100.0
+    return 100.0 / abs(price)
+
+
+def _expected_value_per_unit(model_prob, american_price):
+    """Expected net units per 1 unit risked using the model probability proxy."""
+    try:
+        p = float(model_prob)
+    except (TypeError, ValueError):
+        return None
+    profit = _american_profit_per_unit(american_price)
+    if profit is None:
+        return None
+    p = max(0.0, min(1.0, p))
+    return (p * profit) - (1.0 - p)
+
+
+def _confidence_letter(confidence, data_reliability, starter_reliability):
+    """A/B/C audit grade; not a calibrated win probability."""
+    try:
+        c = float(confidence or 0)
+        dr = float(data_reliability or 0)
+        sr = float(starter_reliability or 0)
+    except (TypeError, ValueError):
+        return "C"
+
+    if c >= 84 and dr >= 85 and sr >= 80:
+        return "A"
+    if c >= 76 and dr >= 75 and sr >= 60:
+        return "B"
+    return "C"
+
+
+def _bet_action(partido):
+    """Translate model + price + EV + movement into JUGAR / ESPERAR / PASAR."""
+    if not partido.get("eligible"):
+        return "🔴 PASAR"
+
+    if not partido.get("hardrock_available"):
+        return "⚪ SIN PRECIO"
+
+    ev = partido.get("expected_value")
+    edge = partido.get("price_edge")
+    movement = partido.get("line_move_pp")
+    price_quality = partido.get("price_quality")
+
+    if ev is None or edge is None:
+        return "⚪ SIN PRECIO"
+
+    # Material adverse movement or clearly negative value = pass.
+    if partido.get("line_move_status") == "🔴 STEAMED / TOO EXPENSIVE":
+        return "🔴 PASAR"
+    if ev <= -0.02 or edge < -0.015 or price_quality == "🔴 PASS":
+        return "🔴 PASAR"
+
+    # Strong current value with no meaningful adverse move.
+    adverse_move = movement is not None and movement >= 0.025
+    if (
+        ev >= 0.05
+        and edge >= 0.03
+        and partido.get("price_gate_pass")
+        and not adverse_move
+        and partido.get("confidence", 0) >= 76
+    ):
+        return "🟢 JUGAR"
+
+    # Positive/borderline value where waiting for a better number is preferable.
+    if ev > 0 and edge >= 0.01:
+        return "🟡 ESPERAR"
+
+    return "🔴 PASAR"
+
+
 def _american_price_movement(first_price, current_price):
     """Compare selected-side prices using implied probability, not raw American numbers.
 
@@ -1705,6 +1808,13 @@ def build_daily_matchups_v28(fecha, season):
         partido["price_edge"] = None
         partido["price_quality"] = "⚪ NO PRICE"
         partido["price_gate_pass"] = False
+        partido["expected_value"] = None
+        partido["confidence_grade"] = _confidence_letter(
+            partido.get("confidence"),
+            partido.get("data_reliability"),
+            partido.get("min_starter_reliability"),
+        )
+        partido["bet_action"] = "⚪ SIN PRECIO"
         partido["first_seen_price"] = None
         partido["current_price"] = None
         partido["line_move_pp"] = None
@@ -1749,6 +1859,15 @@ def build_daily_matchups_v28(fecha, season):
         )
         partido["value_gap"] = model_prob - actionable_market_prob
         partido["market_agreement"] = _market_agreement(model_prob, market_prob)
+        partido["expected_value"] = _expected_value_per_unit(
+            model_prob, snapshot["selected_price"]
+        )
+        partido["confidence_grade"] = _confidence_letter(
+            partido.get("confidence"),
+            partido.get("data_reliability"),
+            partido.get("min_starter_reliability"),
+        )
+        partido["bet_action"] = _bet_action(partido)
         grade, survival, value = _classify_market_pick(partido)
         partido["market_grade"] = grade
         partido["survival_approved"] = survival
@@ -4306,6 +4425,90 @@ def _resolve_official_pitcher(player_text, games):
         "side": side,
     }
 
+def _resolve_official_player(player_text, games):
+    """Resolve an active MLB player to today's scheduled game using MLB Stats API currentTeam."""
+    name = str(player_text or "").strip()
+    if not name:
+        return None
+    search = safe_get_json(
+        f"{MLB_API}/people/search",
+        params={"names": name, "active": "true", "sportIds": 1},
+        cache_ttl=300,
+    ) or {}
+    people = search.get("people") or []
+    if not people:
+        return None
+    norm = _normalize_team_name(name)
+    exact = [p for p in people if _normalize_team_name(p.get("fullName")) == norm]
+    candidates = exact or people
+    resolved = []
+    for person in candidates[:5]:
+        pid = person.get("id")
+        if not pid:
+            continue
+        profile = safe_get_json(
+            f"{MLB_API}/people/{pid}",
+            params={"hydrate": "currentTeam"},
+            cache_ttl=300,
+        ) or {}
+        plist = profile.get("people") or []
+        if not plist:
+            continue
+        pdata = plist[0]
+        team = (pdata.get("currentTeam") or {}).get("name")
+        if not team:
+            continue
+        tkey = _normalize_team_name(team)
+        for game in games:
+            if tkey in {_normalize_team_name(game.get("away")), _normalize_team_name(game.get("home"))}:
+                resolved.append((pdata, game, team))
+                break
+    unique = {(r[0].get("id"), r[1].get("game_pk")): r for r in resolved}
+    if len(unique) != 1:
+        return None
+    pdata, game, team = next(iter(unique.values()))
+    return {
+        "game_pk": game["game_pk"],
+        "game_date": game["game_date"],
+        "away": game["away"],
+        "home": game["home"],
+        "selection": pdata.get("fullName") or name,
+        "pitcher": game["away_pitcher"] if _normalize_team_name(team) == _normalize_team_name(game["away"]) else game["home_pitcher"],
+        "player_id": pdata.get("id"),
+        "player_team": team,
+    }
+
+
+def _official_player_prop_spec(stat_text):
+    key = re.sub(r"[^A-Z0-9 ]+", " ", str(stat_text or "").upper())
+    key = re.sub(r"\s+", " ", key).strip()
+    aliases = {
+        "K": ("PITCHER_STRIKEOUTS", "K"),
+        "KS": ("PITCHER_STRIKEOUTS", "K"),
+        "STRIKEOUT": ("PITCHER_STRIKEOUTS", "K"),
+        "STRIKEOUTS": ("PITCHER_STRIKEOUTS", "K"),
+        "PITCHER STRIKEOUTS": ("PITCHER_STRIKEOUTS", "K"),
+        "HIT": ("BATTER_HITS", "Hits"),
+        "HITS": ("BATTER_HITS", "Hits"),
+        "TOTAL BASE": ("BATTER_TOTAL_BASES", "Total Bases"),
+        "TOTAL BASES": ("BATTER_TOTAL_BASES", "Total Bases"),
+        "TB": ("BATTER_TOTAL_BASES", "Total Bases"),
+        "HOME RUN": ("BATTER_HOME_RUNS", "HR"),
+        "HOME RUNS": ("BATTER_HOME_RUNS", "HR"),
+        "HR": ("BATTER_HOME_RUNS", "HR"),
+        "RBI": ("BATTER_RBIS", "RBI"),
+        "RBIS": ("BATTER_RBIS", "RBI"),
+        "HITS ALLOWED": ("PITCHER_HITS_ALLOWED", "Hits Allowed"),
+        "PITCHER HITS ALLOWED": ("PITCHER_HITS_ALLOWED", "Hits Allowed"),
+        "OUT": ("PITCHER_OUTS", "Pitching Outs"),
+        "OUTS": ("PITCHER_OUTS", "Pitching Outs"),
+        "PITCHING OUT": ("PITCHER_OUTS", "Pitching Outs"),
+        "PITCHING OUTS": ("PITCHER_OUTS", "Pitching Outs"),
+        "PITCHER OUTS": ("PITCHER_OUTS", "Pitching Outs"),
+    }
+    return aliases.get(key)
+
+
 def _parse_official_pick(raw_text, games):
     """Parse an admin-entered channel pick and bind it to today's MLB game.
 
@@ -4321,18 +4524,27 @@ def _parse_official_pick(raw_text, games):
     if not raw:
         return None, "Pick vacío."
 
-    # Pitcher strikeouts player prop. Example: "Gerrit Cole Over 5.5 K".
-    m = re.match(r"^(.+?)\s+(over|under)\s+([0-9]+(?:\.[0-9]+)?)\s+(?:k|ks|strikeouts?)$", raw, re.I)
+    # MLB player props. Examples:
+    # Gerrit Cole Over 5.5 K / Aaron Judge Over 1.5 Hits / Ohtani Over 1.5 Total Bases
+    m = re.match(r"^(.+?)\s+(over|under)\s+([0-9]+(?:\.[0-9]+)?)\s+(.+?)$", raw, re.I)
     if m:
-        player = _resolve_official_pitcher(m.group(1), games)
-        if not player:
-            return None, f"No pude identificar de forma única al pitcher: {m.group(1)}"
-        direction = m.group(2).upper()
-        line = float(m.group(3))
-        player["market_family"] = f"PITCHER_STRIKEOUTS_{direction}"
-        player["line"] = line
-        player["pick_text"] = f"{player['selection']} {direction.title()} {_fmt_line(line)} K"
-        return player, None
+        spec = _official_player_prop_spec(m.group(4))
+        if spec:
+            family_base, display_stat = spec
+            if family_base.startswith("PITCHER_"):
+                player = _resolve_official_pitcher(m.group(1), games)
+                if not player:
+                    player = _resolve_official_player(m.group(1), games)
+            else:
+                player = _resolve_official_player(m.group(1), games)
+            if not player:
+                return None, f"No pude identificar de forma única al jugador: {m.group(1)}"
+            direction = m.group(2).upper()
+            line = float(m.group(3))
+            player["market_family"] = f"{family_base}_{direction}"
+            player["line"] = line
+            player["pick_text"] = f"{player['selection']} {direction.title()} {_fmt_line(line)} {display_stat}"
+            return player, None
 
     # Full-game total must be checked before team-total syntax.
     m = re.match(r"^(.+?)\s+vs\.?\s+(.+?)\s+(over|under)\s+([0-9]+(?:\.[0-9]+)?)$", raw, re.I)
@@ -4730,7 +4942,9 @@ async def admin_official_start_input(update: Update, context: ContextTypes.DEFAU
         "Baltimore Orioles ML\n"
         "Orioles Over 3.5\n"
         "Dodgers vs Padres Over 8.5\n\n"
-        "También acepta Team Total Over/Under, run line (+1.5/-1.5) y pitcher K (ej. Cole Over 5.5 K).\n"
+        "También acepta Team Total Over/Under, run line (+1.5/-1.5) y props MLB.\n"
+        "Props: pitcher K, hits allowed, pitching outs; batter hits, total bases, HR y RBI.\n"
+        "Ejemplos: Cole Over 5.5 K | Judge Over 1.5 Hits | Ohtani Over 1.5 Total Bases.\n"
         "El bot identificará automáticamente rival, pitcher, horario y partido.\n"
         "Pulsa ❌ Cancelar carga para salir.",
         reply_markup=ReplyKeyboardMarkup([["❌ Cancelar carga"]], resize_keyboard=True, is_persistent=True),
@@ -6076,6 +6290,8 @@ def _mlb_prop_definition(selection, row=None):
         "HOME RUN": "HR", "HOME RUNS": "HR", "HOMER": "HR", "HOMERS": "HR", "HR": "HR",
         "RUN": "R", "RUNS": "R", "R": "R",
         "WALK": "BB", "WALKS": "BB", "BASES ON BALLS": "BB", "BB": "BB",
+        "HITS ALLOWED": "PHA", "PITCHER HITS ALLOWED": "PHA",
+        "OUT": "POUT", "OUTS": "POUT", "PITCHING OUT": "POUT", "PITCHING OUTS": "POUT", "PITCHER OUTS": "POUT",
     }
     code = aliases.get(key)
     if not code:
@@ -6097,6 +6313,21 @@ def _mlb_stat_number(raw):
     except (TypeError, ValueError):
         m = re.match(r"^(-?[0-9]+(?:\.[0-9]+)?)", str(raw).strip())
         return float(m.group(1)) if m else None
+
+
+def _mlb_innings_to_outs(raw):
+    """Convert MLB inningsPitched notation (e.g. 5.2) to pitching outs."""
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    m = re.match(r"^(\d+)(?:\.(\d))?$", text)
+    if not m:
+        return None
+    whole = int(m.group(1))
+    frac = int(m.group(2) or 0)
+    if frac not in (0, 1, 2):
+        return None
+    return float(whole * 3 + frac)
 
 
 def _mlb_boxscore_players(boxscore):
@@ -6122,6 +6353,8 @@ def _mlb_boxscore_players(boxscore):
                 "R": _mlb_stat_number(batting.get("runs")),
                 "BB": _mlb_stat_number(batting.get("baseOnBalls")),
                 "K": _mlb_stat_number(pitching.get("strikeOuts")),
+                "PHA": _mlb_stat_number(pitching.get("hits")),
+                "POUT": _mlb_innings_to_outs(pitching.get("inningsPitched")),
             }
             out[name] = {k: v for k, v in mapped.items() if v is not None}
     return out
@@ -9251,6 +9484,8 @@ async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"HR no-vig {_pct(p.get('hardrock_no_vig'))}\n"
                     f"🌐 Consensus no-vig: {_pct(p.get('consensus_no_vig'))} | "
                     f"Gap {p.get('value_gap', 0) * 100:+.1f} pp\n"
+                    f"🧾 EV {'N/D' if p.get('expected_value') is None else f"{p.get('expected_value') * 100:+.1f}%"} | "
+                    f"Conf {p.get('confidence_grade', 'C')} | {p.get('bet_action', 'N/D')}\n"
                     f"🤝 {p.get('market_agreement')} | {p.get('market_grade')}\n"
                 )
             else:
@@ -9318,7 +9553,7 @@ async def mlb_lines(update: Update, context: ContextTypes.DEFAULT_TYPE):
         item = dict(row)
         event = _find_odds_event(item, events, pick_date)
         family = str(item.get("market_family") or "").upper()
-        if family.startswith("PITCHER_STRIKEOUTS_"):
+        if family.startswith(("PITCHER_", "BATTER_")):
             quote = await asyncio.to_thread(_player_prop_quote, item, event)
         else:
             quote = _featured_quote_for_official_pick(item, event)
@@ -9371,7 +9606,7 @@ async def pool(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Market: {'ON' if odds_status == 'ok' else 'OFF/FALLBACK'} | "
         f"Primary: {ODDS_PRIMARY_BOOKMAKER}\n\n"
         "C=Confidence | DR=Data Reliability | MP=Model Probability Proxy | "
-        "MKT=consensus no-vig | VG=value gap | PE=price edge.\n\n"
+        "MKT=consensus no-vig | VG=value gap | PE=price edge | EV=expected value.\n\n"
     )
     mensaje += _primary_feed_notice(partidos, odds_status)
     for i, p in enumerate(partidos, 1):
@@ -9387,6 +9622,8 @@ async def pool(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Δ {p['difference']:.1f} | SR {p['min_starter_reliability']:.0f}\n"
             f"🧮 MP {_pct(p.get('model_probability'))} | MKT {_pct(p.get('market_probability'))} | VG {vg_text}\n"
             f"💲 HR {_format_american(p.get('hardrock_price'))} | Impl {_pct(p.get('price_implied_probability'))} | PE {pe_text} | {p.get('price_quality')}\n"
+            f"🧾 EV {'N/D' if p.get('expected_value') is None else f"{p.get('expected_value') * 100:+.1f}%"} | "
+            f"Conf {p.get('confidence_grade', 'C')} | {p.get('bet_action', 'N/D')}\n"
             f"📉 First {_format_american(p.get('first_seen_price'))} → Now {_format_american(p.get('current_price'))} | "
             f"Move {'N/D' if p.get('line_move_pp') is None else f"{p.get('line_move_pp') * 100:+.1f}pp"} | {p.get('line_move_status')}\n"
             f"🛡️ Model Gate: {p['gate_reason']}\n\n"
@@ -9436,6 +9673,8 @@ async def market(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💵 Hard Rock {_format_american(p.get('hardrock_price'))} | "
             f"Impl {_pct(p.get('price_implied_probability'))} | PE {pe_text}\n"
             f"🏷️ Price Gate: {p.get('price_quality')} | HR no-vig {_pct(p.get('hardrock_no_vig'))}\n"
+            f"🧾 EV {'N/D' if p.get('expected_value') is None else f"{p.get('expected_value') * 100:+.1f}%"} | "
+            f"Conf {p.get('confidence_grade', 'C')} | {p.get('bet_action', 'N/D')}\n"
             f"📉 First {_format_american(p.get('first_seen_price'))} → Now {_format_american(p.get('current_price'))} | "
             f"Move {'N/D' if p.get('line_move_pp') is None else f"{p.get('line_move_pp') * 100:+.1f} pp"} | {p.get('line_move_status')}\n"
             f"🌐 Consensus {_pct(p.get('consensus_no_vig'))} | Gap {vg_text}\n"
@@ -9500,6 +9739,8 @@ async def value(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🧮 Model {_pct(p.get('model_probability'))} | "
                 f"HR no-vig {_pct(p.get('hardrock_no_vig'))} | "
                 f"Gap {p['value_gap'] * 100:+.1f} pp\n"
+                f"🧾 EV {'N/D' if p.get('expected_value') is None else f"{p.get('expected_value') * 100:+.1f}%"} | "
+                f"Conf {p.get('confidence_grade', 'C')} | {p.get('bet_action', 'N/D')}\n"
                 f"🧪 C {p['confidence']:.0f} | DR {p['data_reliability']:.0f}\n\n"
             )
     mensaje += "⚠️ Model Probability sigue siendo proxy no calibrado hasta completar tracking/backtest."

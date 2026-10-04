@@ -89,7 +89,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.5.29"
+BOT_VERSION = "3.5.30"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -3091,7 +3091,7 @@ def _set_sms_subscription(chat_id, enabled=None, phone_number=None):
     return {"enabled": final_enabled, "phone_number": final_phone}
 
 
-def _sms_was_sent(chat_id, pick_date, game_pk, selection):
+def _sms_was_sent(chat_id, pick_date, game_pk, selection, market_family=None, line=None):
     init_tracking_db()
     with _tracking_connection() as conn:
         row = conn.execute(
@@ -3099,7 +3099,7 @@ def _sms_was_sent(chat_id, pick_date, game_pk, selection):
             SELECT 1 FROM sms_deliveries
             WHERE chat_id=? AND pick_date=? AND game_pk=? AND selection=? AND status='SENT'
             """,
-            (int(chat_id), pick_date, int(game_pk), selection),
+            (int(chat_id), pick_date, int(game_pk), _pick_alert_storage_key(selection, market_family, line)),
         ).fetchone()
     return row is not None
 
@@ -3121,7 +3121,8 @@ def _record_sms_delivery(chat_id, row, phone_number, status, provider_sid=None, 
                 sent_at=excluded.sent_at
             """,
             (
-                int(chat_id), row.get("pick_date"), int(row.get("game_pk")), row.get("selection"),
+                int(chat_id), row.get("pick_date"), int(row.get("game_pk")),
+                _pick_alert_storage_key(row.get("selection"), row.get("market_family"), row.get("line")),
                 phone_number, provider_sid, status, error, local_now().isoformat(),
             ),
         )
@@ -3205,7 +3206,14 @@ def _enabled_alert_chats():
         ).fetchall()
 
 
-def _set_game_alert_enabled(chat_id, pick_date, game_pk, selection, enabled):
+def _pick_alert_storage_key(selection, market_family=None, line=None):
+    """Market-aware key stored in legacy alert tables so same-game picks do not collide."""
+    family = str(market_family or "FULL_GAME_ML").upper()
+    line_key = "NA" if line is None else _fmt_line(line)
+    return f"{selection}||{family}||{line_key}"
+
+
+def _set_game_alert_enabled(chat_id, pick_date, game_pk, selection, enabled, market_family=None, line=None):
     init_tracking_db()
     with _tracking_connection() as conn:
         conn.execute(
@@ -3218,13 +3226,13 @@ def _set_game_alert_enabled(chat_id, pick_date, game_pk, selection, enabled):
                 updated_at=excluded.updated_at
             """,
             (
-                int(chat_id), pick_date, int(game_pk), selection,
+                int(chat_id), pick_date, int(game_pk), _pick_alert_storage_key(selection, market_family, line),
                 int(bool(enabled)), local_now().isoformat(),
             ),
         )
 
 
-def _game_alert_enabled(chat_id, pick_date, game_pk, selection):
+def _game_alert_enabled(chat_id, pick_date, game_pk, selection, market_family=None, line=None):
     """Per-game alerts default ON unless explicitly disabled."""
     init_tracking_db()
     with _tracking_connection() as conn:
@@ -3233,16 +3241,18 @@ def _game_alert_enabled(chat_id, pick_date, game_pk, selection):
             SELECT enabled FROM alert_game_settings
             WHERE chat_id=? AND pick_date=? AND game_pk=? AND selection=?
             """,
-            (int(chat_id), pick_date, int(game_pk), selection),
+            (int(chat_id), pick_date, int(game_pk), _pick_alert_storage_key(selection, market_family, line)),
         ).fetchone()
     return True if row is None else bool(row["enabled"])
 
 
 def _alert_status(chat_id, row, global_enabled=True):
-    if _alert_was_sent(chat_id, row["pick_date"], row["game_pk"], row["selection"]):
+    family = row["market_family"] if "market_family" in row.keys() else None
+    line = row["line"] if "line" in row.keys() else None
+    if _alert_was_sent(chat_id, row["pick_date"], row["game_pk"], row["selection"], family, line):
         return "ENVIADA"
     if not global_enabled or not _game_alert_enabled(
-        chat_id, row["pick_date"], row["game_pk"], row["selection"]
+        chat_id, row["pick_date"], row["game_pk"], row["selection"], family, line
     ):
         return "DESACTIVADA"
     return "PENDIENTE"
@@ -3270,7 +3280,7 @@ def _pending_alert_picks(pick_date=None):
         ).fetchall()
     return rows
 
-def _alert_was_sent(chat_id, pick_date, game_pk, selection):
+def _alert_was_sent(chat_id, pick_date, game_pk, selection, market_family=None, line=None):
     init_tracking_db()
     with _tracking_connection() as conn:
         row = conn.execute(
@@ -3278,7 +3288,7 @@ def _alert_was_sent(chat_id, pick_date, game_pk, selection):
             SELECT 1 FROM alert_deliveries
             WHERE chat_id=? AND pick_date=? AND game_pk=? AND selection=?
             """,
-            (int(chat_id), pick_date, int(game_pk), selection),
+            (int(chat_id), pick_date, int(game_pk), _pick_alert_storage_key(selection, market_family, line)),
         ).fetchone()
     return row is not None
 
@@ -3293,7 +3303,8 @@ def _record_alert_delivery(chat_id, row, scheduled_for):
             ) VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
-                int(chat_id), row["pick_date"], int(row["game_pk"]), row["selection"],
+                int(chat_id), row["pick_date"], int(row["game_pk"]),
+                _pick_alert_storage_key(row["selection"], row.get("market_family"), row.get("line")),
                 scheduled_for.isoformat(), local_now().isoformat(),
             ),
         )
@@ -3301,7 +3312,9 @@ def _record_alert_delivery(chat_id, row, scheduled_for):
 
 def _alert_job_name(chat_id, row):
     safe_selection = re.sub(r"[^a-zA-Z0-9]+", "_", str(row["selection"]))[:40]
-    return f"tp_alert_{chat_id}_{row['pick_date']}_{row['game_pk']}_{safe_selection}"
+    safe_market = re.sub(r"[^a-zA-Z0-9]+", "_", str(row.get("market_family") or "ML"))[:28]
+    safe_line = re.sub(r"[^a-zA-Z0-9]+", "_", str(row.get("line") if row.get("line") is not None else "NA"))[:12]
+    return f"tp_alert_{chat_id}_{row['pick_date']}_{row['game_pk']}_{safe_selection}_{safe_market}_{safe_line}"
 
 
 def _tracked_pick_display(row):
@@ -3339,12 +3352,14 @@ async def _send_pick_alert_job(context: ContextTypes.DEFAULT_TYPE):
     if not sub.get("enabled"):
         return
     game_enabled = await asyncio.to_thread(
-        _game_alert_enabled, chat_id, row.get("pick_date"), row.get("game_pk"), row.get("selection")
+        _game_alert_enabled, chat_id, row.get("pick_date"), row.get("game_pk"), row.get("selection"),
+        row.get("market_family"), row.get("line")
     )
     if not game_enabled:
         return
     if await asyncio.to_thread(
-        _alert_was_sent, chat_id, row.get("pick_date"), row.get("game_pk"), row.get("selection")
+        _alert_was_sent, chat_id, row.get("pick_date"), row.get("game_pk"), row.get("selection"),
+        row.get("market_family"), row.get("line")
     ):
         return
 
@@ -3369,7 +3384,8 @@ async def _send_pick_alert_job(context: ContextTypes.DEFAULT_TYPE):
     sms_sub = await asyncio.to_thread(_get_sms_subscription, chat_id)
     if sms_sub.get("enabled") and sms_sub.get("phone_number"):
         already_sms = await asyncio.to_thread(
-            _sms_was_sent, chat_id, row.get("pick_date"), row.get("game_pk"), row.get("selection")
+            _sms_was_sent, chat_id, row.get("pick_date"), row.get("game_pk"), row.get("selection"),
+            row.get("market_family"), row.get("line")
         )
         if not already_sms:
             sms_body = (
@@ -3407,12 +3423,14 @@ async def schedule_alert_jobs(application, pick_date=None):
         lead = int(chat["lead_minutes"] or ALERT_LEAD_MINUTES)
         for row in rows:
             if not await asyncio.to_thread(
-                _game_alert_enabled, chat_id, row["pick_date"], row["game_pk"], row["selection"]
+                _game_alert_enabled, chat_id, row["pick_date"], row["game_pk"], row["selection"],
+                row["market_family"], row["line"]
             ):
                 skipped += 1
                 continue
             if await asyncio.to_thread(
-                _alert_was_sent, chat_id, row["pick_date"], row["game_pk"], row["selection"]
+                _alert_was_sent, chat_id, row["pick_date"], row["game_pk"], row["selection"],
+                row["market_family"], row["line"]
             ):
                 skipped += 1
                 continue
@@ -3691,7 +3709,8 @@ async def alert_game_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     row = candidates[0]
     enabled = action == "on"
     await asyncio.to_thread(
-        _set_game_alert_enabled, chat_id, row["pick_date"], row["game_pk"], row["selection"], enabled
+        _set_game_alert_enabled, chat_id, row["pick_date"], row["game_pk"], row["selection"], enabled,
+        row["market_family"], row["line"]
     )
 
     if context.application.job_queue is not None:
@@ -5165,8 +5184,28 @@ def _parse_official_pick(raw_text, games):
     return team, None
 
 
+def _official_pick_identity(item):
+    """Stable identity for one MLB market selection, allowing several picks from one game."""
+    line = item.get("line")
+    line_key = "" if line is None else _fmt_line(line)
+    return (
+        int(item.get("game_pk") or 0),
+        str(item.get("market_family") or "FULL_GAME_ML").upper(),
+        str(item.get("selection") or "").strip().lower(),
+        line_key,
+    )
+
+
+def _official_tracking_model_version(item):
+    """Keep market-distinct official picks unique in the legacy tracked_picks schema."""
+    family = str(item.get("market_family") or "FULL_GAME_ML").upper()
+    line = item.get("line")
+    line_key = "NA" if line is None else _fmt_line(line)
+    return f"CHANNEL_OFFICIAL:{family}:{line_key}"
+
+
 def _save_official_market_picks(pick_date, pick_lines, admin_user_id):
-    """Parse three complete channel picks and persist one canonical bot/channel slate."""
+    """Parse exactly three channel picks; multiple markets may come from the same MLB game."""
     clean = [str(x).strip() for x in pick_lines if str(x).strip()]
     if len(clean) != 3:
         return False, "Debes enviar exactamente 3 picks.", []
@@ -5176,14 +5215,15 @@ def _save_official_market_picks(pick_date, pick_lines, admin_user_id):
         return False, "No pude obtener la cartelera MLB para esa fecha.", []
 
     resolved = []
-    used_games = set()
+    used_picks = set()
     for pick_text in clean:
         item, error = _parse_official_pick(pick_text, games)
         if item is None:
             return False, error or f"No pude interpretar: {pick_text}", []
-        if item["game_pk"] in used_games:
-            return False, f"Hay dos selecciones del mismo partido: {item['away']} vs {item['home']}", []
-        used_games.add(item["game_pk"])
+        identity = _official_pick_identity(item)
+        if identity in used_picks:
+            return False, f"Pick duplicado: {item['pick_text']}", []
+        used_picks.add(identity)
         resolved.append(item)
 
     now_iso = local_now().isoformat()
@@ -5219,12 +5259,13 @@ def _save_official_market_picks(pick_date, pick_lines, admin_user_id):
                     product, source, official, market_family, line, odds, book,
                     model_version, bot_version, result, units_risked, notes
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, 'OFFICIAL', 'CHANNEL_OFFICIAL', 1,
-                          ?, ?, NULL, NULL, 'CHANNEL_OFFICIAL', ?,
+                          ?, ?, NULL, NULL, ?, ?,
                           'PENDING', 1.0, 'Confirmed by admin for channel/bot sync')
                 """,
                 (
                     now_iso, pick_date, item["game_pk"], item["game_date"], item["away"], item["home"],
-                    item["selection"], item["market_family"], item["line"], BOT_VERSION,
+                    item["selection"], item["market_family"], item["line"],
+                    _official_tracking_model_version(item), BOT_VERSION,
                 ),
             )
     return True, "OK", resolved
@@ -5279,7 +5320,7 @@ async def admin_official_picks_panel(update: Update, context: ContextTypes.DEFAU
     rows = await asyncio.to_thread(_official_pick_rows, fecha)
     await update.effective_message.reply_text(
         _format_official_picks_text(rows) +
-        "\n\n📝 Cargar 3 picks: pega los tres picks completos, uno por línea.\n"
+        "\n\n📝 Cargar 3 picks: pega los tres picks completos, uno por línea. Pueden ser del mismo partido.\n"
         "Formatos: Orioles ML · Orioles Over 3.5 · Orioles +1.5 · Orioles vs Yankees Over 8.5.\n"
         "🤖 Usar picks del modelo: toma el Triple Pick calculado por el bot y lo fija como oficial.",
         reply_markup=OFFICIAL_PICKS_ADMIN_KEYBOARD,
@@ -5326,7 +5367,7 @@ def _parse_mlb_master_block(text):
 
     resolved = []
     errors = []
-    used_games = set()
+    used_picks = set()
     offset = 2 if mdate else 1
 
     for idx, raw in enumerate(body, start=offset):
@@ -5357,10 +5398,11 @@ def _parse_mlb_master_block(text):
                 errors.append({"line": idx, "text": raw, "error": "la selección no pertenece al partido escrito"})
                 continue
 
-        if item["game_pk"] in used_games:
-            errors.append({"line": idx, "text": raw, "error": f"partido duplicado: {item['away']} vs {item['home']}"})
+        identity = _official_pick_identity(item)
+        if identity in used_picks:
+            errors.append({"line": idx, "text": raw, "error": f"pick duplicado: {item['pick_text']}"})
             continue
-        used_games.add(item["game_pk"])
+        used_picks.add(identity)
         resolved.append(item)
 
     return pick_date, resolved, errors
@@ -5402,12 +5444,13 @@ def _commit_mlb_master_import(pick_date, resolved, admin_user_id):
                     product, source, official, market_family, line, odds, book,
                     model_version, bot_version, result, units_risked, notes
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, 'OFFICIAL', 'CHANNEL_OFFICIAL', 1,
-                          ?, ?, NULL, NULL, 'CHANNEL_OFFICIAL', ?,
+                          ?, ?, NULL, NULL, ?, ?,
                           'PENDING', 1.0, 'MLB master import confirmed by admin')
                 """,
                 (
                     now_iso, pick_date, item["game_pk"], item["game_date"], item["away"], item["home"],
-                    item["selection"], item["market_family"], item["line"], BOT_VERSION,
+                    item["selection"], item["market_family"], item["line"],
+                    _official_tracking_model_version(item), BOT_VERSION,
                 ),
             )
     return True, "OK"
@@ -5422,7 +5465,7 @@ async def admin_mlb_master_start(update: Update, context: ContextTypes.DEFAULT_T
     context.user_data.pop("awaiting_official_picks", None)
     await update.effective_message.reply_text(
         "📥 IMPORTAR JORNADA MLB\n\n"
-        "Pega el bloque completo con exactamente 3 picks oficiales.\n\n"
+        "Pega el bloque completo con exactamente 3 picks oficiales. Los 3 pueden pertenecer al mismo partido si son mercados distintos.\n\n"
         "Formato recomendado:\n"
         "DATE: 2026-09-24\n\n"
         "Baltimore Orioles vs New York Yankees | Yankees ML\n"

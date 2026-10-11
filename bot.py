@@ -89,7 +89,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.5.33"
+BOT_VERSION = "3.5.34"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -6651,8 +6651,30 @@ async def multi_button_callback(update,context):
             [(f"{g['away']} vs {g['home']}",f'game:{i}') for i,g in enumerate(games)]+[("Cancelar","cancel")],prefix='mp',columns=1))
     elif kind=='game' and value.isdigit() and int(value)<len(d.get('games',[])):
         d['game']=d['games'][int(value)]
-        await q.edit_message_text('Selecciona mercado:',reply_markup=_soccer_button_markup(
-            [(label,'market:'+key) for key,label in MULTI_MARKETS[sport].items()]+[("Cancelar","cancel")],prefix='mp'))
+        if sport == 'NBA':
+            options = [('🏀 Mercados del partido','category:team'),
+                       ('🎯 Player Props — jugadores','category:player'),
+                       ('Cancelar','cancel')]
+            await q.edit_message_text('Selecciona categoría de mercado:',
+                reply_markup=_soccer_button_markup(options,prefix='mp',columns=1))
+        else:
+            await q.edit_message_text('Selecciona mercado:',reply_markup=_soccer_button_markup(
+                [(label,'market:'+key) for key,label in MULTI_MARKETS[sport].items()]+[("Cancelar","cancel")],prefix='mp'))
+    elif kind=='category' and sport=='NBA' and value in {'team','player'} and 'game' in d:
+        show_players = (value == 'player')
+        options = [(label,'market:'+key) for key,label in MULTI_MARKETS['NBA'].items()
+                   if key.startswith('player_') == show_players]
+        options += [('⬅️ Categorías','category:back'),('Cancelar','cancel')]
+        await q.edit_message_text(
+            '🎯 Player Props — selecciona estadística y Over/Under:' if show_players
+            else '🏀 Mercados del partido — selecciona mercado:',
+            reply_markup=_soccer_button_markup(options,prefix='mp',columns=2))
+    elif kind=='category' and sport=='NBA' and value=='back' and 'game' in d:
+        await q.edit_message_text('Selecciona categoría de mercado:',
+            reply_markup=_soccer_button_markup([
+                ('🏀 Mercados del partido','category:team'),
+                ('🎯 Player Props — jugadores','category:player'),
+                ('Cancelar','cancel')],prefix='mp',columns=1))
     elif kind=='market' and value in MULTI_MARKETS[sport] and 'game' in d:
         d['market']=value;d.pop('player',None);d.pop('line',None)
         if value.startswith('pitcher_'):

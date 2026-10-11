@@ -89,7 +89,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.5.34"
+BOT_VERSION = "3.5.35"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -4054,6 +4054,86 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"MKT {_pct(row['market_probability'])} | {_format_units(row['units_won_lost'])}\n\n"
         )
     await _reply_long(update.message, msg)
+
+
+def settle_pending_nba_player_props():
+    """Settle NBA player props only after ESPN confirms the final box score.
+
+    Missing player/stat/game data remains PENDING for manual review. Existing
+    WIN/LOSS/PUSH/VOID rows are never overwritten.
+    """
+    init_tracking_db()
+    with _tracking_connection() as conn:
+        pending = conn.execute(
+            "SELECT id, pick_date, away, home, selection, product FROM nba_picks "
+            "WHERE result='PENDING' AND UPPER(product)='PLAYER' "
+            "ORDER BY pick_date, id"
+        ).fetchall()
+    report = {"checked": len(pending), "wins": 0, "losses": 0,
+              "pushes": 0, "still_pending": 0}
+    by_date = {}
+    for row in pending:
+        # Avoid hitting ESPN for future games.
+        if row["pick_date"] > local_now().strftime("%Y-%m-%d"):
+            report["still_pending"] += 1
+            continue
+        by_date.setdefault(row["pick_date"], []).append(row)
+    for date, rows in by_date.items():
+        scoreboard = _nba_scoreboard(date) or {}
+        events = scoreboard.get("events", [])
+        summary_cache = {}
+        for row in rows:
+            event = _find_espn_event(events, row["away"], row["home"])
+            if not event:
+                report["still_pending"] += 1
+                continue
+            status = (event.get("status") or {}).get("type") or {}
+            if status.get("state") != "post" or not status.get("completed", False):
+                report["still_pending"] += 1
+                continue
+            definition = _nba_prop_definition(row["selection"], row)
+            if not definition:
+                report["still_pending"] += 1
+                continue
+            event_id = str(event.get("id") or "")
+            if not event_id:
+                report["still_pending"] += 1
+                continue
+            if event_id not in summary_cache:
+                summary_cache[event_id] = _nba_summary(event_id)
+            snapshot = _nba_player_prop_snapshot(summary_cache[event_id], definition)
+            if not snapshot:
+                report["still_pending"] += 1
+                continue
+            value = float(snapshot["value"])
+            line = float(definition["line"])
+            if value == line:
+                result = "PUSH"
+            elif (value > line) == (definition["direction"] == "OVER"):
+                result = "WIN"
+            else:
+                result = "LOSS"
+            with _tracking_connection() as conn:
+                cur = conn.execute(
+                    "UPDATE nba_picks SET result=?, updated_at=? "
+                    "WHERE id=? AND result='PENDING'",
+                    (result, local_now().isoformat(), row["id"]),
+                )
+            if cur.rowcount:
+                report[{"WIN": "wins", "LOSS": "losses", "PUSH": "pushes"}[result]] += 1
+    return report
+
+
+async def auto_settle_nba_player_props(context: ContextTypes.DEFAULT_TYPE):
+    if not TRACK_AUTO_SETTLE:
+        return
+    try:
+        info = await asyncio.to_thread(settle_pending_nba_player_props)
+        if info["wins"] or info["losses"] or info["pushes"]:
+            print(f"NBA player props settled: W={info['wins']} L={info['losses']} "
+                  f"P={info['pushes']} pending={info['still_pending']}")
+    except Exception as exc:
+        print(f"NBA player prop settlement error: {exc}")
 
 
 async def auto_settle_tracking(context: ContextTypes.DEFAULT_TYPE):
@@ -11502,6 +11582,11 @@ def main():
                 auto_settle_tracking,
                 time=settle_time,
                 name="triple_pick_tracking_settle",
+            )
+            app.job_queue.run_daily(
+                auto_settle_nba_player_props,
+                time=settle_time,
+                name="triple_pick_nba_player_prop_settle",
             )
             print(
                 f"🧾 Auto-settle programado diariamente a "

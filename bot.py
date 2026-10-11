@@ -89,7 +89,7 @@ _ODDS_LAST_META = {"remaining": None, "used": None, "last": None, "error": None}
 
 
 # Triple Pick v2.9.7 — Telegram + optional Twilio SMS pregame alerts.
-BOT_VERSION = "3.5.30"
+BOT_VERSION = "3.5.31"
 MODEL_VERSION = "MLB_MODEL_2.7.1_PROXY"
 RAILWAY_VOLUME_MOUNT_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 TRACK_DB_PATH = os.environ.get("TRACK_DB_PATH", "").strip()
@@ -6077,7 +6077,8 @@ MLB_MENU_KEYBOARD = ReplyKeyboardMarkup(
 
 SOCCER_ADMIN_KEYBOARD = ReplyKeyboardMarkup(
     [
-        ["📋 Ver picks fútbol", "📝 Importar jornada fútbol"],
+        ["📋 Ver picks fútbol", "⚽ Crear pick con botones"],
+        ["📝 Importar jornada fútbol"],
         ["🗑️ Borrar picks fútbol", "📊 Resultados Fútbol"],
         ["⬅️ Panel Admin"],
     ],
@@ -6339,6 +6340,296 @@ def _parse_soccer_master_block(text):
 
     return pick_date, parsed, rejected
 
+
+
+# v3.5.31 — Guided soccer picks, admin only. ESPN supplies actual fixtures;
+# the operator approves market/line/plan before appending to the day's picks.
+SOCCER_BUTTON_LEAGUES = {
+    "eng.1": "Premier League", "esp.1": "LaLiga", "ita.1": "Serie A",
+    "ger.1": "Bundesliga", "fra.1": "Ligue 1", "uefa.champions": "Champions League",
+    "uefa.europa": "Europa League", "uefa.europa.conf": "Conference League",
+    "usa.1": "MLS", "uefa.nations": "Nations League",
+}
+SOCCER_BUTTON_MARKETS = {
+    "ml_home": "Gana local", "ml_away": "Gana visitante", "draw": "Empate",
+    "goals_o": "Over goles", "goals_u": "Under goles",
+    "corners_o": "Over corners", "corners_u": "Under corners",
+    "home_goals_o": "Local Over goles", "away_goals_o": "Visitante Over goles",
+    "home_corners_o": "Local Over corners", "away_corners_o": "Visitante Over corners",
+    "shots_o": "Over tiros totales", "sot_o": "Over tiros a puerta",
+    "home_shots_o": "Local Over tiros", "away_shots_o": "Visitante Over tiros",
+    "home_sot_o": "Local Over tiros a puerta", "away_sot_o": "Visitante Over tiros a puerta",
+    "player_sot_o": "Jugador Over SOT", "player_shots_o": "Jugador Over SHOTS",
+    "player_sot_u": "Jugador Under SOT", "player_shots_u": "Jugador Under SHOTS",
+}
+SOCCER_BUTTON_LINES = {
+    "goals": ["0.5", "1.5", "2.5", "3.5", "4.5"],
+    "corners": ["5.5", "6.5", "7.5", "8.5", "9.5", "10.5", "11.5", "12.5"],
+    "shots": ["14.5", "17.5", "19.5", "21.5", "24.5", "27.5"],
+    "sot": ["4.5", "5.5", "6.5", "7.5", "8.5", "9.5"],
+    "player": ["0.5", "1.5", "2.5", "3.5", "4.5", "5.5"],
+}
+
+
+def _soccer_button_fixtures(league, date):
+    data = _espn_get_json(f"soccer/{league}/scoreboard", {"dates": date.replace("-", "")})
+    if data is None:
+        return None
+    matches = []
+    for event in data.get("events", []):
+        _comp, away, home = _espn_competitors(event)
+        if not away or not home:
+            continue
+        if event.get("status", {}).get("type", {}).get("state") != "pre":
+            continue
+        matches.append({
+            "id": str(event.get("id", "")),
+            "away": away.get("team", {}).get("displayName", ""),
+            "home": home.get("team", {}).get("displayName", ""),
+            "kickoff_utc": event.get("date"),
+            "away_id": str(away.get("team", {}).get("id", "")),
+            "home_id": str(home.get("team", {}).get("id", "")),
+        })
+    return [m for m in matches if m["id"] and m["away"] and m["home"]]
+
+
+def _soccer_button_roster(league, team_id):
+    """List registered squad members from ESPN; not a confirmed starting XI."""
+    if not team_id or not str(team_id).isdigit():
+        return None
+    data = _espn_get_json(f"soccer/{league}/teams/{team_id}/roster")
+    if data is None:
+        return None
+    names = []
+    def collect(node):
+        if isinstance(node, dict):
+            # ESPN roster feeds may nest athletes by positional groups.
+            athletes = node.get("athletes")
+            if isinstance(athletes, list):
+                for entry in athletes:
+                    if isinstance(entry, dict):
+                        candidate = entry.get("athlete", entry)
+                        if isinstance(candidate, dict):
+                            name = candidate.get("displayName") or candidate.get("fullName")
+                            if name and len(name) <= 90:
+                                names.append(str(name))
+            for key, value in node.items():
+                if key != "athletes" and isinstance(value, (dict, list)):
+                    collect(value)
+        elif isinstance(node, list):
+            for item in node:
+                collect(item)
+    collect(data)
+    return sorted(set(names), key=str.casefold)
+
+
+async def _soccer_button_choose_player_team(query, draft):
+    game = draft["game"]
+    await query.edit_message_text(
+        "Selecciona el equipo del jugador (plantilla ESPN; no confirma titularidad):",
+        reply_markup=_soccer_button_markup([
+            (game["home"], "team:home"), (game["away"], "team:away"),
+            ("❌ Cancelar", "cancel"),
+        ], columns=1),
+    )
+
+
+async def _soccer_button_choose_player_line(query, draft):
+    name = draft["player"]
+    market = draft["market"]
+    label = "SOT" if "sot" in market else "Shots"
+    await query.edit_message_text(
+        f"{name} — {label}\nSelecciona línea (no verificada en la casa de apuestas):",
+        reply_markup=_soccer_button_markup(
+            [(v, "line:" + v) for v in SOCCER_BUTTON_LINES["player"]] + [("Cancelar", "cancel")]
+        ),
+    )
+
+
+def _soccer_button_markup(options, prefix="sb", columns=2):
+    buttons = [InlineKeyboardButton(str(label)[:60], callback_data=f"{prefix}|{value}") for label, value in options]
+    return InlineKeyboardMarkup([buttons[i:i+columns] for i in range(0, len(buttons), columns)])
+
+
+def _soccer_button_selection(state):
+    market = state["market"]
+    game = state["game"]
+    if market.startswith("player_"):
+        direction = "Over" if market.endswith("_o") else "Under"
+        stat = "SOT" if "sot" in market else "Shots"
+        return f"{state['player']} {direction} {state['line']} {stat}"
+    if market == "ml_home":
+        return f"{game['home']} gana"
+    if market == "ml_away":
+        return f"{game['away']} gana"
+    if market == "draw":
+        return "Empate"
+    line = state["line"]
+    side = "Over" if market.endswith("_o") else "Under"
+    stat = ("Corners" if "corners" in market else "Goals" if "goals" in market else
+            "Shots on Target" if "sot" in market else "Shots")
+    team = (game["home"] + " " if market.startswith("home_") else
+            game["away"] + " " if market.startswith("away_") else "")
+    return f"{team}{side} {line} {stat}"
+
+
+def _append_soccer_button_pick(state, user_id):
+    date = state["date"]
+    game = state["game"]
+    selection = _soccer_button_selection(state)
+    now = local_now().isoformat()
+    with _tracking_connection() as conn:
+        # Atomic unique slot allocation. Never delete existing daily picks.
+        next_slot = conn.execute(
+            "SELECT COALESCE(MAX(slot), 0) + 1 FROM soccer_picks WHERE pick_date=?", (date,)
+        ).fetchone()[0]
+        conn.execute(
+            """INSERT INTO soccer_picks (pick_date, slot, league, away, home, selection,
+               product, plan_required, kickoff_utc, created_by, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (date, next_slot, SOCCER_BUTTON_LEAGUES[state["league"]],
+             game["away"], game["home"], selection, state["product"],
+             state["plan"], game["kickoff_utc"], user_id, now, now),
+        )
+    return next_slot
+
+
+async def admin_soccer_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user is None or int(user.id) not in SUBSCRIPTION_ADMIN_IDS:
+        await update.effective_message.reply_text("⛔ Acceso exclusivo para administradores.")
+        return
+    context.user_data["soccer_button_draft"] = {}
+    await update.effective_message.reply_text(
+        "⚽ NUEVO PICK — elige la fecha.",
+        reply_markup=_soccer_button_markup([
+            ("Hoy", "date:0"), ("Mañana", "date:1"), ("En 2 días", "date:2"),
+            ("En 3 días", "date:3"), ("Cancelar", "cancel")
+        ]),
+    )
+
+
+async def soccer_button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = update.effective_user
+    if user is None or int(user.id) not in SUBSCRIPTION_ADMIN_IDS:
+        await query.answer("No autorizado", show_alert=True)
+        return
+    await query.answer()
+    raw = query.data[len("sb|"):]
+    draft = context.user_data.get("soccer_button_draft")
+    if raw == "cancel":
+        context.user_data.pop("soccer_button_draft", None)
+        await query.edit_message_text("Carga cancelada.")
+        return
+    if draft is None:
+        await query.edit_message_text("Sesión caducada. Abre de nuevo el panel de fútbol.")
+        return
+    kind, _, value = raw.partition(":")
+    if kind == "date" and value in {"0", "1", "2", "3"}:
+        draft.clear()
+        draft["date"] = (local_now().date() + timedelta(days=int(value))).isoformat()
+        await query.edit_message_text(
+            f"📅 {draft['date']} — Elige liga:",
+            reply_markup=_soccer_button_markup([(v, "league:" + k) for k, v in SOCCER_BUTTON_LEAGUES.items()] + [("Cancelar", "cancel")]),
+        )
+    elif kind == "league" and value in SOCCER_BUTTON_LEAGUES and "date" in draft:
+        draft["league"] = value
+        games = await asyncio.to_thread(_soccer_button_fixtures, value, draft["date"])
+        if games is None:
+            await query.edit_message_text("Error consultando ESPN. Reintenta desde 'Crear pick con botones'.")
+            return
+        draft["games"] = games
+        if not games:
+            await query.edit_message_text("No hay partidos futuros en esta liga y fecha. Elige otra:", reply_markup=_soccer_button_markup(
+                [(label, "league:" + key) for key, label in SOCCER_BUTTON_LEAGUES.items()]))
+            return
+        options = [(f"{m['away']} vs {m['home']}", f"game:{i}") for i, m in enumerate(games)]
+        await query.edit_message_text("⚽ Elige el partido:", reply_markup=_soccer_button_markup(options + [("Cancelar", "cancel")], columns=1))
+    elif kind == "game" and value.isdigit() and "games" in draft and int(value) < len(draft["games"]):
+        draft["game"] = draft["games"][int(value)]
+        await query.edit_message_text(
+            f"{draft['game']['away']} vs {draft['game']['home']}\nSelecciona el mercado:",
+            reply_markup=_soccer_button_markup([(label, "market:" + key) for key, label in SOCCER_BUTTON_MARKETS.items()] + [("Cancelar", "cancel")]),
+        )
+    elif kind == "market" and value in SOCCER_BUTTON_MARKETS and "game" in draft:
+        draft["market"] = value
+        if value.startswith("player_"):
+            await _soccer_button_choose_player_team(query, draft)
+        elif value in {"ml_home", "ml_away", "draw"}:
+            await _soccer_button_choose_product(query, draft)
+        else:
+            category = "corners" if "corners" in value else "goals" if "goals" in value else "sot" if "sot" in value else "shots"
+            await query.edit_message_text("Selecciona la línea (no es una cuota confirmada):", reply_markup=_soccer_button_markup(
+                [(x, "line:" + x) for x in SOCCER_BUTTON_LINES[category]] + [("Cancelar", "cancel")]))
+    elif kind == "team" and value in {"home", "away"} and draft.get("market", "").startswith("player_"):
+        draft["player_team"] = value
+        game = draft["game"]
+        players = await asyncio.to_thread(_soccer_button_roster, draft["league"], game[value + "_id"])
+        if players is None:
+            await query.edit_message_text("No se pudo consultar la plantilla ESPN. Reintenta desde el panel.")
+            return
+        if not players:
+            await query.edit_message_text("ESPN no publica jugadores para este equipo. Usa la importación por texto.")
+            return
+        draft["players"] = players
+        await query.edit_message_text(
+            "Elige jugador de la plantilla (titularidad no confirmada):",
+            reply_markup=_soccer_button_markup(
+                [(name, f"player:{i}") for i, name in enumerate(players)] + [("Cancelar", "cancel")], columns=2
+            ),
+        )
+    elif kind == "player" and value.isdigit() and draft.get("market", "").startswith("player_") and "players" in draft and int(value) < len(draft["players"]):
+        draft["player"] = draft["players"][int(value)]
+        await _soccer_button_choose_player_line(query, draft)
+    elif kind == "line" and value in {x for values in SOCCER_BUTTON_LINES.values() for x in values} and "market" in draft:
+        if draft["market"].startswith("player_"):
+            if "player" not in draft or value not in SOCCER_BUTTON_LINES["player"]:
+                await query.edit_message_text("Selección de jugador/línea inválida. Inicia de nuevo.")
+                return
+        draft["line"] = value
+        await _soccer_button_choose_product(query, draft)
+    elif kind == "product" and value in ({"PLAYER"} if draft.get("market", "").startswith("player_") else {"SURVIVAL", "TOP PICK", "CORE", "VALUE", "HYBRID"}) and "market" in draft:
+        draft["product"] = value
+        await query.edit_message_text("Selecciona el plan de acceso:", reply_markup=_soccer_button_markup(
+            [(p, "plan:" + p) for p in ("FREE", "PREMIUM", "PRO")]))
+    elif kind == "plan" and value in {"FREE", "PREMIUM", "PRO"} and "product" in draft:
+        draft["plan"] = value
+        game = draft["game"]
+        when = _parse_iso_utc(game["kickoff_utc"])
+        hour = when.astimezone(LOCAL_TZ).strftime("%I:%M %p") if when else "Por confirmar"
+        await query.edit_message_text(
+            f"📋 CONFIRMAR PICK\n\n{draft['date']} | {SOCCER_BUTTON_LEAGUES[draft['league']]}\n"
+            f"{game['away']} vs {game['home']}\n{_soccer_button_selection(draft)}\n"
+            f"{draft['product']} | {draft['plan']} | {hour}\n\n¿Publicar?",
+            reply_markup=_soccer_button_markup([("✅ Publicar", "save"), ("❌ Cancelar", "cancel")]),
+        )
+    elif raw == "save" and all(k in draft for k in ("date", "league", "game", "market", "product", "plan")) and (not draft["market"].startswith("player_") or (draft.get("player") and draft.get("line") in SOCCER_BUTTON_LINES["player"] and draft.get("product") == "PLAYER")):
+        try:
+            slot = await asyncio.to_thread(_append_soccer_button_pick, draft, int(user.id))
+        except Exception as exc:
+            print(f"Soccer button save error: {exc}")
+            await query.edit_message_text("No se pudo guardar el pick; no se ha confirmado su publicación.")
+            return
+        date = draft["date"]
+        selection = _soccer_button_selection(draft)
+        context.user_data.pop("soccer_button_draft", None)
+        summary = await schedule_soccer_alert_jobs(context.application, date)
+        await query.edit_message_text(
+            f"✅ Pick #{slot} añadido el {date}: {selection}\n"
+            f"🔔 Alertas programadas: {summary.get('scheduled', 0)}.\n"
+            "Puedes crear otro desde el panel de fútbol."
+        )
+    else:
+        await query.edit_message_text("Selección inválida o caducada; inicia de nuevo.")
+
+
+async def _soccer_button_choose_product(query, draft):
+    await query.edit_message_text(
+        f"🎯 {_soccer_button_selection(draft)}\nSelecciona el producto:",
+        reply_markup=_soccer_button_markup([(p, "product:" + p) for p in
+            (("PLAYER",) if draft.get("market", "").startswith("player_") else ("SURVIVAL", "TOP PICK", "CORE", "VALUE", "HYBRID"))]),
+    )
 
 async def admin_soccer_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -10247,6 +10538,7 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "📝 Importar jornada NBA": admin_nba_start_input,
         "🗑️ Borrar picks NBA": admin_nba_clear,
         "📋 Ver picks fútbol": admin_soccer_panel,
+        "⚽ Crear pick con botones": admin_soccer_buttons,
         "📝 Importar jornada fútbol": admin_soccer_start_input,
         "📝 Cargar picks fútbol": admin_soccer_start_input,
         "🗑️ Borrar picks fútbol": admin_soccer_clear,
@@ -10881,12 +11173,14 @@ def main():
     app.add_handler(CommandHandler("mlbimport", admin_mlb_master_start))
     app.add_handler(CallbackQueryHandler(membership_callback, pattern=r"^tp_"))
     app.add_handler(CallbackQueryHandler(language_callback, pattern=r"^lang\|"))
+    app.add_handler(CallbackQueryHandler(soccer_button_callback, pattern=r"^sb\|"))
     app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
     app.add_handler(CommandHandler("mlb", mlb))
     app.add_handler(CommandHandler("soccer", soccer_menu))
     app.add_handler(CommandHandler("soccerpicks", soccer_picks))
     app.add_handler(CommandHandler("socceradmin", admin_soccer_panel))
+    app.add_handler(CommandHandler("soccernew", admin_soccer_buttons))
     app.add_handler(CommandHandler("nba", nba_menu))
     app.add_handler(CommandHandler("nbagames", nba_games))
     app.add_handler(CommandHandler("nbapicks", nba_picks))

@@ -5300,7 +5300,8 @@ def _format_official_picks_text(rows, title="🎯 PICKS OFICIALES TRIPLE PICK"):
 
 OFFICIAL_PICKS_ADMIN_KEYBOARD = ReplyKeyboardMarkup(
     [
-        ["📋 Ver picks oficiales", "📥 Importar jornada MLB"],
+        ["📋 Ver picks oficiales", "⚾ Crear pick con botones"],
+        ["📥 Importar jornada MLB"],
         ["📝 Cargar 3 picks", "🤖 Usar picks del modelo"],
         ["🗑️ Borrar picks oficiales"],
         ["⬅️ Panel Admin"],
@@ -6493,6 +6494,238 @@ def _append_soccer_button_pick(state, user_id):
         )
     return next_slot
 
+
+# v3.5.33 — guided MLB/NBA official picks. Calendar and rosters sourced from MLB/ESPN.
+MULTI_MARKETS = {
+    "MLB": {"home_ml": "Gana local (ML)", "away_ml": "Gana visitante (ML)",
+            "game_o": "Over carreras partido", "game_u": "Under carreras partido",
+            "home_o": "Local Over carreras", "home_u": "Local Under carreras",
+            "away_o": "Visitante Over carreras", "away_u": "Visitante Under carreras",
+            "home_spread": "Local run line", "away_spread": "Visitante run line",
+            "pitcher_k_o": "Pitcher Over ponches", "pitcher_k_u": "Pitcher Under ponches"},
+    "NBA": {"home_ml": "Gana local (ML)", "away_ml": "Gana visitante (ML)",
+            "game_o": "Over puntos partido", "game_u": "Under puntos partido",
+            "home_o": "Local Over puntos", "home_u": "Local Under puntos",
+            "away_o": "Visitante Over puntos", "away_u": "Visitante Under puntos",
+            "player_pts_o": "Jugador Over puntos", "player_pts_u": "Jugador Under puntos",
+            "player_reb_o": "Jugador Over rebotes", "player_reb_u": "Jugador Under rebotes",
+            "player_ast_o": "Jugador Over asistencias", "player_ast_u": "Jugador Under asistencias",
+            "player_3pm_o": "Jugador Over triples", "player_3pm_u": "Jugador Under triples"},
+}
+
+def _multi_games(sport, date):
+    if sport == "MLB":
+        return [{"away": g["away"], "home": g["home"], "id": g["game_pk"],
+                 "start": g["game_date"], "away_pitcher": g["away_pitcher"],
+                 "home_pitcher": g["home_pitcher"]} for g in _today_schedule_games(date)]
+    data = _nba_scoreboard(date)
+    if data is None:
+        return None
+    result = []
+    for ev in data.get("events", []):
+        _, away, home = _espn_competitors(ev)
+        if away and home and ev.get("status", {}).get("type", {}).get("state") == "pre":
+            result.append({"away": away.get("team", {}).get("displayName"),
+                           "home": home.get("team", {}).get("displayName"),
+                           "away_id": str(away.get("team", {}).get("id", "")),
+                           "home_id": str(home.get("team", {}).get("id", "")),
+                           "id": str(ev.get("id")), "start": ev.get("date")})
+    return [x for x in result if x["away"] and x["home"]]
+
+def _multi_roster(team_id):
+    if not str(team_id).isdigit():
+        return []
+    data = _espn_get_json(f"basketball/nba/teams/{team_id}/roster")
+    if data is None:
+        return None
+    players=[]
+    for group in data.get("athletes", []):
+        if isinstance(group, dict):
+            athletes = group.get("items", group.get("athletes", [group]))
+        elif isinstance(group, list):
+            athletes = group
+        else:
+            athletes = []
+        for athlete in athletes:
+            if isinstance(athlete, dict):
+                name=athlete.get("displayName") or athlete.get("fullName") or athlete.get("athlete", {}).get("displayName")
+                if name: players.append(name)
+    return sorted(set(players))
+
+def _multi_lines(sport, market):
+    if sport == "MLB":
+        if market.endswith("spread"):
+            return ["-2.5", "-1.5", "+1.5", "+2.5"]
+        if market.startswith("pitcher_"):
+            return [str(x+0.5) for x in range(2, 11)]
+        if market == "game_o" or market == "game_u":
+            return [str(x+0.5) for x in range(4, 13)]
+        return [str(x+0.5) for x in range(1, 9)]
+    if market.startswith("player_"):
+        stat=market.split("_")[1]
+        return ([str(x+0.5) for x in range(0, 7)] if stat=="3pm" else
+                [str(x+0.5) for x in range(1, 21)] if stat in {"reb","ast"} else
+                [str(x+0.5) for x in range(4, 46, 2)])
+    if market.startswith("game_"):
+        return [str(x+0.5) for x in range(189, 261, 5)]
+    return [str(x+0.5) for x in range(79, 151, 5)]
+
+def _multi_selection(d):
+    m=d["market"]; g=d["game"]; side="home" if m.startswith("home") else "away"
+    if m.endswith("_ml"):
+        return f"{g[side]} ML"
+    if m.endswith("spread"):
+        return f"{g[side]} {d['line']} run line"
+    if m.startswith("player_") or m.startswith("pitcher_"):
+        stat=({"pitcher_k":"K", "player_pts":"Points", "player_reb":"Rebounds",
+               "player_ast":"Assists", "player_3pm":"3-Pointers"})[m.rsplit("_",1)[0]]
+        return f"{d['player']} {'Over' if m.endswith('_o') else 'Under'} {d['line']} {stat}"
+    target=("Game" if m.startswith("game") else g[side])
+    return f"{target} {'Over' if m.endswith('_o') else 'Under'} {d['line']} {'runs' if d['sport']=='MLB' else 'points'}"
+
+def _multi_save(d, uid):
+    now=local_now().isoformat(); date=d["date"]; g=d["game"]
+    selection=_multi_selection(d)
+    with _tracking_connection() as conn:
+        if d["sport"]=="NBA":
+            dup=conn.execute("SELECT 1 FROM nba_picks WHERE pick_date=? AND away=? AND home=? AND selection=?",(date,g['away'],g['home'],selection)).fetchone()
+            if dup: raise ValueError("Este pick NBA ya está publicado")
+            slot=conn.execute("SELECT COALESCE(MAX(slot),0)+1 FROM nba_picks WHERE pick_date=?",(date,)).fetchone()[0]
+            product="PLAYER" if d["market"].startswith("player_") else d["product"]
+            conn.execute("""INSERT INTO nba_picks (pick_date,slot,away,home,selection,product,plan_required,tipoff_utc,player,line,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (date,slot,g['away'],g['home'],selection,product,d['plan'],g['start'],d.get('player'),float(d['line']) if 'line' in d else None,uid,now,now))
+        else:
+            if conn.execute("SELECT COUNT(*) FROM official_daily_picks WHERE pick_date=?",(date,)).fetchone()[0]>=3:
+                raise ValueError("La lista oficial MLB admite 3 picks por fecha. Elimina o reemplaza uno antes de añadir otro.")
+            raw=selection.replace("Game ",f"{g['away']} vs {g['home']} ")
+            raw=re.sub(r"\s+runs$", "", raw, flags=re.I)
+            raw=re.sub(r"\s+run line$", "", raw, flags=re.I)
+            if d['market'].startswith('pitcher_'):
+                raw=raw.replace(' K',' K')
+            games=[{"game_pk":g['id'],"game_date":g['start'], "away":g['away'],"home":g['home'],"away_pitcher":g['away_pitcher'],"home_pitcher":g['home_pitcher']}]
+            item,error=_parse_official_pick(raw,games)
+            if not item: raise ValueError(error or "Mercado MLB incompatible")
+            for row in conn.execute("SELECT game_pk,market_family,selection,line FROM official_daily_picks WHERE pick_date=?",(date,)):
+                if row['game_pk']==item['game_pk'] and row['market_family']==item['market_family'] and row['selection']==item['selection'] and row['line']==item['line']:
+                    raise ValueError("Este pick MLB ya está publicado")
+            slot=conn.execute("SELECT COALESCE(MAX(slot),0)+1 FROM official_daily_picks WHERE pick_date=?",(date,)).fetchone()[0]
+            conn.execute("""INSERT INTO official_daily_picks(pick_date,slot,game_pk,game_date,away,home,selection,pitcher,pick_text,market_family,line,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (date,slot,item['game_pk'],item['game_date'],item['away'],item['home'],item['selection'],item['pitcher'],item['pick_text'],item['market_family'],item['line'],uid,now,now))
+            conn.execute("""INSERT OR IGNORE INTO tracked_picks(created_at,pick_date,game_pk,game_date,away,home,selection,product,source,official,market_family,line,model_version,bot_version,result,units_risked,notes) VALUES (?,?,?,?,?,?,?,'OFFICIAL','CHANNEL_OFFICIAL',1,?,?,?,?,'PENDING',1.0,'Admin button picker')""",
+                (now,date,item['game_pk'],item['game_date'],item['away'],item['home'],item['selection'],item['market_family'],item['line'],_official_tracking_model_version(item),BOT_VERSION))
+    return slot
+
+async def _multi_start(update,context,sport):
+    if not update.effective_user or update.effective_user.id not in SUBSCRIPTION_ADMIN_IDS:
+        await update.effective_message.reply_text("Acceso exclusivo para administradores."); return
+    context.user_data['multi_draft']={"sport":sport}
+    await update.effective_message.reply_text(f"{sport} — Elige fecha:",reply_markup=_soccer_button_markup(
+        [("Hoy","date:0"),("Mañana","date:1"),("2 días","date:2"),("3 días","date:3"),("Cancelar","cancel")],prefix="mp"))
+
+async def admin_mlb_buttons(update,context):
+    await _multi_start(update,context,"MLB")
+
+async def admin_nba_buttons(update,context):
+    await _multi_start(update,context,"NBA")
+
+async def multi_button_callback(update,context):
+    q=update.callback_query; user=update.effective_user
+    if not user or user.id not in SUBSCRIPTION_ADMIN_IDS:
+        await q.answer("No autorizado",show_alert=True); return
+    await q.answer()
+    d=context.user_data.get('multi_draft'); raw=q.data[3:]
+    if raw=='cancel':
+        context.user_data.pop('multi_draft',None);await q.edit_message_text('Operación cancelada.');return
+    if not d:
+        await q.edit_message_text('Sesión caducada. Abre el panel Admin nuevamente.');return
+    kind,_,value=raw.partition(':'); sport=d['sport']
+    if kind=='date' and value in {'0','1','2','3'}:
+        d['date']=(local_now().date()+timedelta(days=int(value))).isoformat()
+        games=await asyncio.to_thread(_multi_games,sport,d['date'])
+        if games is None:
+            await q.edit_message_text('No se pudo consultar el calendario. Vuelve a intentarlo.');return
+        d['games']=games
+        if not games:
+            await q.edit_message_text('No hay partidos disponibles para esa fecha. Inicia otra vez para elegir fecha.');return
+        await q.edit_message_text('Selecciona partido:',reply_markup=_soccer_button_markup(
+            [(f"{g['away']} vs {g['home']}",f'game:{i}') for i,g in enumerate(games)]+[("Cancelar","cancel")],prefix='mp',columns=1))
+    elif kind=='game' and value.isdigit() and int(value)<len(d.get('games',[])):
+        d['game']=d['games'][int(value)]
+        await q.edit_message_text('Selecciona mercado:',reply_markup=_soccer_button_markup(
+            [(label,'market:'+key) for key,label in MULTI_MARKETS[sport].items()]+[("Cancelar","cancel")],prefix='mp'))
+    elif kind=='market' and value in MULTI_MARKETS[sport] and 'game' in d:
+        d['market']=value;d.pop('player',None);d.pop('line',None)
+        if value.startswith('pitcher_'):
+            choices=[(d['game'][side+'_pitcher'],'player:'+side) for side in ('home','away') if d['game'][side+'_pitcher']!='Por confirmar']
+            if not choices:
+                await q.edit_message_text('No hay lanzadores probables confirmados por MLB.');return
+            d['players']=[(name,side) for name,side in choices]
+            await q.edit_message_text('Selecciona lanzador (probable, no confirmado):',reply_markup=_soccer_button_markup(choices+[("Cancelar","cancel")],prefix='mp'))
+        elif value.startswith('player_'):
+            await q.edit_message_text('Selecciona equipo (plantilla, no quinteto confirmado):',reply_markup=_soccer_button_markup(
+                [(d['game'][side],'team:'+side) for side in ('home','away')]+[("Cancelar","cancel")],prefix='mp'))
+        elif value.endswith('_ml'):
+            await _multi_product(q,d)
+        else:
+            await _multi_lines_prompt(q,d)
+    elif kind=='team' and value in {'home','away'} and d.get('market','').startswith('player_'):
+        roster=await asyncio.to_thread(_multi_roster,d['game'][value+'_id'])
+        if roster is None:
+            await q.edit_message_text('ESPN no respondió con la plantilla.');return
+        if not roster:
+            await q.edit_message_text('No hay jugadores disponibles en esta plantilla.');return
+        d['players']=roster
+        await q.edit_message_text('Selecciona jugador (titularidad no confirmada):',reply_markup=_soccer_button_markup(
+            [(name,f'player:{i}') for i,name in enumerate(roster)]+[("Cancelar","cancel")],prefix='mp',columns=2))
+    elif kind=='player' and (d.get('market','').startswith('player_') or d.get('market','').startswith('pitcher_')):
+        if sport=='MLB' and value in {'home','away'}:
+            d['player']=d['game'].get(value+'_pitcher')
+        elif value.isdigit() and int(value)<len(d.get('players',[])):
+            d['player']=d['players'][int(value)]
+        else:
+            await q.edit_message_text('Jugador inválido.');return
+        await _multi_lines_prompt(q,d)
+    elif kind=='line' and value in _multi_lines(sport,d.get('market','')):
+        d['line']=value
+        await _multi_product(q,d)
+    elif kind=='product' and value in {'SURVIVAL','TOP PICK','CORE','VALUE','HYBRID','PLAYER'}:
+        d['product']=value
+        await q.edit_message_text('Selecciona plan:',reply_markup=_soccer_button_markup(
+            [(x,'plan:'+x) for x in ('FREE','PREMIUM','PRO')],prefix='mp'))
+    elif kind=='plan' and value in {'FREE','PREMIUM','PRO'} and d.get('product'):
+        d['plan']=value
+        await q.edit_message_text(f"CONFIRMAR {sport}\n{d['date']}\n{d['game']['away']} vs {d['game']['home']}\n{_multi_selection(d)}\n{d['product']} / {d['plan']}\n\nLínea elegida manualmente; NO verificada en Hard Rock Bet. ¿Publicar?",reply_markup=_soccer_button_markup(
+            [('Publicar','save'),('Cancelar','cancel')],prefix='mp'))
+    elif raw=='save' and all(x in d for x in ('date','game','market','product','plan')) and (d['market'].endswith('_ml') or 'line' in d):
+        try:
+            slot=await asyncio.to_thread(_multi_save,d,user.id)
+        except Exception as exc:
+            await q.edit_message_text(f'No se publicó: {exc}');return
+        context.user_data.pop('multi_draft',None)
+        if sport=='NBA':
+            try: await schedule_nba_alert_jobs(context.application,d['date'])
+            except Exception as exc: print(f'NBA alert scheduling: {exc}')
+        else:
+            try: await schedule_alert_jobs(context.application)
+            except Exception as exc: print(f'MLB alert scheduling: {exc}')
+        await q.edit_message_text(f"Pick #{slot} publicado en {sport}: {_multi_selection(d)}. Puedes crear otro desde el panel.")
+    else:
+        await q.edit_message_text('Selección inválida. Vuelve a iniciar desde el panel.')
+
+async def _multi_lines_prompt(q,d):
+    await q.edit_message_text('Selecciona línea (NO verificada en Hard Rock Bet):',reply_markup=_soccer_button_markup(
+        [(line,'line:'+line) for line in _multi_lines(d['sport'],d['market'])]+[("Cancelar","cancel")],prefix='mp',columns=3))
+
+async def _multi_product(q,d):
+    products=('PLAYER',) if d['market'].startswith(('player_','pitcher_')) else ('SURVIVAL','TOP PICK','CORE','VALUE','HYBRID')
+    if d['sport']=='MLB':
+        # The MLB official-picks table has no per-pick membership/product column.
+        d['product']='OFFICIAL'
+        d['plan']='FREE'
+        await q.edit_message_text(f"CONFIRMAR MLB\n{d['date']}\n{d['game']['away']} vs {d['game']['home']}\n{_multi_selection(d)}\nLínea NO verificada en Hard Rock Bet. ¿Publicar?",reply_markup=_soccer_button_markup([('Publicar','save'),('Cancelar','cancel')],prefix='mp'))
+    else:
+        await q.edit_message_text('Selecciona producto:',reply_markup=_soccer_button_markup(
+            [(x,'product:'+x) for x in products],prefix='mp'))
 
 async def admin_soccer_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -9561,7 +9794,8 @@ NBA_MENU_KEYBOARD = ReplyKeyboardMarkup(
 
 NBA_ADMIN_KEYBOARD = ReplyKeyboardMarkup(
     [
-        ["📋 Ver picks NBA", "📝 Importar jornada NBA"],
+        ["📋 Ver picks NBA", "🏀 Crear pick con botones"],
+        ["📝 Importar jornada NBA"],
         ["🗑️ Borrar picks NBA", "📊 Resultados NBA"],
         ["⬅️ Panel Admin"],
     ],
@@ -10544,6 +10778,8 @@ async def visual_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "🗑️ Borrar picks fútbol": admin_soccer_clear,
         "📋 Ver picks oficiales": admin_official_picks_panel,
         "📥 Importar jornada MLB": admin_mlb_master_start,
+        "⚾ Crear pick con botones": admin_mlb_buttons,
+        "🏀 Crear pick con botones": admin_nba_buttons,
         "📝 Cargar 3 picks": admin_official_start_input,
         "🤖 Usar picks del modelo": admin_official_use_model,
         "🗑️ Borrar picks oficiales": admin_official_clear,
@@ -11174,6 +11410,7 @@ def main():
     app.add_handler(CallbackQueryHandler(membership_callback, pattern=r"^tp_"))
     app.add_handler(CallbackQueryHandler(language_callback, pattern=r"^lang\|"))
     app.add_handler(CallbackQueryHandler(soccer_button_callback, pattern=r"^sb\|"))
+    app.add_handler(CallbackQueryHandler(multi_button_callback, pattern=r"^mp\|"))
     app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
     app.add_handler(CommandHandler("mlb", mlb))
@@ -11185,6 +11422,8 @@ def main():
     app.add_handler(CommandHandler("nbagames", nba_games))
     app.add_handler(CommandHandler("nbapicks", nba_picks))
     app.add_handler(CommandHandler("nbaadmin", admin_nba_panel))
+    app.add_handler(CommandHandler("mlbnew", admin_mlb_buttons))
+    app.add_handler(CommandHandler("nbanew", admin_nba_buttons))
     app.add_handler(CommandHandler("picks", picks))
     app.add_handler(CommandHandler("pool", pool))
     app.add_handler(CommandHandler("market", market))
